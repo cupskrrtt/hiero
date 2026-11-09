@@ -83,6 +83,13 @@ pub async fn run(config_error: Option<String>) -> Result<()> {
     let path = endpoint::socket_path();
     let mut watch = Watcher::spawn(path.clone(), Filter::default());
     let mut term = ratatui::init();
+    // ratatui's own panic hook restores raw mode and the screen but not the
+    // mouse; without this a crash leaves the shell printing mouse escapes.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
+        previous(info);
+    }));
     execute!(std::io::stdout(), EnableBracketedPaste)?;
     if config::get().workspace.mouse {
         execute!(std::io::stdout(), EnableMouseCapture)?;
