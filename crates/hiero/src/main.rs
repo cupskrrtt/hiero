@@ -1,5 +1,6 @@
 mod app;
 mod attach;
+mod config;
 mod forms;
 mod git;
 mod integrate;
@@ -9,6 +10,7 @@ mod pipeline;
 mod tasks;
 mod tui;
 mod ui;
+mod usage;
 mod worktree;
 
 use anyhow::Result;
@@ -72,9 +74,24 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Hiero's settings file.
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigCmd>,
+    },
     /// Called by agent hooks; reports status to herdr-core.
     #[command(hide = true)]
     Hook { agent: String, event: String, arg: Option<String> },
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Print where the file is.
+    Path,
+    /// Write a commented starting file (keeps an existing one).
+    Init,
+    /// Check the file and print the settings in effect.
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -113,17 +130,18 @@ enum Debug {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("HIERO_LOG")
-                .unwrap_or_else(|_| "warn".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     let cli = Cli::parse();
+    init_logging(cli.command.is_none());
+    let config_error = match config::load() {
+        Ok(cfg) => {
+            config::set(cfg);
+            None
+        }
+        Err(e) => Some(e),
+    };
     match cli.command {
-        None => tui::run().await,
+        None => tui::run(config_error).await,
+        Some(Command::Config { action }) => config_cmd(action, config_error),
         Some(Command::Debug(d)) => debug(d).await,
         Some(Command::Hook { agent, event, arg }) => {
             integrate::run_hook(&agent, &event, arg.as_deref()).await;
@@ -137,6 +155,58 @@ async fn main() -> Result<()> {
             integrate_cmd(&agent, uninstall, status, settings, exe, force)
         }
     }
+}
+
+/// The board logs to a file (stderr would draw over the screen); commands
+/// log to stderr.
+fn init_logging(board: bool) {
+    let filter = tracing_subscriber::EnvFilter::try_from_env("HIERO_LOG").unwrap_or_else(|_| "warn".into());
+    if board {
+        let dir = config::state_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("hiero.log");
+        // Start over past 5 MB.
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > 5 * 1024 * 1024) {
+            let _ = std::fs::rename(&path, dir.join("hiero.log.old"));
+        }
+        if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .init();
+            return;
+        }
+    }
+    tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
+}
+
+fn config_cmd(action: Option<ConfigCmd>, error: Option<String>) -> Result<()> {
+    let path = config::config_path();
+    match action.unwrap_or(ConfigCmd::Show) {
+        ConfigCmd::Path => println!("{}", path.display()),
+        ConfigCmd::Init => {
+            if path.exists() {
+                println!("{} already exists; left as is", path.display());
+            } else {
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                std::fs::write(&path, config::DEFAULT_TOML)?;
+                println!("wrote {}", path.display());
+            }
+        }
+        ConfigCmd::Show => {
+            if let Some(e) = error {
+                anyhow::bail!("{e}");
+            }
+            let exists = if path.exists() { "" } else { " (not created yet; defaults in effect)" };
+            println!("# {}{exists}", path.display());
+            print!("{}", toml::to_string_pretty(config::get())?);
+            println!("# logs: {}", config::state_dir().join("hiero.log").display());
+        }
+    }
+    Ok(())
 }
 
 async fn broadcast(text: &str, labels: &[String], force: bool) -> Result<()> {

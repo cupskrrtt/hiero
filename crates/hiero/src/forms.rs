@@ -118,9 +118,9 @@ pub struct AgentChoice {
     pub kind: AgentKind,
 }
 
-/// How to start an agent of `kind` with `task`: argv, plus text to type after
-/// it starts (for a shell).
-pub fn agent_argv(kind: &AgentKind, task: &str) -> Result<(Vec<String>, Option<String>), String> {
+/// How to start agent `name` (as configured) of `kind` with `task`: argv,
+/// plus text to type after it starts.
+pub fn agent_argv(name: &str, kind: &AgentKind, task: &str) -> Result<(Vec<String>, Option<String>), String> {
     let task = task.trim();
     Ok(match kind {
         AgentKind::Template(t) => {
@@ -132,10 +132,17 @@ pub fn agent_argv(kind: &AgentKind, task: &str) -> Result<(Vec<String>, Option<S
         }
         AgentKind::Command(cmd) => {
             let mut argv = shell_words::split(cmd).map_err(|e| format!("bad command: {e}"))?;
-            if !task.is_empty() {
-                argv.push(task.to_string());
+            // `[agents.<name>] task` decides how the task goes in.
+            match crate::config::task_mode(name) {
+                "send" => (argv, (!task.is_empty()).then(|| task.to_string())),
+                "none" => (argv, None),
+                _ => {
+                    if !task.is_empty() {
+                        argv.push(task.to_string());
+                    }
+                    (argv, None)
+                }
             }
-            (argv, None)
         }
         AgentKind::Shell => (vec![], (!task.is_empty()).then(|| task.to_string())),
     })
@@ -153,13 +160,19 @@ pub fn agent_choices(templates: &[TemplateInfo]) -> Vec<AgentChoice> {
             kind: AgentKind::Template(t.name.clone()),
         })
         .collect();
-    for a in KNOWN_AGENTS {
-        if on_path(a) {
-            out.push(AgentChoice {
-                label: a.to_string(),
-                detail: format!("runs `{a} <task>`"),
-                kind: AgentKind::Command(a.to_string()),
-            });
+    let configured = crate::config::get().agents.keys().map(String::as_str);
+    let mut names: Vec<&str> = KNOWN_AGENTS.to_vec();
+    names.extend(configured.filter(|n| !KNOWN_AGENTS.contains(n)));
+    for a in names {
+        let cmd = crate::config::command_for(a);
+        let exe = shell_words::split(&cmd).ok().and_then(|v| v.into_iter().next()).unwrap_or_default();
+        if on_path(&exe) || Path::new(&exe).is_file() {
+            let how = match crate::config::task_mode(a) {
+                "send" => format!("runs `{cmd}`, then types the task"),
+                "none" => format!("runs `{cmd}` (no task)"),
+                _ => format!("runs `{cmd} <task>`"),
+            };
+            out.push(AgentChoice { label: a.to_string(), detail: how, kind: AgentKind::Command(cmd) });
         }
     }
     out.push(AgentChoice {
@@ -356,7 +369,7 @@ impl SpawnForm {
         let name = self.name.value().trim();
 
         let mut params = RunParams::new().cwd(folder.to_string_lossy());
-        let (argv, send_after) = agent_argv(&agent.kind, &task)?;
+        let (argv, send_after) = agent_argv(&agent.label, &agent.kind, &task)?;
         params = params.argv(argv);
         if let Some(m) = self.machine() {
             if self.worktree {

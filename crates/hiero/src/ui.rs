@@ -76,6 +76,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Review(v) => draw_review(f, app, area, v),
         Mode::Pipelines(v) => draw_pipelines(f, app, area, v),
         Mode::Launch(form) => draw_launch(f, area, form),
+        Mode::Usage(rows) => draw_usage(f, area, rows.as_deref()),
         _ => {}
     }
 }
@@ -812,6 +813,76 @@ fn draw_launch(f: &mut Frame, area: Rect, form: &crate::app::LaunchForm) {
     f.render_widget(Paragraph::new("tab switch field · enter on folder or ctrl+s launch · esc back").dim(), rows[7]);
 }
 
+fn draw_usage(f: &mut Frame, area: Rect, rows: Option<&[crate::usage::Row]>) {
+    use crate::usage::{Tokens, short};
+    let n = rows.map(|r| r.len()).unwrap_or(0) as u16;
+    let inner = popup(f, area, 112, (n + 8).clamp(9, area.height.saturating_sub(2)), "Claude token usage");
+    let [body, note, keys] = Layout::vertical([Constraint::Min(2), Constraint::Length(2), Constraint::Length(1)]).areas(inner);
+    match rows {
+        None => f.render_widget(Paragraph::new("reading transcripts…").dim(), body),
+        Some([]) => f.render_widget(Paragraph::new("No Claude agents on the board.").dim(), body),
+        Some(rows) => {
+            let mut total = Tokens::default();
+            let num = |v: u64| Cell::from(Line::from(short(v)).right_aligned());
+            let mut table_rows: Vec<Row> = rows
+                .iter()
+                .map(|r| {
+                    total.add(&r.tokens);
+                    let (model, src) = match &r.source {
+                        Ok(_) => (r.model.clone(), Style::new()),
+                        Err(why) => (why.clone(), Style::new().dim().italic()),
+                    };
+                    Row::new(vec![
+                        Cell::from(Span::styled(r.name.clone(), Style::new().bold())),
+                        Cell::from(Span::styled(r.addr.clone(), Style::new().dim())),
+                        Cell::from(Span::styled(model, src)),
+                        num(r.tokens.messages),
+                        num(r.tokens.input),
+                        num(r.tokens.output),
+                        num(r.tokens.cache_write),
+                        num(r.tokens.cache_read),
+                    ])
+                })
+                .collect();
+            table_rows.push(
+                Row::new(vec![
+                    Cell::from("total"),
+                    Cell::from(""),
+                    Cell::from(""),
+                    num(total.messages),
+                    num(total.input),
+                    num(total.output),
+                    num(total.cache_write),
+                    num(total.cache_read),
+                ])
+                .style(Style::new().bold().fg(Color::Cyan)),
+            );
+            let w = [
+                Constraint::Length(18),
+                Constraint::Length(6),
+                Constraint::Min(16),
+                Constraint::Length(6),
+                Constraint::Length(8),
+                Constraint::Length(8),
+                Constraint::Length(10),
+                Constraint::Length(10),
+            ];
+            let header = Row::new(["AGENT", "", "MODEL", "MSGS", "INPUT", "OUTPUT", "CACHE W", "CACHE R"].map(Cell::from))
+                .style(Style::new().dim());
+            f.render_widget(Table::new(table_rows, w).header(header).column_spacing(1), body);
+        }
+    }
+    f.render_widget(
+        Paragraph::new(
+            "From each agent's Claude Code transcript (~/.claude/projects). Tokens only: how they're billed depends on your plan.",
+        )
+        .wrap(Wrap { trim: true })
+        .dim(),
+        note,
+    );
+    f.render_widget(hints(&[("r", "refresh"), ("esc", "back")]), keys);
+}
+
 /// An agent attached inside the board, drawn from its vt100 screen.
 fn draw_pane(f: &mut Frame, pane: &PaneView, area: Rect) {
     let mut title = vec![
@@ -908,6 +979,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  e                keep on/off           R       rename"),
         Line::from("  T                tasks                 v       review this agent's task"),
         Line::from("  w                pipelines             B       broadcast to agents shown"),
+        Line::from("  u                Claude token usage"),
         Line::from("  ctrl+\\          leave an attached agent"),
         Line::from(""),
         Line::from("Board".bold()),

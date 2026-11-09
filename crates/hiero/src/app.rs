@@ -35,6 +35,8 @@ pub enum Mode {
     Review(Box<ReviewView>),
     Pipelines(PipelinesView),
     Launch(Box<LaunchForm>),
+    /// Claude token usage per agent; None while loading.
+    Usage(Option<Vec<crate::usage::Row>>),
     /// Typing into an agent inside the board.
     Pane,
 }
@@ -113,6 +115,7 @@ pub enum Action {
     /// Start a stage of a run; the driver's job.
     StartStage { run: Box<Run>, stage: usize, templates: Vec<TemplateInfo> },
     EditPipeline(PathBuf),
+    LoadUsage(Vec<crate::usage::Query>),
 }
 
 pub struct Flash {
@@ -216,6 +219,8 @@ pub struct Preview {
 }
 
 pub struct Alert {
+    /// blocked, error, done, exited, failed or pipeline (for `[notify] on`).
+    pub what: String,
     pub title: String,
     pub body: String,
 }
@@ -256,6 +261,10 @@ pub struct App {
     /// Alerts raised outside `on_watch` (pipeline results).
     pub alerts: Vec<Alert>,
     pub machines: Vec<String>,
+    /// Typed key → default key (`[keys]`).
+    pub key_map: BTreeMap<char, char>,
+    /// A config problem to show on the board.
+    pub config_error: Option<String>,
     pub tick: u64,
     pub quit: bool,
 }
@@ -296,6 +305,8 @@ impl App {
             starting_runs: Default::default(),
             alerts: Vec::new(),
             machines: Vec::new(),
+            key_map: BTreeMap::new(),
+            config_error: None,
             tick: 0,
             quit: false,
         }
@@ -476,8 +487,71 @@ impl App {
             Mode::Review(v) => self.key_review(v, key),
             Mode::Pipelines(v) => self.key_pipelines(v, key),
             Mode::Launch(f) => self.key_launch(f, key),
+            Mode::Usage(rows) => match key.code {
+                KeyCode::Char('r') => self.usage_view(),
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('u') => Mode::Normal,
+                _ => Mode::Usage(rows),
+            },
         };
         self.rebuild();
+    }
+
+    fn usage_view(&mut self) -> Mode {
+        let queries: Vec<crate::usage::Query> = self
+            .set
+            .terminals
+            .values()
+            .filter(|t| !t.address.contains('/') && agent_name(t) == "claude")
+            .map(|t| crate::usage::Query {
+                addr: t.address.clone(),
+                name: t.labels.get(LABEL_NAME).cloned().unwrap_or_else(|| t.display_name().to_string()),
+                cwd: t.cwd.clone(),
+                created_ms: t.created_ms,
+            })
+            .collect();
+        self.actions.push(Action::LoadUsage(queries));
+        Mode::Usage(None)
+    }
+
+    pub fn on_usage(&mut self, rows: Vec<crate::usage::Row>) {
+        if let Mode::Usage(r) = &mut self.mode {
+            *r = Some(rows);
+        }
+    }
+
+    /// Take settings and last session's view.
+    pub fn apply_config(&mut self, cfg: &crate::config::Config) {
+        self.grouping = grouping_from(&cfg.board.grouping);
+        self.show_finished = cfg.board.show_finished;
+        self.key_map = cfg.key_map().unwrap_or_default();
+        if cfg.board.remember {
+            let ui = crate::config::load_ui_state();
+            if let Some(g) = &ui.grouping {
+                self.grouping = grouping_from(g);
+            }
+            if let Some(f) = ui.show_finished {
+                self.show_finished = f;
+            }
+            self.query = ui.query;
+            self.want_select = ui.selected;
+        }
+    }
+
+    /// What to remember for next time.
+    pub fn ui_state(&self) -> crate::config::UiState {
+        crate::config::UiState {
+            grouping: Some(
+                match self.grouping {
+                    Grouping::Project => "project",
+                    Grouping::Tree => "tree",
+                    Grouping::Flat => "flat",
+                }
+                .into(),
+            ),
+            show_finished: Some(self.show_finished),
+            selected: self.selected.clone(),
+            query: self.query.clone(),
+        }
     }
 
     /// Live agents in the list right now, except Hiero itself.
@@ -680,6 +754,7 @@ impl App {
                     r.history.push(std::mem::take(&mut r.members));
                     r.note = "all stages finished".into();
                     self.alerts.push(Alert {
+                        what: "pipeline".into(),
                         title: "hiero · pipeline".into(),
                         body: format!("{} finished: {}", r.pipeline, r.task),
                     });
@@ -690,7 +765,11 @@ impl App {
                     let mut r = run.clone();
                     r.status = RunStatus::Failed;
                     r.note = why.clone();
-                    self.alerts.push(Alert { title: "hiero · pipeline failed".into(), body: format!("{}: {why}", r.pipeline) });
+                    self.alerts.push(Alert {
+                        what: "pipeline".into(),
+                        title: "hiero · pipeline failed".into(),
+                        body: format!("{}: {why}", r.pipeline),
+                    });
                     self.starting_runs.insert(r.id.clone());
                     self.actions.push(Action::TaskOps(vec![TaskOp::RunPut(Box::new(r))]));
                 }
@@ -900,8 +979,18 @@ impl App {
         }
     }
 
-    fn key_normal(&mut self, key: KeyEvent) -> Mode {
+    fn key_normal(&mut self, mut key: KeyEvent) -> Mode {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // `[keys]` remaps: translate to the default key, or swallow a disabled one.
+        if let KeyCode::Char(c) = key.code
+            && !ctrl
+            && let Some(&to) = self.key_map.get(&c)
+        {
+            if to == '\0' {
+                return Mode::Normal;
+            }
+            key.code = KeyCode::Char(to);
+        }
         match key.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => return Mode::Help,
@@ -943,6 +1032,7 @@ impl App {
                 }
             }
             KeyCode::Char('w') => return self.pipelines_view(),
+            KeyCode::Char('u') => return self.usage_view(),
             KeyCode::Char('f') => {
                 self.show_finished = !self.show_finished;
                 self.flash(if self.show_finished { "showing finished" } else { "hiding finished" });
@@ -1432,6 +1522,14 @@ impl App {
 
 // ---- helpers ----------------------------------------------------------------
 
+fn grouping_from(word: &str) -> Grouping {
+    match word {
+        "tree" => Grouping::Tree,
+        "flat" => Grouping::Flat,
+        _ => Grouping::Project,
+    }
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1504,6 +1602,7 @@ fn alert_for(t: &Terminal, a: Attention) -> Alert {
         }
     }
     Alert {
+        what: a.word().to_string(),
         title: format!("hiero · {}", agent_name(t)),
         body,
     }

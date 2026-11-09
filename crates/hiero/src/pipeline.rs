@@ -308,7 +308,7 @@ pub fn resolve_agent(name: &str, templates: &[hc_client::TemplateInfo]) -> Agent
     } else if templates.iter().any(|t| t.name == name) {
         AgentKind::Template(name.to_string())
     } else {
-        AgentKind::Command(name.to_string())
+        AgentKind::Command(crate::config::command_for(name))
     }
 }
 

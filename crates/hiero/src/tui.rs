@@ -20,8 +20,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, interval};
 
-/// History lines to fetch above the visible screen for the preview.
-const PREVIEW_HISTORY: usize = 200;
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
 /// Results coming back from spawned work.
@@ -32,17 +30,18 @@ enum Msg {
     Templates(Vec<TemplateInfo>),
     Doc(tasks::Doc),
     Machines(Vec<String>),
+    Usage(Vec<crate::usage::Row>),
     StageStarted(String),
     Review { id: String, result: Result<worktree::Review, String> },
     PaneOpened { addr: String, name: String, cols: u16, rows: u16, result: Result<Box<AttachStream>, String> },
 }
 
-pub async fn run() -> Result<()> {
+pub async fn run(config_error: Option<String>) -> Result<()> {
     let path = endpoint::socket_path();
     let mut watch = Watcher::spawn(path.clone(), Filter::default());
     let mut term = ratatui::init();
     execute!(std::io::stdout(), EnableBracketedPaste)?;
-    let result = event_loop(&mut term, &mut watch, path).await;
+    let result = event_loop(&mut term, &mut watch, path, config_error).await;
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
@@ -52,8 +51,16 @@ async fn event_loop(
     term: &mut ratatui::DefaultTerminal,
     watch: &mut mpsc::Receiver<WatchMsg>,
     path: PathBuf,
+    config_error: Option<String>,
 ) -> Result<()> {
     let mut app = App::new();
+    app.apply_config(crate::config::get());
+    if let Some(e) = config_error {
+        tracing::warn!("{e}");
+        app.flash_error(&format!("config ignored: {e}"));
+        app.config_error = Some(e);
+    }
+    let preview_history = crate::config::get().board.preview_history;
     let mut keys = EventStream::new();
 
     // A request connection (the watcher's is events-only).
@@ -89,7 +96,7 @@ async fn event_loop(
         {
             let (c, tx) = (c.clone(), tx.clone());
             tokio::spawn(async move {
-                let (result, lost) = match c.read(&addr, PREVIEW_HISTORY).await {
+                let (result, lost) = match c.read(&addr, preview_history).await {
                     Ok(r) => (Ok(r.text), false),
                     Err(e) => {
                         let lost = matches!(e, hc_client::Error::Disconnected | hc_client::Error::Io(_));
@@ -215,7 +222,7 @@ async fn event_loop(
                     client = None;
                 }
                 for a in app.on_watch(&msg) {
-                    notify::alert(&a.title, &a.body);
+                    notify::alert(&a.what, &a.title, &a.body);
                 }
             }
             msg = pane_recv(&mut pane) => {
@@ -262,6 +269,7 @@ async fn event_loop(
                 Msg::Templates(t) => app.on_templates(t),
                 Msg::Doc(doc) => app.on_doc(doc),
                 Msg::Machines(m) => app.machines = m,
+                Msg::Usage(rows) => app.on_usage(rows),
                 Msg::StageStarted(id) => {
                     app.on_stage_started(&id);
                     app.drive_pipelines();
@@ -282,9 +290,15 @@ async fn event_loop(
                 app.rebuild();
             }
         }
+        for a in std::mem::take(&mut app.alerts) {
+            notify::alert(&a.what, &a.title, &a.body);
+        }
         if app.quit {
             break;
         }
+    }
+    if crate::config::get().board.remember {
+        crate::config::save_ui_state(&app.ui_state());
     }
     if let Some(p) = pane.take() {
         p.close().await;
@@ -588,7 +602,7 @@ async fn start_stage(
             let agent = spec.agent.clone().unwrap_or_else(|| "claude".into());
             let kind = pipeline::resolve_agent(&agent, templates);
             let prompt = pipeline::fill(spec.prompt.as_deref().unwrap_or(""), &run, n, count);
-            let (argv, send_after) = forms::agent_argv(&kind, &prompt)?;
+            let (argv, send_after) = forms::agent_argv(&agent, &kind, &prompt)?;
             params = params.argv(argv).label(crate::app::LABEL_AGENT, agent.clone()).label(crate::app::LABEL_TASK, prompt.chars().take(200).collect::<String>());
             if spec.worktree {
                 let task_spec = forms::TaskSpec {
@@ -661,6 +675,14 @@ fn run_action(c: Client, action: Action, tx: mpsc::UnboundedSender<Msg>) {
     match action {
         Action::LoadTemplates => return load_templates(c, tx),
         Action::LoadDoc => return load_doc(c, tx),
+        Action::LoadUsage(queries) => {
+            tokio::spawn(async move {
+                if let Ok(rows) = tokio::task::spawn_blocking(move || crate::usage::collect(queries)).await {
+                    let _ = tx.send(Msg::Usage(rows));
+                }
+            });
+            return;
+        }
         Action::LoadMachines => {
             tokio::spawn(async move {
                 if let Ok(m) = c.machines().await {

@@ -29,7 +29,7 @@ herdr-core's document store. Close Hiero, reopen it, and everything is still the
 | 3 | Status bridge for Claude Code, codex, pi | ✅ done |
 | 4 | Tasks and git worktrees | ✅ done |
 | 5 | Orchestration: pipelines, broadcast, machines | ✅ done |
-| 6 | Polish: usage, config, packaging | ⏳ next |
+| 6 | Polish: usage, config, packaging | ✅ done |
 
 ## Development phases
 
@@ -148,11 +148,22 @@ command) ran to the end and handed plan, branches and folders along; tree view; 
 the board and the CLI; a shell on a second machine (`hc machine add --via`) started, attached
 and typed into from the board.
 
-### Phase 6: Polish
-- [ ] Usage and cost panel from agent transcripts
-- [ ] `~/.config/hiero/config.toml`: keybindings, theme, notification rules
-- [ ] Restore layout and selection, help overlay, log file
-- [ ] AUR `PKGBUILD` and release binaries
+### Phase 6: Polish ✅
+- [x] **Usage panel** (`u`): Claude tokens per agent (messages, input, output, cache write, cache
+  read) from its transcript in `~/.claude/projects`, counted once per message. Tokens only, no
+  prices: plans bill differently, and a wrong price is worse than none
+- [x] **Config** `~/.config/hiero/config.toml` (`hiero config init | path | show`): board defaults,
+  which changes alert and how (bell / desktop), per-agent launch settings (`command`, and
+  `task = arg | send | none`), key remapping under `[keys]`. Checked on start; a broken file is
+  reported on the board and ignored
+- [x] **Remembers** grouping, show-finished, search and the selected agent between runs
+  (`~/.local/state/hiero/ui.json`; `remember = false` turns it off)
+- [x] **Log file** `~/.local/state/hiero/hiero.log` for the board (it used to write to stderr,
+  over the screen); rotated past 5 MB
+- [x] **Packaging**: release profile (thin LTO, stripped), Apache-2.0 `LICENSE`, Arch
+  `packaging/arch/PKGBUILD` (builds and tests the checkout; notes for publishing on the AUR)
+- [ ] Release binaries for other distros (needs a hosted repository and CI)
+- [ ] Themes (colours are fixed for now)
 
 ## Known issues
 
@@ -164,7 +175,6 @@ Tracked here until fixed. ✅ = fixed.
 | 9 | Codex (`hiero hook codex`) and pi are untested; neither is installed here. Codex `notify` only reports finished turns, so Codex shows done but never working or blocked. | Partial status for Codex; none for pi unless its hooks call `hiero report`. | Test when installed; check whether they speak OSC 7501 natively. |
 | 3 | Opening an agent inside the board (`o`) resizes the agent to the pane. herdr-core gives the size to the last active viewer. | The agent reflows to a smaller size; full-screen attach (`a`) sizes it back. | Could use an observe-only stream for viewing and become a viewer only on the first keypress. |
 | 4 | The board redraws timers and the spinner every second, so its screen never goes quiet. | When Hiero itself runs inside an hc terminal, `hc send` / `hc keys` into it fail with "output has not settled". Normal use is unaffected. | Redraw only when something visible changes, and tick wait timers less often. |
-| 5 | For agents on PATH the task goes in as the last argument (`claude "<task>"`). | Agents that take their prompt differently start without the task. | Use a template for those; later, per-agent launch settings in Hiero's config. |
 | 6 | The Windows toast (WSL) is sent with exit code 0, but nobody has confirmed it actually appears. | Desktop notifications may be silent on WSL; the bell still rings. | Confirm on a real desktop; fall back to `wsl-notify-send` if needed. |
 | 7 | Rename is stored as a `hiero.name` label because hc has no rename. | `hc ls` and other tools still show the original name. | Use a real rename if herdr-core adds one. |
 | 10 | Pull requests (`P`) are only tested up to the push failing cleanly (no remote here); `gh pr create` itself is untested. | The PR step may need fixes on first real use. | Test against a real GitHub repo. |
@@ -174,10 +184,51 @@ Tracked here until fixed. ✅ = fixed.
 | 14 | A pipeline only moves forward while the board that drives it is open. | Close Hiero and the run pauses; reopen and press `A` on the run (the old board id is gone). | Adopt runs automatically when their driver has been silent for a while. |
 | 15 | The built-in `plan-build-review` (Claude) is untested end to end to save tokens; only the command/`sh -c` smoke pipeline ran. Agents that never report status (plain shells) never finish a stage. | A real Claude pipeline may need prompt tuning. | Run it on a real task; let shell members finish on exit only. |
 | 16 | Agents on other machines show no git branch and can't use worktrees. | Less information for remote agents. | Read git facts through `hc exec --on`. |
+| 17 | No release binaries or AUR entry yet: the PKGBUILD builds a local checkout, and its `url` is a placeholder. | Install from source (below). | Push the repository, tag a release, point the PKGBUILD at the tarball. |
+| ✅ | Agents on PATH always got the task as the last argument. | — | Phase 6: `[agents.<name>] task = "send"` types it in instead (or `"none"`). |
+| ✅ | The board logged to stderr, which drew over the screen. | — | Phase 6: the board logs to `~/.local/state/hiero/hiero.log`. |
 | ✅ | Real coding agents showed `·` (no status). | — | Phase 3: Claude Code 2.1.319 reports natively (verified); hooks cover older versions; `hiero report` for others. |
 | ✅ | Only tested with shells and fake agents. | — | Phase 3: verified with real Claude Code sessions (working, blocked:permission, done). |
 | ✅ | Coming back from full-screen attach quit the board: ratatui's `clear()` asks for the cursor position and the reply was lost. | — | Fixed in Phase 2: clear the screen directly and build a fresh terminal handle. |
 | ✅ | The board could attach to its own terminal (endless loop). | — | Fixed in Phase 2: attach, open, kill and preview skip the terminal Hiero runs in. |
+
+## Install
+
+Needs [herdr-core](https://github.com/herdrdev/herdr-core) running (`hc server status`).
+
+```sh
+# Arch: build and install a package from this checkout
+cd packaging/arch && makepkg -si
+
+# anywhere with Rust
+cargo install --path crates/hiero
+```
+
+Then run `hiero`. Optional: `hiero config init` writes a commented settings file.
+
+## Configuration
+
+`~/.config/hiero/config.toml` — every setting has a default, so the file can stay short:
+
+```toml
+[board]
+grouping = "tree"            # project, tree or flat
+
+[notify]
+bell = false
+on = ["blocked", "error", "pipeline"]
+
+[agents.claude]
+command = "claude --model opus"
+
+[agents.pi]
+task = "send"                # type the task in after start, instead of passing it as an argument
+
+[keys]
+kill = "X"                   # the old key (K) stops working
+```
+
+`hiero config show` checks the file and prints what's in effect.
 
 ## Getting started
 
@@ -209,7 +260,8 @@ hiero broadcast --label hiero.project=shosha "please rebase on main"
 | `HIERO_LOG` | Log level, for example `debug` or `hc_client=trace` |
 | `HIERO_NO_NOTIFY` | Turn off desktop notifications (the bell still rings) |
 | `VISUAL` / `EDITOR` | Editor for templates and pipelines (default `vi`) |
-| `XDG_CONFIG_HOME` | Where `hiero/pipelines/` lives (default `~/.config`) |
+| `XDG_CONFIG_HOME` | Where `hiero/config.toml` and `hiero/pipelines/` live (default `~/.config`) |
+| `XDG_STATE_HOME` | Where `hiero/hiero.log` and `hiero/ui.json` live (default `~/.local/state`) |
 
 ### Board keys
 
@@ -238,6 +290,7 @@ hiero broadcast --label hiero.project=shosha "please rebase on main"
 | `T` | task list: `Enter` review · `g` go to agent · `D` forget a finished task |
 | `w` | pipelines: `Enter` launch / go to run · `e` edit · `S` stop run · `A` adopt run · `D` forget run |
 | `B` | broadcast a message to every live agent shown |
+| `u` | Claude token usage per agent |
 | `?` | help |
 | `q` / `Ctrl+C` | quit |
 
@@ -276,8 +329,11 @@ crates/
     ├── tasks.rs      task records in doc "hiero"
     ├── worktree.rs   git worktrees: create, review, merge, PR, remove
     ├── pipeline.rs   pipeline specs, runs and the stage driver
+    ├── config.rs     config.toml, key remaps, remembered UI state
+    ├── usage.rs      Claude token usage from transcripts
     ├── git.rs        repo root and branch, read from .git
     └── notify.rs     bell and desktop notifications
+packaging/arch/       PKGBUILD
 ```
 
 ## License

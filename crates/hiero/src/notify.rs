@@ -40,12 +40,21 @@ fn is_wsl() -> bool {
             .unwrap_or(false)
 }
 
-/// Ring the bell and show a notification. Never blocks, never fails loudly.
-pub fn alert(title: &str, body: &str) {
-    let mut out = std::io::stdout();
-    let _ = out.write_all(b"\x07");
-    let _ = out.flush();
-
+/// Ring the bell and show a notification, as `[notify]` allows, for an
+/// alert of kind `what` (blocked, done, pipeline, …). Never blocks.
+pub fn alert(what: &str, title: &str, body: &str) {
+    let cfg = &crate::config::get().notify;
+    if !cfg.wants(what) {
+        return;
+    }
+    if cfg.bell {
+        let mut out = std::io::stdout();
+        let _ = out.write_all(b"\x07");
+        let _ = out.flush();
+    }
+    if !cfg.desktop {
+        return;
+    }
     let spawned = match backend() {
         Backend::NotifySend => Command::new("notify-send")
             .args(["--app-name=hiero", title, body])

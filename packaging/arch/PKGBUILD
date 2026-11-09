@@ -1,0 +1,49 @@
+# Builds Hiero from the checkout this file sits in:
+#   cd packaging/arch && makepkg -si
+#
+# To publish on the AUR, set url to the real repository and replace the
+# _root lines with a release tarball:
+#   source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+#   b2sums=('...')        # updpkgsums
+#   _root="$srcdir/$pkgname-$pkgver"
+
+pkgname=hiero
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='TUI agent manager on top of herdr-core: board, attach, tasks in git worktrees, pipelines'
+arch=('x86_64' 'aarch64')
+url='https://github.com/CHANGE-ME/hiero'
+license=('Apache-2.0')
+depends=('gcc-libs' 'git' 'herdr-core')
+makedepends=('cargo')
+optdepends=(
+	'github-cli: open pull requests from task review'
+	'libnotify: desktop notifications (notify-send)'
+)
+options=('!lto' '!debug')
+source=()
+
+_root="$(realpath "$startdir/../..")"
+
+prepare() {
+	export RUSTUP_TOOLCHAIN=stable
+	cargo fetch --locked --manifest-path "$_root/Cargo.toml" --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR="$srcdir/target"
+	cargo build --frozen --release -p hiero --manifest-path "$_root/Cargo.toml"
+}
+
+check() {
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR="$srcdir/target"
+	cargo test --frozen --release --workspace --manifest-path "$_root/Cargo.toml"
+}
+
+package() {
+	install -Dm755 "$srcdir/target/release/hiero" "$pkgdir/usr/bin/hiero"
+	install -Dm644 "$_root/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+	install -Dm644 "$_root/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+}
