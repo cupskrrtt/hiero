@@ -223,6 +223,7 @@ impl App {
         match msg {
             WatchMsg::Snapshot { .. } => {
                 self.set.apply_watch(msg);
+                self.set.terminals.values_mut().for_each(status_from_labels);
                 self.disconnected = None;
                 self.connected_once = true;
                 self.preview.dirty = true;
@@ -235,6 +236,9 @@ impl App {
                 let addr = e.terminal.clone();
                 let before = addr.as_deref().and_then(|a| self.set.get(a)).and_then(attention);
                 self.set.apply(e);
+                if let Some(t) = addr.as_deref().and_then(|a| self.set.terminals.get_mut(a)) {
+                    status_from_labels(t);
+                }
                 if let Some(a) = addr.as_deref() {
                     if let Some(t) = self.set.get(a) {
                         let after = attention(t);
@@ -885,6 +889,29 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// The hook's fallback (labels) when an agent couldn't report through its
+/// terminal. A real OSC 7501 report always wins.
+fn status_from_labels(t: &mut Terminal) {
+    use crate::integrate::{LABEL_STATUS, LABEL_STATUS_KIND, LABEL_STATUS_MS, LABEL_STATUS_MSG};
+    if t.reported || !t.is_live() {
+        return;
+    }
+    let Some(state) = t.labels.get(LABEL_STATUS).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let get = |k: &str| t.labels.get(k).cloned().unwrap_or_default();
+    let kind = get(LABEL_STATUS_KIND);
+    t.status = Some(hc_client::Status {
+        state: state.clone(),
+        app: t.labels.get(LABEL_AGENT).cloned().unwrap_or_default(),
+        kind: (!kind.is_empty()).then_some(kind),
+        msg: get(LABEL_STATUS_MSG),
+        progress: None,
+        title: String::new(),
+    });
+    t.status_ms = get(LABEL_STATUS_MS).parse().ok().or(t.status_ms);
+}
+
 /// Why this terminal wants a person, if it does.
 pub fn attention(t: &Terminal) -> Option<Attention> {
     if t.is_live() {
@@ -936,7 +963,10 @@ pub fn agent_name(t: &Terminal) -> String {
         return tpl.clone();
     }
     if let Some(app) = t.status.as_ref().map(|s| s.app.as_str()).filter(|a| !a.is_empty()) {
-        return app.to_string();
+        return match app {
+            "claude-code" => "claude".to_string(),
+            other => other.to_string(),
+        };
     }
     if let Some(fg) = &t.foreground
         && !SHELLS.contains(&fg.name.as_str())

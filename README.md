@@ -13,7 +13,7 @@ hiero (one binary)
 ├── state         live picture of all terminals (snapshot + events)
 ├── store         Hiero's data (tasks, projects) in hc doc "hiero"; survives restarts
 ├── ui            ratatui: board · preview · in-pane terminal · dialogs
-└── integrations  status bridges per agent (Claude Code first)
+└── integrate     status bridge: agent hooks → OSC 7501 (hiero hook / report)
 ```
 
 Hiero keeps no database of its own: terminals live in herdr-core, and Hiero's data lives in
@@ -26,8 +26,8 @@ herdr-core's document store. Close Hiero, reopen it, and everything is still the
 | 0 | Foundation: `hc-client` library | ✅ done |
 | 1 | Agent board (MVP) | ✅ done |
 | 2 | Drive agents: spawn, actions, attach | ✅ done |
-| 3 | Status bridge for Claude Code, codex, pi | ⏳ next |
-| 4 | Tasks and git worktrees | ☐ |
+| 3 | Status bridge for Claude Code, codex, pi | ✅ done |
+| 4 | Tasks and git worktrees | ⏳ next |
 | 5 | Orchestration: pipelines, broadcast, machines | ☐ |
 | 6 | Polish: usage, config, packaging | ☐ |
 
@@ -73,21 +73,28 @@ herdr-core's document store. Close Hiero, reopen it, and everything is still the
 
 **Done when:** you can start, talk to, take over and clean up agents entirely inside Hiero.
 
-### Phase 3: Status bridge
+### Phase 3: Status bridge ✅
 **Goal:** real status for agents that don't report it themselves.
 
-herdr-core only knows a status when the program reports it through OSC 7501, and Claude Code
-doesn't do that natively.
+herdr-core only knows a status the program reports through OSC 7501. Testing with a real session
+showed that **Claude Code 2.1.319 already reports natively** (`app=claude-code`): working with a
+message, `blocked:permission` with `approve Write: …`, and done. The board shows it with no setup.
+So the bridge covers older Claude versions and other agents:
 
-- [ ] `hiero integrate claude`: installs Claude Code hooks
-  - `UserPromptSubmit` → working
-  - `Notification` / permission prompt → blocked
-  - `Stop` → done
-- [ ] Report through OSC 7501 on the pane's tty, falling back to a `hiero.status` label
-- [ ] Integrations for codex and pi
-- [ ] `hiero integrate --uninstall`
+- [x] `hiero hook claude <Event>`: Claude Code hooks → OSC 7501 on the agent's terminal
+  (`UserPromptSubmit`/tool use → working, `PermissionRequest`/permission notification → blocked,
+  `Stop` → done). It stays quiet when Claude reports natively, so the two never fight
+- [x] `hiero integrate claude [--uninstall] [--status] [--settings F] [--force]`: merges the hooks
+  into `~/.claude/settings.json`, keeps other hooks (such as herdr's), backs the file up first.
+  It declines on Claude Code 2.1.319+ unless `--force`
+- [x] `hiero hook codex`: Codex `notify` (turn complete → done, with the last message);
+  `hiero integrate codex` prints the `config.toml` line
+- [x] `hiero report <state> [--kind] [--msg]`: report from any agent's hooks or a script
+- [x] Fallback when there's no controlling terminal: `hiero.status*` labels the board reads
+- [x] Board shows `claude-code` as `claude`
 
-**Done when:** Claude agents show accurate working, blocked and done states on the board.
+**Done when:** Claude agents show accurate working, blocked and done states on the board. ✅
+(verified with real Claude Code 2.1.319 sessions)
 
 ### Phase 4: Tasks and git worktrees
 **Goal:** run parallel agents on one repo without them colliding.
@@ -124,13 +131,15 @@ Tracked here until fixed. ✅ = fixed.
 
 | # | Issue | Impact | Plan |
 |---|---|---|---|
-| 1 | Real coding agents show `·` (no status). herdr-core only knows a status the program reports through OSC 7501, and Claude Code doesn't report one natively. | Claude agents never reach NEEDS YOU. | Phase 3 status bridge (hooks). |
-| 2 | Only tested with shells and fake agents, not a real Claude session. | Agent-specific quirks (trust dialogs, startup timing) are unverified. | Test with real Claude in Phase 3. |
+| 8 | Before its first report an agent shows `·`, including while Claude waits at its "trust this folder?" dialog, which comes before any hook or native report. | A new agent in a new folder looks idle while it actually waits for you. | Show "starting / not reported" for young agents, and hint to attach. |
+| 9 | Codex (`hiero hook codex`) and pi are untested; neither is installed here. Codex `notify` only reports finished turns, so Codex shows done but never working or blocked. | Partial status for Codex; none for pi unless its hooks call `hiero report`. | Test when installed; check whether they speak OSC 7501 natively. |
 | 3 | Opening an agent inside the board (`o`) resizes the agent to the pane. herdr-core gives the size to the last active viewer. | The agent reflows to a smaller size; full-screen attach (`a`) sizes it back. | Could use an observe-only stream for viewing and become a viewer only on the first keypress. |
 | 4 | The board redraws timers and the spinner every second, so its screen never goes quiet. | When Hiero itself runs inside an hc terminal, `hc send` / `hc keys` into it fail with "output has not settled". Normal use is unaffected. | Redraw only when something visible changes, and tick wait timers less often. |
 | 5 | For agents on PATH the task goes in as the last argument (`claude "<task>"`). | Agents that take their prompt differently start without the task. | Use a template for those; later, per-agent launch settings in Hiero's config. |
 | 6 | The Windows toast (WSL) is sent with exit code 0, but nobody has confirmed it actually appears. | Desktop notifications may be silent on WSL; the bell still rings. | Confirm on a real desktop; fall back to `wsl-notify-send` if needed. |
 | 7 | Rename is stored as a `hiero.name` label because hc has no rename. | `hc ls` and other tools still show the original name. | Use a real rename if herdr-core adds one. |
+| ✅ | Real coding agents showed `·` (no status). | — | Phase 3: Claude Code 2.1.319 reports natively (verified); hooks cover older versions; `hiero report` for others. |
+| ✅ | Only tested with shells and fake agents. | — | Phase 3: verified with real Claude Code sessions (working, blocked:permission, done). |
 | ✅ | Coming back from full-screen attach quit the board: ratatui's `clear()` asks for the cursor position and the reply was lost. | — | Fixed in Phase 2: clear the screen directly and build a fresh terminal handle. |
 | ✅ | The board could attach to its own terminal (endless loop). | — | Fixed in Phase 2: attach, open, kill and preview skip the terminal Hiero runs in. |
 
@@ -149,6 +158,11 @@ cargo run -p hiero -- debug events          # follow live events
 cargo run -p hiero -- debug read t1 --lines 50
 cargo run -p hiero -- debug doc '{"hello":"world"}'   # write doc "hiero"; omit JSON to read
 cargo run -p hiero -- debug type t1 'ls\r'  # type raw bytes over an attach stream
+
+cargo run -p hiero -- integrate claude --status   # is the Claude bridge installed?
+cargo run -p hiero -- integrate claude            # install (declines on Claude Code 2.1.319+, which reports natively)
+cargo run -p hiero -- integrate codex             # prints the Codex notify line
+hiero report blocked --kind question --msg "pick a database"   # from inside an hc terminal
 ```
 
 | Setting | Meaning |
@@ -216,9 +230,9 @@ crates/
     ├── forms.rs      dialog state: text input, new agent, templates
     ├── attach.rs     full-screen attach
     ├── keys.rs       key events → terminal bytes
+    ├── integrate.rs  status bridge: hooks, report, installers
     ├── git.rs        repo root and branch, read from .git
     └── notify.rs     bell and desktop notifications
-integrations/         agent hook scripts (Phase 3)
 ```
 
 ## License
