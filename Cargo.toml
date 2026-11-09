@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/hc-client", "crates/hiero"]
+members = ["crates/hc-client", "crates/hiero", "crates/vt100"]
 
 [workspace.package]
 version = "0.3.0"

@@ -286,6 +286,7 @@ running terminals are not touched.
 
 Fixed:
 
+- ✅ When neovim scrolled a window next to others (the main buffer beside a dap-ui sidebar), the windows beside it were wiped: neovim scrolls with left/right margins (`CSI ?69h`, `CSI Pl;Pr s`), which the vt100 crate ignored. Hiero now carries a vt100 fork that supports them.
 - ✅ With a pane streaming fast output (nvim plugins like dap-ui), the screen could fall seconds behind and show old frames mixed with new ones, worst on Windows where output goes through ConPTY. Hiero now applies all queued output before drawing and draws at most every 16 ms while busy.
 - ✅ After a core restart, panes stayed `ended` until Enter or a tab switch (W5: they restore by themselves).
 
@@ -329,6 +330,7 @@ are fixed).
 
 ```
 crates/
+├── vt100/            fork of vt100 0.18.1 (MIT) with DEC left/right margins (DECLRMM/DECSLRM)
 ├── hc-client/src/
 │   ├── lib.rs        exports
 │   ├── endpoint.rs   find the socket or pipe

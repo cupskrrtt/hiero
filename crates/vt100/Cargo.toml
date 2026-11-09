@@ -1,0 +1,20 @@
+[package]
+name = "vt100"
+version = "0.18.1"
+authors = ["Jesse Luehrs <doy@tozt.net>"]
+edition = "2024"
+rust-version = "1.85"
+description = "Library for parsing terminal data (Hiero fork with left/right margin support)"
+license = "MIT"
+repository = "https://github.com/doy/vt100-rust"
+publish = false
+
+[features]
+default = ["std"]
+std = ["vte/std"]
+
+[dependencies]
+embedded-io = { version = "0.7.1", optional = true }
+itoa = "1.0.18"
+unicode-width = "0.2.2"
+vte = { version = "0.15.0", default-features = false }
