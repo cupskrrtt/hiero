@@ -320,6 +320,9 @@ pub struct UiState {
     pub query: String,
     /// The workspace open on the main screen (its id).
     pub workspace: Option<String>,
+    /// Sidebar width in columns (None: the default).
+    pub sidebar_width: Option<u16>,
+    pub sidebar_hidden: bool,
 }
 
 fn ui_state_path() -> PathBuf {

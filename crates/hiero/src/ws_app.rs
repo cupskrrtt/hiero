@@ -3,7 +3,7 @@
 //! loop (`ws_tui`) carries out the [`Action`]s this asks for, so all of it
 //! can be tested.
 
-use crate::app::{Alert, BoardStart, PaneView, status_from_labels};
+use crate::app::{Alert, BoardStart, LABEL_AGENT, PaneView, status_from_labels};
 use crate::config::Prefix;
 use crate::forms::{TextInput, expand_home};
 use crate::workspace::{self, Dir, Move, Tab, Workspace, WsDoc, WsOp, WsStatus, new_id};
@@ -20,6 +20,9 @@ pub const LABEL_PROJECT: &str = "hiero.project";
 
 /// How much one `H` `J` `K` `L` press moves a border, in percent of the split.
 const RESIZE_STEP: i16 = 5;
+
+/// How many columns `<` `>` move the sidebar edge.
+const SIDEBAR_STEP: u16 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -245,6 +248,8 @@ pub struct Slot {
     pub idle: bool,
     /// Inner cells (cols, rows) the stream and the parser have.
     pub size: (u16, u16),
+    /// The attach stream closed (as opposed to a pane that was never running).
+    pub lost: bool,
 }
 
 /// A short error in the bottom bar.
@@ -282,8 +287,16 @@ pub struct WsApp {
     pub zoom: Option<String>,
     /// Where the panes go (below the tabs bar).
     pub panes_area: Rect,
-    /// Height of the whole screen, for the scrolling help.
-    screen_h: u16,
+    /// The whole screen, to lay the panes out again when the sidebar changes.
+    screen: Rect,
+    /// Sidebar width in columns, and whether it is hidden (prefix `b`).
+    pub sidebar_w: u16,
+    pub sidebar_hidden: bool,
+    /// A new snapshot came after a lost connection and the panes have not
+    /// been checked yet (that waits until requests work again).
+    reconnected: bool,
+    /// The request connection works (the watcher's is events-only).
+    client_up: bool,
     pub actions: Vec<Action>,
     pub disconnected: Option<String>,
     pub connected_once: bool,
@@ -318,8 +331,12 @@ impl WsApp {
             auto_restore: true,
             next_attempt: 0,
             zoom: None,
-            panes_area: ws_ui::areas(Rect::new(0, 0, 100, 30), false).panes,
-            screen_h: 30,
+            panes_area: ws_ui::areas(Rect::new(0, 0, 100, 30), false, ws_ui::SIDEBAR_W).panes,
+            screen: Rect::new(0, 0, 100, 30),
+            sidebar_w: ws_ui::SIDEBAR_W,
+            sidebar_hidden: false,
+            reconnected: false,
+            client_up: false,
             actions: Vec::new(),
             disconnected: None,
             connected_once: false,
@@ -452,6 +469,9 @@ impl WsApp {
     pub fn on_watch(&mut self, msg: &WatchMsg) -> Vec<Alert> {
         match msg {
             WatchMsg::Snapshot { .. } => {
+                // Not the first one: the core went away and is back (or events
+                // were missed), so what the panes show may be out of date.
+                let again = self.connected_once;
                 self.set.apply_watch(msg);
                 self.set.terminals.values_mut().for_each(status_from_labels);
                 self.disconnected = None;
@@ -461,10 +481,16 @@ impl WsApp {
                 self.synced = true;
                 // Only now do we know which terminals exist, so only now is
                 // it safe to decide what is missing.
-                self.sync();
+                if again {
+                    self.reconnected = true;
+                    self.try_recover();
+                } else {
+                    self.sync();
+                }
                 Vec::new()
             }
             WatchMsg::Disconnected { error } => {
+                self.client_up = false;
                 self.set.apply_watch(msg);
                 self.disconnected = Some(error.clone());
                 Vec::new()
@@ -499,7 +525,7 @@ impl WsApp {
                     self.focus = Focus::Workspace;
                     self.open_workspace(&id);
                 }
-                None => self.focus = Focus::Sidebar,
+                None => self.focus = if self.sidebar_hidden { Focus::Workspace } else { Focus::Sidebar },
             }
         }
         if let Some(id) = self.pending_open.take_if(|id| self.doc.workspace(id).is_some()) {
@@ -568,9 +594,61 @@ impl WsApp {
 
     /// The screen changed size (or the banner came or went).
     pub fn set_screen(&mut self, screen: Rect) {
-        self.panes_area = ws_ui::areas(screen, self.disconnected.is_some()).panes;
-        self.screen_h = screen.height;
+        self.screen = screen;
+        self.panes_area = ws_ui::areas(screen, self.disconnected.is_some(), self.sidebar_cols()).panes;
         self.sync();
+    }
+
+    /// Columns the sidebar takes right now (0 when hidden).
+    pub fn sidebar_cols(&self) -> u16 {
+        if self.sidebar_hidden { 0 } else { self.sidebar_w }
+    }
+
+    /// Apply the remembered sidebar state.
+    pub fn set_sidebar(&mut self, width: Option<u16>, hidden: bool) {
+        self.sidebar_w = width.unwrap_or(ws_ui::SIDEBAR_W).clamp(ws_ui::SIDEBAR_MIN, ws_ui::SIDEBAR_MAX);
+        self.sidebar_hidden = hidden;
+        self.relayout();
+    }
+
+    /// Lay the panes out again for the sidebar's new width; `sync` then
+    /// resizes the streams and the parsers.
+    fn relayout(&mut self) {
+        self.set_screen(self.screen);
+    }
+
+    /// Prefix `b`: hide the sidebar (the workspace takes the width) or show it.
+    /// A hidden sidebar can't keep the keyboard.
+    fn toggle_sidebar(&mut self) {
+        self.sidebar_hidden = !self.sidebar_hidden;
+        if self.sidebar_hidden && self.focus == Focus::Sidebar {
+            self.focus = Focus::Workspace;
+        }
+        self.relayout();
+    }
+
+    /// Prefix `<` `>`: move the sidebar edge. Resizing shows a hidden sidebar.
+    fn resize_sidebar(&mut self, wider: bool) {
+        let w = if wider { self.sidebar_w.saturating_add(SIDEBAR_STEP) } else { self.sidebar_w.saturating_sub(SIDEBAR_STEP) };
+        self.sidebar_w = w.clamp(ws_ui::SIDEBAR_MIN, ws_ui::SIDEBAR_MAX);
+        self.sidebar_hidden = false;
+        self.relayout();
+    }
+
+    /// Once a second. A pane whose program the system took down (not one that
+    /// was ended) starts again, but not at once: a core that is stopping marks
+    /// its terminals finished a moment before the connection drops, and that
+    /// case belongs to the reconnect.
+    pub fn on_tick(&mut self) {
+        if self.client_up && self.disconnected.is_none() {
+            self.recover_lost(false);
+        }
+    }
+
+    /// A connection that can send requests is up (also again after a restart).
+    pub fn on_connected(&mut self) {
+        self.client_up = true;
+        self.try_recover();
     }
 
     /// Make the open panes match what the document says is on screen: close
@@ -578,8 +656,9 @@ impl WsApp {
     /// runs, else start one), and resize the ones whose rectangle changed.
     /// Safe to call at any time; it only acts on differences.
     pub fn sync(&mut self) {
-        // Before the first snapshot every terminal looks missing.
-        if !self.synced {
+        // Before the first snapshot every terminal looks missing. After a
+        // reconnect the same holds until the panes have been checked.
+        if !self.synced || self.reconnected {
             return;
         }
         let (panes, tab) = match self.active() {
@@ -621,6 +700,58 @@ impl WsApp {
     fn recently_started(&self, pane: &str) -> Option<String> {
         let addr = self.recent.get(pane)?;
         (self.terminal_of(pane).as_ref() == Some(addr) && self.set.get(addr).is_none()).then(|| addr.clone())
+    }
+
+    /// Terminal starts waiting in `actions`, with or without an attach.
+    fn queued_starts(&self) -> usize {
+        let starts = |a: &&Action| matches!(a, Action::Start { .. } | Action::Open { plan: Plan::Start { .. }, .. });
+        self.actions.iter().filter(starts).count()
+    }
+
+    /// After a core restart: check every pane against the new list of
+    /// terminals and bring back what the restart rule says. Waits for the
+    /// request connection, because starting needs it.
+    fn try_recover(&mut self) {
+        if !self.reconnected || !self.client_up {
+            return;
+        }
+        self.reconnected = false;
+        // The new snapshot is the truth: starts and failures of the old
+        // connection say nothing about it.
+        self.recent.clear();
+        self.failed.clear();
+        let before = self.queued_starts();
+        self.sync(); // the panes of the other tabs
+        self.recover_lost(true); // the panes on screen
+        self.sync();
+        let n = self.queued_starts() - before;
+        if n > 0 {
+            self.flash_info(&format!("core restarted — restored {n} pane{}", if n == 1 { "" } else { "s" }));
+        }
+    }
+
+    /// Panes on screen whose stream closed (or whose open failed while the
+    /// core was away, after a reconnect): open them again when the restart
+    /// rule says their terminal is gone or was taken down by the system. One
+    /// that ended on its own or was killed stays as it is. After a reconnect
+    /// (`reconnect`) the terminal list is fresh, so a stream that was only
+    /// lost to a still-running terminal attaches again, and a terminal that
+    /// is no longer listed counts as gone.
+    fn recover_lost(&mut self, reconnect: bool) {
+        let mut lost: Vec<String> =
+            self.slots.iter().filter(|(_, s)| s.lost || (reconnect && s.error.is_some())).map(|(id, _)| id.clone()).collect();
+        lost.sort();
+        for pane in lost {
+            let t = self.terminal_of(&pane).and_then(|a| self.set.get(&a));
+            let go = match fate(t) {
+                Fate::Missing => reconnect || t.is_some(),
+                Fate::Running => reconnect,
+                Fate::Ended(_) => false,
+            };
+            if go {
+                self.restart(&pane, false, false);
+            }
+        }
     }
 
     /// Start, in the background, the missing terminals of the panes that are
@@ -676,7 +807,7 @@ impl WsApp {
         let (cols, rows) = self.size_of(pane);
         self.next_attempt += 1;
         let attempt = self.next_attempt;
-        let mut slot = Slot { attempt, view: None, error: None, idle: false, size: (cols, rows) };
+        let mut slot = Slot { attempt, view: None, error: None, idle: false, size: (cols, rows), lost: false };
         match &p {
             Plan::Ended { addr, why, .. } => {
                 let mut view = PaneView::new(addr.clone(), addr.clone(), cols, rows);
@@ -709,13 +840,14 @@ impl WsApp {
 
     /// Enter on an ended pane starts a fresh shell (or its command) there; on a
     /// failed one it tries the same again. A start already underway is left alone.
-    fn restart(&mut self, pane: &str, fresh: bool) {
+    /// `manual` as in `open_slot`: a recovery on its own honours `restore = false`.
+    fn restart(&mut self, pane: &str, fresh: bool, manual: bool) {
         if self.starting.contains(pane) {
             return;
         }
         self.slots.remove(pane);
         self.actions.push(Action::Detach(pane.to_string()));
-        self.open_slot(pane, fresh, true);
+        self.open_slot(pane, fresh, manual);
     }
 
     /// An open attempt finished. False when the pane has moved on (another tab
@@ -747,7 +879,12 @@ impl WsApp {
         match msg {
             StreamMsg::Data(bytes) => view.parser.process(&bytes),
             StreamMsg::Resize { .. } => {}
-            StreamMsg::Closed(reason) => view.ended = Some(crate::attach::describe_close(reason.as_ref())),
+            StreamMsg::Closed(reason) => {
+                view.ended = Some(crate::attach::describe_close(reason.as_ref()));
+                if let Some(slot) = self.slots.get_mut(pane) {
+                    slot.lost = true;
+                }
+            }
         }
     }
 
@@ -791,6 +928,10 @@ impl WsApp {
 
     pub fn flash_error(&mut self, msg: &str) {
         self.flash = Some(Flash { msg: msg.into(), error: true, at: Instant::now() });
+    }
+
+    pub fn flash_info(&mut self, msg: &str) {
+        self.flash = Some(Flash { msg: msg.into(), error: false, at: Instant::now() });
     }
 
     /// The message to show now, and whether it is an error.
@@ -849,8 +990,19 @@ impl WsApp {
         }
         match k.code {
             KeyCode::Char('w') => {
-                self.focus = if self.focus == Focus::Sidebar { Focus::Workspace } else { Focus::Sidebar };
+                if self.focus == Focus::Sidebar {
+                    self.focus = Focus::Workspace;
+                } else {
+                    self.focus = Focus::Sidebar;
+                    // Asking for the sidebar shows it.
+                    if self.sidebar_hidden {
+                        self.toggle_sidebar();
+                    }
+                }
             }
+            KeyCode::Char('b') => self.toggle_sidebar(),
+            KeyCode::Char('<') => self.resize_sidebar(false),
+            KeyCode::Char('>') => self.resize_sidebar(true),
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.dialog = Some(Dialog::Help(0)),
             KeyCode::Char('m') => self.dialog = Some(Dialog::Menu(0)),
@@ -889,7 +1041,7 @@ impl WsApp {
         if (ended || slot.error.is_some() || slot.idle) && k.code == KeyCode::Enter {
             // A fresh shell where the program ended; a plain retry after a
             // failed attach, or the first start of a pane left alone.
-            self.restart(&id, ended);
+            self.restart(&id, ended, true);
             return None;
         }
         self.pane_live().then_some(Out::Key(k))
@@ -1210,7 +1362,7 @@ impl WsApp {
         match self.dialog.as_mut() {
             Some(Dialog::Help(top)) => {
                 // The help may be taller than the screen: it scrolls, any other key closes.
-                let max = ws_ui::help_lines("").len().saturating_sub(self.screen_h.saturating_sub(4) as usize);
+                let max = ws_ui::help_lines("").len().saturating_sub(self.screen.height.saturating_sub(4) as usize);
                 match k.code {
                     KeyCode::Char('j') | KeyCode::Down => *top = (*top + 1).min(max),
                     KeyCode::Char('k') | KeyCode::Up => *top = top.saturating_sub(1),
@@ -1242,7 +1394,13 @@ impl WsApp {
                 KeyCode::Enter => {
                     let start = MENU[*i].1;
                     self.dialog = None;
-                    self.actions.push(Action::Board(start));
+                    // The prompt would have no one to send to: say so here
+                    // instead of opening the board for nothing.
+                    if start == BoardStart::Broadcast && live_agents(&self.set) == 0 {
+                        self.flash_info("no live agents to broadcast to");
+                    } else {
+                        self.actions.push(Action::Board(start));
+                    }
                 }
                 KeyCode::Esc | KeyCode::Char('q') => self.dialog = None,
                 _ => {}
@@ -1368,6 +1526,15 @@ impl WsApp {
 }
 
 /// What was typed into a command prompt; empty means the shell.
+/// Live terminals that look like agents: they report a status or were
+/// started as one. Plain shells and editors are not.
+pub fn live_agents(set: &TerminalSet) -> usize {
+    set.terminals
+        .values()
+        .filter(|t| t.is_live() && (t.status.is_some() || t.labels.contains_key(LABEL_AGENT) || t.template.is_some()))
+        .count()
+}
+
 fn command(input: &TextInput) -> Option<String> {
     Some(input.value().trim().to_string()).filter(|c| !c.is_empty())
 }
@@ -2418,6 +2585,24 @@ mod tests {
             a.on_key(key('j'));
         }
         a.on_key(code(KeyCode::Enter));
+        assert!(a.actions.is_empty(), "no agents: no board");
+        assert!(a.current_flash().is_some_and(|(m, e)| !e && m == "no live agents to broadcast to"));
+        // A shell is not an agent; one that reports a status is.
+        a.set.terminals.insert("sh".into(), terminal("sh", true));
+        assert_eq!(live_agents(&a.set), 0);
+        let mut agent = terminal("ag", true);
+        agent.status = serde_json::from_value(serde_json::json!({"state": "working", "app": "claude-code"})).unwrap();
+        a.set.terminals.insert("ag".into(), agent);
+        let mut ended = finished("old", "exited", Some(0));
+        ended.status = a.set.terminals["ag"].status.clone();
+        a.set.terminals.insert("old".into(), ended);
+        assert_eq!(live_agents(&a.set), 1);
+        a.on_key(ctrl_space());
+        a.on_key(key('m'));
+        for _ in 0..10 {
+            a.on_key(key('j'));
+        }
+        a.on_key(code(KeyCode::Enter));
         assert!(matches!(&a.actions[..], [Action::Board(BoardStart::Broadcast)]));
         a.actions.clear();
         // Esc closes without a board.
@@ -2609,5 +2794,239 @@ mod tests {
         assert_ne!(focused(&a), f);
         // Only the focused slot shows a cursor: the UI asks `focused_pane`.
         assert_eq!(a.focused_pane().unwrap(), "n-w1");
+    }
+
+    // ---- core restart while Hiero is open ------------------------------------------
+
+    fn snapshot(terms: Vec<Terminal>) -> WatchMsg {
+        WatchMsg::Snapshot { seq: 9, terminals: terms }
+    }
+
+    fn closed(why: &str) -> hc_client::StreamMsg {
+        hc_client::StreamMsg::Closed(Some(serde_json::json!({ "reason": why })))
+    }
+
+    /// two_tabs with every terminal running, the visible pane attached, and
+    /// the first snapshot seen.
+    fn running_two_tabs() -> (WsApp, Vec<String>) {
+        let (mut a, panes) = two_tabs();
+        for p in &panes {
+            a.set.terminals.insert(format!("t-{p}"), terminal(&format!("t-{p}"), true));
+        }
+        a.connected_once = true;
+        a.client_up = true;
+        a.sync();
+        attach_pending(&mut a);
+        assert!(a.slots["n-w1"].view.is_some());
+        (a, panes)
+    }
+
+    #[test]
+    fn a_core_restart_brings_the_panes_back_by_itself() {
+        let (mut a, _) = running_two_tabs();
+        // The core stops: the stream closes, then the watcher reports it.
+        a.on_stream("n-w1", closed("server_stop"));
+        assert!(a.slots["n-w1"].lost && a.slots["n-w1"].view.as_ref().unwrap().ended.is_some());
+        assert!(a.actions.is_empty(), "the list still says it runs: wait for the new one");
+        a.on_watch(&WatchMsg::Disconnected { error: "gone".into() });
+        assert!(a.disconnected.is_some() && !a.client_up);
+
+        // The core is back and everything it had is finished by the restart;
+        // the hidden x2 had been ended by the person before.
+        let snap = snapshot(vec![
+            finished("t-n-w1", "stopped_by_restart", None),
+            finished("t-x1", "server_stop", None),
+            finished("t-x2", "exited", Some(0)),
+        ]);
+        a.on_watch(&snap);
+        assert!(a.disconnected.is_none());
+        assert!(a.actions.is_empty(), "nothing starts before requests work again");
+        a.sync();
+        assert!(a.actions.is_empty());
+
+        a.on_connected();
+        let acts = std::mem::take(&mut a.actions);
+        let mut started: Vec<String> = acts
+            .iter()
+            .filter_map(|x| match x {
+                Action::Start { pane, .. } => Some(pane.clone()),
+                Action::Open { plan: Plan::Start { pane, .. }, .. } => Some(pane.clone()),
+                _ => None,
+            })
+            .collect();
+        started.sort();
+        assert_eq!(started, ["n-w1", "x1"], "x2 was ended on purpose");
+        assert!(a.current_flash().is_some_and(|(m, e)| !e && m == "core restarted — restored 2 panes"), "{:?}", a.current_flash());
+        assert!(a.slots["n-w1"].view.is_none() && !a.slots["n-w1"].lost, "a fresh slot, opening");
+
+        // Asking again does nothing more.
+        a.on_connected();
+        a.sync();
+        assert!(a.actions.is_empty());
+    }
+
+    #[test]
+    fn a_pane_the_program_ended_stays_ended_after_a_reconnect() {
+        let (mut a, _) = running_two_tabs();
+        a.on_stream("n-w1", closed("exited"));
+        a.on_watch(&WatchMsg::Disconnected { error: "gone".into() });
+        a.on_watch(&snapshot(vec![
+            finished("t-n-w1", "exited", Some(0)),
+            terminal("t-x1", true),
+            terminal("t-x2", true),
+        ]));
+        a.on_connected();
+        assert!(a.actions.is_empty(), "{:?}", a.actions);
+        assert!(a.current_flash().is_none());
+        assert!(a.slots["n-w1"].view.as_ref().unwrap().ended.is_some());
+        // Killed on purpose is the same.
+        a.on_watch(&snapshot(vec![finished("t-n-w1", "killed", None), terminal("t-x1", true), terminal("t-x2", true)]));
+        assert!(a.actions.is_empty());
+    }
+
+    #[test]
+    fn a_lost_stream_to_a_running_terminal_attaches_again() {
+        let (mut a, _) = running_two_tabs();
+        a.on_stream("n-w1", closed("server_stop"));
+        a.on_watch(&WatchMsg::Disconnected { error: "gone".into() });
+        // The holder kept the terminals alive across the restart.
+        a.on_watch(&snapshot(["t-n-w1", "t-x1", "t-x2"].map(|t| terminal(t, true)).to_vec()));
+        a.on_connected();
+        let o = opens(&mut a);
+        assert!(matches!(&o[..], [Plan::Attach { pane, addr }] if pane == "n-w1" && addr == "t-n-w1"), "{o:?}");
+        assert!(a.current_flash().is_none(), "nothing was restarted");
+    }
+
+    #[test]
+    fn a_pane_that_failed_to_open_while_the_core_was_away_is_tried_again() {
+        let (mut a, _) = running_two_tabs();
+        a.slots.get_mut("n-w1").unwrap().error = Some("not connected to herdr-core".into());
+        a.on_watch(&WatchMsg::Disconnected { error: "gone".into() });
+        a.on_watch(&snapshot(["t-n-w1", "t-x1", "t-x2"].map(|t| terminal(t, true)).to_vec()));
+        a.on_connected();
+        assert!(matches!(&opens(&mut a)[..], [Plan::Attach { pane, .. }] if pane == "n-w1"));
+    }
+
+    #[test]
+    fn restore_off_leaves_a_lost_pane_idle_after_a_restart() {
+        let (mut a, _) = running_two_tabs();
+        a.auto_restore = false;
+        a.on_stream("n-w1", closed("server_stop"));
+        a.on_watch(&WatchMsg::Disconnected { error: "gone".into() });
+        a.on_watch(&snapshot(vec![]));
+        a.on_connected();
+        assert!(!a.actions.iter().any(|x| matches!(x, Action::Start { .. } | Action::Open { .. })), "{:?}", a.actions);
+        assert!(a.slots["n-w1"].idle);
+    }
+
+    #[test]
+    fn a_stream_closed_by_the_system_restarts_once_the_list_says_so() {
+        let (mut a, _) = running_two_tabs();
+        // The terminal's own host went down while the core stayed up.
+        a.set.terminals.insert("t-n-w1".into(), finished("t-n-w1", "host_shutdown", None));
+        a.on_stream("n-w1", closed("host_shutdown"));
+        assert!(a.actions.is_empty(), "not at once: the core may be stopping");
+        a.on_tick();
+        let o = opens(&mut a);
+        assert!(matches!(&o[..], [Plan::Start { pane, .. }] if pane == "n-w1"), "{o:?}");
+        // One that exited is left alone.
+        let (mut b, _) = running_two_tabs();
+        b.set.terminals.insert("t-n-w1".into(), finished("t-n-w1", "exited", Some(0)));
+        b.on_stream("n-w1", closed("exited"));
+        b.on_tick();
+        assert!(b.actions.is_empty());
+        // Not while the core is away.
+        let (mut c, _) = running_two_tabs();
+        c.set.terminals.insert("t-n-w1".into(), finished("t-n-w1", "server_stop", None));
+        c.on_stream("n-w1", closed("server_stop"));
+        c.on_watch(&WatchMsg::Disconnected { error: "gone".into() });
+        c.on_tick();
+        assert!(c.actions.is_empty());
+    }
+
+    // ---- sidebar: hide and resize ---------------------------------------------------
+
+    #[test]
+    fn the_sidebar_hides_and_the_panes_take_the_width() {
+        let mut a = app();
+        a.set_screen(rect(0, 0, 120, 40));
+        open_attached(&mut a, "w1");
+        a.focus = Focus::Sidebar;
+        let shown = a.panes_area;
+        assert_eq!(shown.width, 120 - 26);
+        let size = a.slots["n-w1"].size;
+
+        pk(&mut a, 'b');
+        assert!(a.sidebar_hidden && a.sidebar_cols() == 0);
+        assert_eq!(a.panes_area.width, 120);
+        assert_eq!(a.focus, Focus::Workspace, "a hidden sidebar can't have the keys");
+        let new = a.slots["n-w1"].size;
+        assert_eq!(new.0, size.0 + 26);
+        assert!(a.actions.iter().any(|x| matches!(x, Action::Resize { pane, cols, .. } if pane == "n-w1" && *cols == new.0)));
+        assert_eq!(a.slots["n-w1"].view.as_ref().unwrap().parser.screen().size().1.get(), new.0, "the parser follows");
+
+        // w asks for the sidebar: it comes back with the keyboard.
+        a.actions.clear();
+        pk(&mut a, 'w');
+        assert!(!a.sidebar_hidden && a.focus == Focus::Sidebar);
+        assert_eq!(a.slots["n-w1"].size, size);
+        pk(&mut a, 'b');
+        pk(&mut a, 'b');
+        assert!(!a.sidebar_hidden);
+    }
+
+    #[test]
+    fn the_sidebar_resizes_in_steps_inside_its_limits() {
+        let mut a = app();
+        a.set_screen(rect(0, 0, 200, 40));
+        open_attached(&mut a, "w1");
+        let start = a.slots["n-w1"].size.0;
+        pk(&mut a, '>');
+        assert_eq!(a.sidebar_w, 30);
+        assert_eq!(a.slots["n-w1"].size.0, start - 4);
+        pk(&mut a, '<');
+        pk(&mut a, '<');
+        assert_eq!(a.sidebar_w, 22);
+        assert_eq!(a.slots["n-w1"].size.0, start + 4);
+        for _ in 0..20 {
+            pk(&mut a, '<');
+        }
+        assert_eq!(a.sidebar_w, ws_ui::SIDEBAR_MIN);
+        for _ in 0..30 {
+            pk(&mut a, '>');
+        }
+        assert_eq!(a.sidebar_w, ws_ui::SIDEBAR_MAX);
+        // Resizing a hidden sidebar shows it.
+        pk(&mut a, 'b');
+        pk(&mut a, '<');
+        assert!(!a.sidebar_hidden);
+        // Narrow terminals give way: the workspace keeps at least half.
+        a.set_screen(rect(0, 0, 50, 20));
+        assert!(a.panes_area.width >= 25);
+    }
+
+    #[test]
+    fn the_sidebar_state_is_remembered() {
+        let mut a = app();
+        a.set_sidebar(Some(38), true);
+        assert_eq!((a.sidebar_w, a.sidebar_hidden), (38, true));
+        a.set_sidebar(Some(500), false);
+        assert_eq!(a.sidebar_w, ws_ui::SIDEBAR_MAX, "a bad saved value is clamped");
+        a.set_sidebar(None, false);
+        assert_eq!(a.sidebar_w, ws_ui::SIDEBAR_W);
+        // It round-trips through the saved state, and old files still load.
+        let state = crate::config::UiState { sidebar_width: Some(34), sidebar_hidden: true, ..Default::default() };
+        let back: crate::config::UiState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!((back.sidebar_width, back.sidebar_hidden), (Some(34), true));
+        let old: crate::config::UiState = serde_json::from_str(r#"{"query":"x"}"#).unwrap();
+        assert_eq!((old.sidebar_width, old.sidebar_hidden), (None, false));
+        // A hidden sidebar at start puts the keyboard in the workspace.
+        let mut b = WsApp::new(Prefix::Space, None);
+        b.set_sidebar(None, true);
+        b.synced = true;
+        let mut doc = WsDoc::default();
+        add_project(&mut doc, "p1", "x");
+        b.on_doc(doc);
+        assert_eq!(b.focus, Focus::Workspace);
     }
 }

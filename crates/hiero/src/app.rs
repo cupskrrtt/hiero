@@ -281,7 +281,13 @@ pub struct App {
     pub quit: bool,
     /// The view to open on the first snapshot (set by the workspace menu).
     pub start: Option<BoardStart>,
-    entered_start: bool,
+    /// The view the workspace menu opened the board on. While it is set the
+    /// board acts as an overlay: dialogs opened from the view return to it.
+    overlay: Option<BoardStart>,
+    /// The overlay view was closed: hand the screen back to the workspace.
+    overlay_done: bool,
+    /// The selected row of the overlay view, kept across its dialogs.
+    overlay_sel: usize,
 }
 
 impl Default for App {
@@ -325,7 +331,9 @@ impl App {
             tick: 0,
             quit: false,
             start: None,
-            entered_start: false,
+            overlay: None,
+            overlay_done: false,
+            overlay_sel: 0,
         }
     }
 
@@ -342,6 +350,9 @@ impl App {
                 self.connected_once = true;
                 self.preview.dirty = true;
                 if let Some(start) = self.start.take() {
+                    // The views read the entries (broadcast targets), which are
+                    // built from the snapshot just applied.
+                    self.rebuild();
                     self.enter_start(start);
                 }
             }
@@ -446,6 +457,8 @@ impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) {
         let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
+        let from_root = self.in_root_view();
+        self.remember_selection();
         if ctrl_c {
             match self.mode {
                 Mode::Normal | Mode::Search | Mode::Help => self.quit = true,
@@ -453,6 +466,7 @@ impl App {
                 _ => self.mode = Mode::Normal, // cancel the dialog
             }
             if !matches!(self.mode, Mode::Pane) {
+                self.overlay_after_key(from_root, true);
                 return;
             }
         }
@@ -513,7 +527,72 @@ impl App {
                 _ => Mode::Usage(rows),
             },
         };
+        self.overlay_after_key(from_root, ctrl_c);
         self.rebuild();
+    }
+
+    /// The overlay's own view is showing (not one of its dialogs).
+    fn in_root_view(&self) -> bool {
+        match (self.overlay, &self.mode) {
+            (Some(BoardStart::Tasks), Mode::Tasks(_))
+            | (Some(BoardStart::Pipelines), Mode::Pipelines(_))
+            | (Some(BoardStart::Usage), Mode::Usage(_))
+            | (Some(BoardStart::Templates), Mode::Templates(_)) => true,
+            (Some(BoardStart::Broadcast), Mode::Input(d)) => matches!(d.purpose, InputPurpose::Broadcast(_)),
+            _ => false,
+        }
+    }
+
+    fn remember_selection(&mut self) {
+        self.overlay_sel = match &self.mode {
+            Mode::Tasks(v) => v.selected,
+            Mode::Pipelines(v) => v.selected,
+            Mode::Templates(v) => v.selected,
+            _ => return,
+        };
+    }
+
+    /// The board was opened from the workspace menu on a view. Closing that
+    /// view (q, Esc) leaves; confirming something in a dialog opened from it
+    /// comes back to it. Jumping to an agent (`g`, Enter on a run) lands on
+    /// the real board, and `q` there leaves.
+    fn overlay_after_key(&mut self, from_root: bool, ctrl_c: bool) {
+        let Some(home) = self.overlay else { return };
+        if !matches!(self.mode, Mode::Normal) {
+            return;
+        }
+        if self.want_select.is_some() {
+            self.overlay = None;
+        } else if from_root || ctrl_c || home == BoardStart::Broadcast {
+            self.overlay_done = true;
+        } else {
+            self.mode = self.home_view(home);
+        }
+    }
+
+    /// The overlay's view again, after one of its dialogs.
+    fn home_view(&mut self, home: BoardStart) -> Mode {
+        let sel = self.overlay_sel;
+        match home {
+            BoardStart::Tasks => Mode::Tasks(TasksView { selected: sel.min(self.task_list().len().saturating_sub(1)) }),
+            BoardStart::Pipelines => {
+                let mut m = self.pipelines_view();
+                if let Mode::Pipelines(v) = &mut m {
+                    let n = v.specs.len() + self.run_list().len();
+                    v.selected = sel.min(n.saturating_sub(1));
+                }
+                m
+            }
+            BoardStart::Usage => self.usage_view(),
+            BoardStart::Templates => {
+                let mut m = self.templates_view();
+                if let Mode::Templates(v) = &mut m {
+                    v.selected = sel.min(v.items.len().saturating_sub(1));
+                }
+                m
+            }
+            BoardStart::Board | BoardStart::Broadcast => Mode::Normal,
+        }
     }
 
     fn usage_view(&mut self) -> Mode {
@@ -571,8 +650,8 @@ impl App {
             show_finished: Some(self.show_finished),
             selected: self.selected.clone(),
             query: self.query.clone(),
-            // Belongs to the workspace screen; don't wipe it.
-            workspace: crate::config::load_ui_state().workspace,
+            // The workspace screen's fields (open workspace, sidebar) are kept.
+            ..crate::config::load_ui_state()
         }
     }
 
@@ -658,17 +737,21 @@ impl App {
             }
             BoardStart::Broadcast => match self.broadcast_mode() {
                 Some(m) => m,
-                None => return,
+                None => {
+                    // Nothing to send to: back to the workspace.
+                    self.overlay_done = true;
+                    return;
+                }
             },
         };
         self.mode = mode;
-        self.entered_start = true;
+        self.overlay = Some(start);
     }
 
     /// The board was opened on a view and that view is closed again: the
     /// board has done its job and the caller (the workspace) takes over.
     pub fn start_done(&self) -> bool {
-        self.entered_start && matches!(self.mode, Mode::Normal)
+        self.overlay_done
     }
 
     fn pipelines_view(&mut self) -> Mode {
@@ -886,7 +969,10 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => v.selected = v.selected.saturating_sub(1),
             KeyCode::Enter | KeyCode::Char('v') => {
                 if let Some(t) = list.get(v.selected) {
-                    return self.open_review(t);
+                    if t.status.has_worktree() {
+                        return self.open_review(t);
+                    }
+                    self.flash_error(&format!("{} was {} — nothing left to review", t.title, t.status.word()));
                 }
             }
             KeyCode::Char('g') => {
@@ -1866,5 +1952,123 @@ mod tests {
         assert_eq!(fmt_dur(65 * 60_000), "1h05m");
         assert!(fuzzy_match("bta", "beta"));
         assert!(!fuzzy_match("x", "beta"));
+    }
+
+    // ---- the menu views act as overlays ------------------------------------------
+
+    fn merged_task(id: &str) -> crate::tasks::Task {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "title": id, "repo": "/tmp", "base_branch": "main", "branch": "hiero/x",
+            "worktree": "/tmp/x", "created_ms": 1, "status": "merged"
+        }))
+        .unwrap()
+    }
+
+    fn overlay_on(start: BoardStart, agents: Vec<Terminal>) -> App {
+        let mut app = App::new();
+        app.start = Some(start);
+        app.on_watch(&WatchMsg::Snapshot { seq: 1, terminals: agents });
+        app.actions.clear();
+        app
+    }
+
+    fn press(app: &mut App, c: char) {
+        app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn forgetting_a_task_keeps_the_tasks_view_and_q_leaves() {
+        let mut app = overlay_on(BoardStart::Tasks, vec![]);
+        let mut doc = tasks::Doc::default();
+        doc.tasks.insert("a".into(), merged_task("a"));
+        doc.tasks.insert("b".into(), merged_task("b"));
+        app.on_doc(doc);
+        assert!(matches!(app.mode, Mode::Tasks(_)));
+
+        press(&mut app, 'j');
+        press(&mut app, 'D');
+        assert!(matches!(app.mode, Mode::Confirm(_)));
+        press(&mut app, 'y');
+        // Confirmed: the action is queued, and we are still in the view, on the same row.
+        assert!(app.actions.iter().any(|a| matches!(a, Action::TaskOps(_))));
+        assert!(matches!(&app.mode, Mode::Tasks(v) if v.selected == 1));
+        assert!(!app.start_done());
+
+        // Cancelling a dialog also stays.
+        press(&mut app, 'D');
+        press(&mut app, 'n');
+        assert!(matches!(app.mode, Mode::Tasks(_)) && !app.start_done());
+
+        // Only q (or Esc) from the view itself leaves.
+        press(&mut app, 'q');
+        assert!(app.start_done());
+        let mut app = overlay_on(BoardStart::Tasks, vec![]);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.start_done());
+    }
+
+    #[test]
+    fn launching_a_pipeline_returns_to_the_pipelines_view() {
+        let mut app = overlay_on(BoardStart::Pipelines, vec![]);
+        assert!(matches!(app.mode, Mode::Pipelines(_)));
+        press(&mut app, 'r'); // the form for the first pipeline
+        assert!(matches!(app.mode, Mode::Launch(_)));
+        for c in "do it".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.actions.iter().any(|a| matches!(a, Action::LaunchRun { .. })));
+        assert!(matches!(app.mode, Mode::Pipelines(_)) && !app.start_done());
+        press(&mut app, 'q');
+        assert!(app.start_done());
+    }
+
+    #[test]
+    fn usage_and_templates_leave_on_q_only() {
+        let mut app = overlay_on(BoardStart::Usage, vec![]);
+        press(&mut app, 'r'); // refresh stays
+        assert!(matches!(app.mode, Mode::Usage(_)) && !app.start_done());
+        press(&mut app, 'q');
+        assert!(app.start_done());
+
+        let mut app = overlay_on(BoardStart::Templates, vec![]);
+        press(&mut app, 'n'); // new template prompt
+        assert!(matches!(app.mode, Mode::Input(_)));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Templates(_)) && !app.start_done());
+        press(&mut app, 'q');
+        assert!(app.start_done());
+    }
+
+    #[test]
+    fn broadcast_prompt_closes_after_sending_or_esc() {
+        let mut app = overlay_on(BoardStart::Broadcast, vec![term("t1", "alpha")]);
+        assert!(matches!(app.mode, Mode::Input(_)));
+        for c in "hi".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.actions.iter().any(|a| matches!(a, Action::Broadcast { .. })));
+        assert!(app.start_done());
+
+        let mut app = overlay_on(BoardStart::Broadcast, vec![term("t1", "alpha")]);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.start_done());
+        // With nobody to send to the board hands the screen straight back.
+        assert!(overlay_on(BoardStart::Broadcast, vec![]).start_done());
+    }
+
+    #[test]
+    fn jumping_to_an_agent_lands_on_the_board_and_q_there_quits() {
+        let mut app = overlay_on(BoardStart::Tasks, vec![term("t1", "alpha")]);
+        let mut doc = tasks::Doc::default();
+        let mut t = merged_task("a");
+        t.terminal = Some("t1".into());
+        doc.tasks.insert("a".into(), t);
+        app.on_doc(doc);
+        press(&mut app, 'g');
+        assert!(matches!(app.mode, Mode::Normal) && !app.start_done());
+        press(&mut app, 'q');
+        assert!(app.quit);
     }
 }

@@ -22,7 +22,17 @@ use clap::{Parser, Subcommand};
 use hc_client::{AgentState, Client, Filter, TerminalSet, WatchMsg, Watcher, endpoint};
 
 #[derive(Parser)]
-#[command(name = "hiero", version, about = "A terminal workspace on top of herdr-core")]
+#[command(
+    name = "hiero",
+    version,
+    about = "A terminal workspace on top of herdr-core",
+    long_about = "A terminal workspace on top of herdr-core.\n\n\
+        Run `hiero` with no command to open the workspace: a sidebar of projects and named \
+        workspaces, and tabs and splits of terminals (nvim, Claude Code, shells) that keep \
+        running when you quit. Hiero's keys sit behind a prefix key (default ctrl+b); press \
+        the prefix then ? for help. The agent tools (board, tasks, pipelines, usage, templates, \
+        broadcast) are in the prefix menu (m), or `hiero board`."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -67,7 +77,7 @@ enum Command {
         #[arg(long, default_value = "hiero")]
         app: String,
     },
-    /// Send one message to many live agents.
+    /// Send one message to many live agents (the same as the board's broadcast).
     Broadcast {
         /// The message.
         text: String,
@@ -81,7 +91,7 @@ enum Command {
     /// Workspaces: projects, named workspaces, tabs and panes.
     #[command(subcommand)]
     Ws(WsCmd),
-    /// The agent board: every terminal at a glance (the screen before workspaces).
+    /// The agent board (also in the workspace menu): every terminal at a glance, tasks, pipelines.
     Board,
     /// Hiero's settings file.
     Config {

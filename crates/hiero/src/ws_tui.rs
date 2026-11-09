@@ -95,8 +95,9 @@ async fn event_loop(
     config_error: Option<String>,
 ) -> Result<()> {
     let remember = config::get().board.remember;
-    let restore = if remember { config::load_ui_state().workspace } else { None };
-    let mut app = WsApp::new(config::get().prefix(), restore);
+    let saved = if remember { config::load_ui_state() } else { config::UiState::default() };
+    let mut app = WsApp::new(config::get().prefix(), saved.workspace);
+    app.set_sidebar(saved.sidebar_width, saved.sidebar_hidden);
     app.auto_restore = config::get().workspace.restore;
     if let Some(e) = config_error {
         tracing::warn!("{e}");
@@ -272,6 +273,7 @@ async fn event_loop(
                         let _ = tx.send(Msg::Doc(workspace::load(&c2).await));
                     });
                     client = Some(c);
+                    app.on_connected();
                 }
                 Msg::Connected(Err(e)) => {
                     connecting = false;
@@ -310,7 +312,7 @@ async fn event_loop(
                     }
                 }
             },
-            _ = slow.tick() => {} // lets a message in the bottom bar expire
+            _ = slow.tick() => app.on_tick(), // also lets a message in the bottom bar expire
         }
         if app.quit {
             break;
@@ -319,6 +321,8 @@ async fn event_loop(
     if remember {
         let mut state = config::load_ui_state();
         state.workspace = app.open.clone();
+        state.sidebar_width = Some(app.sidebar_w);
+        state.sidebar_hidden = app.sidebar_hidden;
         config::save_ui_state(&state);
     }
     // Detach every stream cleanly; the programs keep running.

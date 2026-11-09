@@ -9,7 +9,10 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 
-const SIDEBAR_W: u16 = 26;
+/// Default sidebar width, and the range `<` `>` keep it in.
+pub const SIDEBAR_W: u16 = 26;
+pub const SIDEBAR_MIN: u16 = 16;
+pub const SIDEBAR_MAX: u16 = 60;
 
 pub struct Areas {
     pub banner: Rect,
@@ -21,10 +24,12 @@ pub struct Areas {
     pub bottom: Rect,
 }
 
-pub fn areas(area: Rect, banner: bool) -> Areas {
+/// `sidebar` is the wanted width in columns; 0 hides it. On a narrow screen
+/// it gives way so the workspace keeps at least half.
+pub fn areas(area: Rect, banner: bool, sidebar: u16) -> Areas {
     let [banner_row, body, bottom] =
         Layout::vertical([Constraint::Length(banner as u16), Constraint::Min(3), Constraint::Length(1)]).areas(area);
-    let sb = if area.width >= 60 { SIDEBAR_W } else { area.width / 3 };
+    let sb = if sidebar == 0 { 0 } else { sidebar.min(area.width / 2) };
     let [sidebar, work] = Layout::horizontal([Constraint::Length(sb), Constraint::Min(1)]).areas(body);
     let [tabs, panes] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(work);
     Areas { banner: banner_row, sidebar, tabs, panes, bottom }
@@ -41,7 +46,7 @@ fn dot(s: WsStatus) -> Span<'static> {
 }
 
 pub fn draw(f: &mut Frame, app: &WsApp) {
-    let a = areas(f.area(), app.disconnected.is_some());
+    let a = areas(f.area(), app.disconnected.is_some(), app.sidebar_cols());
     if let Some(err) = &app.disconnected {
         let msg = if app.connected_once {
             format!(" ✗ lost herdr-core: {err} — reconnecting… ")
@@ -50,7 +55,9 @@ pub fn draw(f: &mut Frame, app: &WsApp) {
         };
         f.render_widget(Paragraph::new(msg).style(Style::new().bg(Color::Red).fg(Color::White).bold()), a.banner);
     }
-    draw_sidebar(f, app, a.sidebar);
+    if a.sidebar.width > 0 {
+        draw_sidebar(f, app, a.sidebar);
+    }
     draw_tabs(f, app, a.tabs);
     draw_panes(f, app, a.panes);
     draw_bottom(f, app, a.bottom);
@@ -224,7 +231,7 @@ fn draw_bottom(f: &mut Frame, app: &WsApp, area: Rect) {
     if app.armed {
         spans.push(Span::styled(" prefix ", Style::new().bg(Color::Yellow).fg(Color::Black).bold()));
         spans.push(Span::raw(
-            " t/T tab · v/s split (V/S ask) · hjkl move · HJKL size · 1-9 [ ] tab · r rename · x/X close · z zoom · w sidebar · m menu · ? help",
+            " t/T tab · v/s split (V/S ask) · hjkl move · HJKL size · 1-9 [ ] tab · r rename · x/X close · z zoom · w sidebar · b hide · < > size · m menu · ? help",
         ));
     } else if let Some((msg, error)) = app.current_flash() {
         let style = if error { Style::new().fg(Color::Red) } else { Style::new().fg(Color::Green) };
@@ -279,7 +286,9 @@ pub fn help_lines(prefix: &str) -> Vec<Line<'static>> {
         Line::from("  r          rename the tab"),
         Line::from("  x / X      close the pane / the tab (ends its programs)"),
         Line::from("  z          zoom the pane to the whole area, again to undo"),
-        Line::from("  w          sidebar / back to the workspace"),
+        Line::from("  w          sidebar / back to the workspace (shows a hidden sidebar)"),
+        Line::from("  b          hide or show the sidebar"),
+        Line::from("  < / >      narrower / wider sidebar"),
         Line::from("  n / N      new workspace in this project / new project"),
         Line::from("  m          menu: agents board, tasks, pipelines, usage, templates, broadcast"),
         Line::from("  ?          this help        q   quit Hiero (terminals keep running)"),
