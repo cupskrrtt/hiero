@@ -11,25 +11,23 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 
 const SIDEBAR_W: u16 = 26;
 
-struct Areas {
-    banner: Rect,
-    sidebar: Rect,
-    work: Rect,
-    bottom: Rect,
+pub struct Areas {
+    pub banner: Rect,
+    pub sidebar: Rect,
+    /// The tabs bar, one line.
+    pub tabs: Rect,
+    /// Where the panes of the active tab go.
+    pub panes: Rect,
+    pub bottom: Rect,
 }
 
-fn areas(area: Rect, banner: bool) -> Areas {
+pub fn areas(area: Rect, banner: bool) -> Areas {
     let [banner_row, body, bottom] =
         Layout::vertical([Constraint::Length(banner as u16), Constraint::Min(3), Constraint::Length(1)]).areas(area);
     let sb = if area.width >= 60 { SIDEBAR_W } else { area.width / 3 };
     let [sidebar, work] = Layout::horizontal([Constraint::Length(sb), Constraint::Min(1)]).areas(body);
-    Areas { banner: banner_row, sidebar, work, bottom }
-}
-
-/// The cells the pane's program gets, for a screen of `area`.
-pub fn pane_inner(area: Rect, banner: bool) -> Rect {
-    let inner = Block::new().borders(Borders::ALL).inner(areas(area, banner).work);
-    Rect::new(0, 0, inner.width.max(1), inner.height.max(1))
+    let [tabs, panes] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(work);
+    Areas { banner: banner_row, sidebar, tabs, panes, bottom }
 }
 
 fn dot(s: WsStatus) -> Span<'static> {
@@ -53,7 +51,8 @@ pub fn draw(f: &mut Frame, app: &WsApp) {
         f.render_widget(Paragraph::new(msg).style(Style::new().bg(Color::Red).fg(Color::White).bold()), a.banner);
     }
     draw_sidebar(f, app, a.sidebar);
-    draw_work(f, app, a.work);
+    draw_tabs(f, app, a.tabs);
+    draw_panes(f, app, a.panes);
     draw_bottom(f, app, a.bottom);
     match &app.dialog {
         Some(Dialog::Help) => draw_help(f, f.area(), &app.prefix.label()),
@@ -120,50 +119,92 @@ fn draw_sidebar(f: &mut Frame, app: &WsApp, area: Rect) {
     }
 }
 
-fn draw_work(f: &mut Frame, app: &WsApp, area: Rect) {
-    let focused = app.focus == Focus::Workspace && app.dialog.is_none();
-    let mut title = vec![Span::raw(" ")];
-    if let Some((p, w, tab, panes)) = app.open_title() {
-        title.push(Span::styled(format!("{p} › {w} › {tab}"), Style::new().bold()));
-        if panes > 1 {
-            title.push(Span::styled(format!(" (1 of {panes} panes)"), Style::new().dim()));
-        }
-        if let Some(view) = &app.pane {
-            title.push(Span::styled(format!(" · {}", view.addr), Style::new().dim()));
-        }
-        title.push(Span::raw(" "));
-    } else {
-        title.push(Span::styled("no workspace open ", Style::new().dim()));
+/// The tab names in order; the active one is highlighted. No status here:
+/// the sidebar has the dots.
+fn draw_tabs(f: &mut Frame, app: &WsApp, area: Rect) {
+    let Some((w, active)) = app.active() else {
+        f.render_widget(Paragraph::new(" no workspace open").dim(), area);
+        return;
+    };
+    let mut spans = vec![Span::raw(" ")];
+    for (i, t) in w.tabs.iter().enumerate() {
+        let label = format!(" {} {} ", i + 1, t.name);
+        let style = if t.id == active.id {
+            Style::new().bg(Color::Green).fg(Color::Black).bold()
+        } else {
+            Style::new().dim()
+        };
+        spans.push(Span::styled(label, style));
+        spans.push(Span::raw(" "));
     }
-    let mut color = border(focused);
-    if let Some(why) = app.pane.as_ref().and_then(|p| p.ended.as_ref()) {
+    if app.zoomed() {
+        spans.push(Span::styled(" zoom ", Style::new().fg(Color::Yellow)));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Every pane of the active tab in its own bordered box.
+fn draw_panes(f: &mut Frame, app: &WsApp, area: Rect) {
+    let rects = app.pane_rects();
+    if rects.is_empty() {
+        let label = app.prefix.label();
+        let text = if app.doc.projects.is_empty() {
+            vec![Line::from("no projects yet"), Line::from(format!("press {label} N to add one")).dim()]
+        } else {
+            vec![Line::from("no workspace open"), Line::from(format!("press {label} w to pick a workspace")).dim()]
+        };
+        f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), area);
+        return;
+    }
+    let focused_id = app.focused_pane();
+    let in_workspace = app.focus == Focus::Workspace && app.dialog.is_none();
+    for (id, r) in rects {
+        let is_focused = focused_id.as_deref() == Some(id.as_str());
+        draw_pane(f, app, &id, r, is_focused, in_workspace);
+    }
+}
+
+fn draw_pane(f: &mut Frame, app: &WsApp, id: &str, r: Rect, is_focused: bool, in_workspace: bool) {
+    let Some((_, _, pane)) = app.doc.pane(id) else { return };
+    let slot = app.slots.get(id);
+    let view = slot.and_then(|s| s.view.as_ref());
+    let ended = view.and_then(|v| v.ended.as_ref());
+
+    let mut title = vec![Span::styled(
+        format!(" {} ", pane.command.as_deref().unwrap_or("shell")),
+        if is_focused { Style::new().bold() } else { Style::new() },
+    )];
+    if let Some(v) = view {
+        title.push(Span::styled(format!("{} ", v.addr), Style::new().dim()));
+    }
+    let mut color = if is_focused {
+        Style::new().fg(if in_workspace { Color::Green } else { Color::LightGreen })
+    } else {
+        Style::new().fg(Color::DarkGray)
+    };
+    if let Some(why) = ended {
         title.push(Span::styled(format!("· ended: {why} "), Style::new().fg(Color::Red)));
         color = Style::new().fg(Color::Red);
     }
     let mut block = Block::new()
         .borders(Borders::ALL)
-        .border_type(if focused { BorderType::Thick } else { BorderType::Plain })
+        .border_type(if is_focused && in_workspace { BorderType::Thick } else { BorderType::Plain })
         .border_style(color)
         .title(Line::from(title));
-    if app.pane.as_ref().is_some_and(|p| p.ended.is_some()) {
-        block = block.title_bottom(Line::from(Span::styled(" enter: start a new shell here ", Style::new().dim())));
+    if is_focused && (ended.is_some() || slot.is_some_and(|s| s.error.is_some())) {
+        let hint = if ended.is_some() { " enter: start a new shell here " } else { " enter: try again " };
+        block = block.title_bottom(Line::from(Span::styled(hint, Style::new().dim())));
     }
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = block.inner(r);
+    f.render_widget(block, r);
 
-    if let Some(view) = &app.pane {
-        draw_vt(f, &view.parser, inner, focused && view.ended.is_none());
+    if let Some(view) = view {
+        draw_vt(f, &view.parser, inner, is_focused && in_workspace && ended.is_none());
         return;
     }
-    let label = app.prefix.label();
-    let text = if let Some(err) = &app.pane_error {
-        vec![Line::from(Span::styled(format!("can't open this workspace: {err}"), Style::new().fg(Color::Red))), Line::from(""), Line::from("enter tries again").dim()]
-    } else if app.open.is_some() {
-        vec![Line::from("opening…").dim()]
-    } else if app.doc.projects.is_empty() {
-        vec![Line::from("no projects yet"), Line::from(format!("press {label} N to add one")).dim()]
-    } else {
-        vec![Line::from("no workspace open"), Line::from(format!("press {label} w to pick a workspace")).dim()]
+    let text = match slot.and_then(|s| s.error.as_ref()) {
+        Some(err) => Line::from(Span::styled(format!("can't open this pane: {err}"), Style::new().fg(Color::Red))),
+        None => Line::from("opening…").dim(),
     };
     f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
 }
@@ -173,7 +214,9 @@ fn draw_bottom(f: &mut Frame, app: &WsApp, area: Rect) {
     let mut spans: Vec<Span> = Vec::new();
     if app.armed {
         spans.push(Span::styled(" prefix ", Style::new().bg(Color::Yellow).fg(Color::Black).bold()));
-        spans.push(Span::raw(" w sidebar · n new workspace · N new project · ? help · q quit · esc cancel"));
+        spans.push(Span::raw(
+            " t/T tab · v/s split (V/S ask) · hjkl move · HJKL size · 1-9 [ ] tab · r rename · x/X close · z zoom · w sidebar · ? help",
+        ));
     } else if let Some((msg, error)) = app.current_flash() {
         let style = if error { Style::new().fg(Color::Red) } else { Style::new().fg(Color::Green) };
         spans.push(Span::styled(format!(" {msg}"), style));
@@ -184,7 +227,7 @@ fn draw_bottom(f: &mut Frame, app: &WsApp, area: Rect) {
         ));
     } else {
         spans.push(Span::styled(format!(" {label}"), Style::new().bold()));
-        spans.push(Span::styled(" then  w sidebar · n new · ? help · q quit", Style::new().dim()));
+        spans.push(Span::styled(" then  t tab · v s split · hjkl move · z zoom · w sidebar · ? help · q quit", Style::new().dim()));
     }
     let right = app.attention().map(|(p, w)| Span::styled(format!("◐ {p} › {w} needs you "), Style::new().fg(Color::Red).bold()));
     let rw = right.as_ref().map(|s| s.width() as u16).unwrap_or(0);
@@ -218,13 +261,19 @@ fn draw_form(f: &mut Frame, form: &Form, area: Rect) {
 fn draw_help(f: &mut Frame, area: Rect, prefix: &str) {
     let text = vec![
         Line::from(format!("Prefix: {prefix}, then").bold()),
-        Line::from("  w        sidebar / back to the workspace"),
-        Line::from("  n        new workspace in this project"),
-        Line::from("  N        new project"),
-        Line::from("  ?        this help"),
-        Line::from("  q        quit Hiero (terminals keep running)"),
+        Line::from("  t / T      new tab (T asks for a command first)"),
+        Line::from("  v / s      split side by side / stacked (V / S ask for a command)"),
+        Line::from("  h j k l    move to the pane left / below / above / right (arrows too)"),
+        Line::from("  H J K L    narrower / taller / shorter / wider"),
+        Line::from("  1 .. 9     go to tab N        [ ]   previous / next tab"),
+        Line::from("  r          rename the tab"),
+        Line::from("  x / X      close the pane / the tab (ends its programs)"),
+        Line::from("  z          zoom the pane to the whole area, again to undo"),
+        Line::from("  w          sidebar / back to the workspace"),
+        Line::from("  n / N      new workspace in this project / new project"),
+        Line::from("  ?          this help        q   quit Hiero (terminals keep running)"),
         Line::from(format!("  {prefix}   send the prefix key itself to the program")),
-        Line::from("  esc      cancel"),
+        Line::from("  esc        cancel"),
         Line::from(""),
         Line::from("Sidebar".bold()),
         Line::from("  j k, ↑ ↓   move              enter   open workspace / fold project"),
@@ -236,7 +285,7 @@ fn draw_help(f: &mut Frame, area: Rect, prefix: &str) {
         Line::from(Span::styled("status: ● working  ◐ needs you  ✓ done  ○ idle  · no terminal", Style::new().dim())),
         Line::from(Span::styled("press any key to close", Style::new().dim())),
     ];
-    let w = 76.min(area.width.saturating_sub(4));
+    let w = 78.min(area.width.saturating_sub(4));
     let h = (text.len() as u16 + 2).min(area.height.saturating_sub(2));
     let r = Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h);
     f.render_widget(Clear, r);

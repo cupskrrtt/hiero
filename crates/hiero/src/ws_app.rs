@@ -6,15 +6,20 @@
 use crate::app::{Alert, PaneView, status_from_labels};
 use crate::config::Prefix;
 use crate::forms::{TextInput, expand_home};
-use crate::workspace::{self, Move, WsDoc, WsOp, WsStatus, new_id};
+use crate::workspace::{self, Dir, Move, Tab, Workspace, WsDoc, WsOp, WsStatus, new_id};
+use crate::ws_ui;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hc_client::{EventData, RunParams, TerminalSet, WatchMsg};
-use std::collections::HashMap;
+use ratatui::layout::Rect;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 pub const LABEL_WS: &str = "hiero.ws";
 pub const LABEL_PANE: &str = "hiero.pane";
 pub const LABEL_PROJECT: &str = "hiero.project";
+
+/// How much one `H` `J` `K` `L` press moves a border, in percent of the split.
+const RESIZE_STEP: i16 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -54,22 +59,27 @@ impl Plan {
     }
 }
 
-/// Work for the event loop.
+/// Work for the event loop. (Short-lived and few, so the size gap is fine.)
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Action {
     LoadDoc,
     Update(Vec<WsOp>),
-    /// Close the attach stream (the program keeps running).
-    Detach,
-    Open(Plan),
+    /// Close the pane's attach stream (the program keeps running).
+    Detach(String),
+    /// Start or attach, then stream into a pane of this many inner cells.
+    /// `attempt` tells a late answer from one for an older attempt.
+    Open { plan: Plan, attempt: u64, cols: u16, rows: u16 },
+    Resize { pane: String, cols: u16, rows: u16 },
+    /// Kill these terminals and remove them from hc.
+    Kill(Vec<String>),
 }
 
-/// W2 shows one pane per workspace: the focused pane of the active tab.
-/// With `fresh` a new terminal is started even if the old one still runs.
-pub fn plan(doc: &WsDoc, set: &TerminalSet, ws_id: &str, fresh: bool) -> Option<Plan> {
+/// How to fill one pane. With `fresh` a new terminal is started even if the
+/// old one still runs.
+pub fn plan(doc: &WsDoc, set: &TerminalSet, ws_id: &str, pane_id: &str, fresh: bool) -> Option<Plan> {
     let (project, w) = doc.workspace(ws_id)?;
-    let tab = w.tabs.get(w.active_tab).or(w.tabs.first())?;
-    let pane = tab.layout.find(&tab.focus).or_else(|| tab.layout.panes().into_iter().next())?;
+    let pane = w.panes().into_iter().find(|p| p.id == pane_id)?;
     if !fresh
         && let Some(addr) = &pane.terminal
         && set.get(addr).is_some_and(|t| t.is_live())
@@ -86,12 +96,64 @@ pub fn plan(doc: &WsDoc, set: &TerminalSet, ws_id: &str, fresh: bool) -> Option<
     Some(Plan::Start { pane: pane.id.clone(), params })
 }
 
+/// A direction for moving the focus between panes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nav {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// The pane next to `from` in direction `nav`, by where the panes really are:
+/// the nearest ones that overlap it along the other axis, the biggest overlap
+/// first (the first one, top or left, on a tie).
+pub fn neighbor(rects: &[(String, Rect)], from: &str, nav: Nav) -> Option<String> {
+    let me = rects.iter().find(|(id, _)| id == from)?.1;
+    let span = |r: Rect, vertical_axis: bool| -> (i32, i32) {
+        if vertical_axis { (r.y as i32, r.y as i32 + r.height as i32) } else { (r.x as i32, r.x as i32 + r.width as i32) }
+    };
+    let (mut best, mut best_key) = (None, (i32::MAX, 0));
+    for (id, r) in rects.iter().filter(|(id, _)| id != from) {
+        // `gap` along the move axis; `lo..hi` overlap on the other.
+        let (gap, (a0, a1), (b0, b1)) = match nav {
+            Nav::Right => (r.x as i32 - (me.x as i32 + me.width as i32), span(me, true), span(*r, true)),
+            Nav::Left => (me.x as i32 - (r.x as i32 + r.width as i32), span(me, true), span(*r, true)),
+            Nav::Down => (r.y as i32 - (me.y as i32 + me.height as i32), span(me, false), span(*r, false)),
+            Nav::Up => (me.y as i32 - (r.y as i32 + r.height as i32), span(me, false), span(*r, false)),
+        };
+        let overlap = a1.min(b1) - a0.max(b0);
+        if gap < 0 || overlap <= 0 {
+            continue;
+        }
+        let key = (gap, -overlap);
+        if best.is_none() || key < best_key {
+            best = Some(id.clone());
+            best_key = key;
+        }
+    }
+    best
+}
+
 // ---- dialogs ----------------------------------------------------------------
 
 pub enum FormKind {
     AddProject,
     AddWorkspace { project: String },
     Rename { id: String },
+    RenameTab { id: String },
+    /// A new tab, asking what it runs first.
+    NewTab { workspace: String },
+    /// A split of `pane`, asking what the new pane runs first.
+    NewSplit { pane: String, dir: Dir },
+}
+
+/// What a yes/no question is about.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfirmKind {
+    Delete(String),
+    ClosePane(String),
+    CloseTab(String),
 }
 
 pub struct Field {
@@ -110,7 +172,7 @@ pub struct Form {
 pub enum Dialog {
     Help,
     Form(Form),
-    Confirm { id: String, message: String },
+    Confirm { kind: ConfirmKind, message: String },
 }
 
 /// What a key press means for the program in the pane.
@@ -119,6 +181,16 @@ pub enum Out {
     Key(KeyEvent),
     /// Raw bytes (the prefix key typed twice).
     Bytes(Vec<u8>),
+}
+
+/// One pane of the active tab: its stream's screen, or why it has none.
+pub struct Slot {
+    pub attempt: u64,
+    /// Present once attached.
+    pub view: Option<PaneView>,
+    pub error: Option<String>,
+    /// Inner cells (cols, rows) the stream and the parser have.
+    pub size: (u16, u16),
 }
 
 /// A short error in the bottom bar.
@@ -140,10 +212,15 @@ pub struct WsApp {
     pub dialog: Option<Dialog>,
     /// The workspace shown in the pane area.
     pub open: Option<String>,
-    /// The pane being opened or shown (so a late attach for another one is dropped).
-    pub want: Option<String>,
-    pub pane: Option<PaneView>,
-    pub pane_error: Option<String>,
+    /// The panes of the active tab that are open or opening, by pane id.
+    pub slots: HashMap<String, Slot>,
+    /// Panes whose terminal is being started right now (never start one twice).
+    starting: HashSet<String>,
+    next_attempt: u64,
+    /// The tab (id) whose focused pane fills the area. View only, not saved.
+    pub zoom: Option<String>,
+    /// Where the panes go (below the tabs bar).
+    pub panes_area: Rect,
     pub actions: Vec<Action>,
     pub disconnected: Option<String>,
     pub connected_once: bool,
@@ -171,9 +248,11 @@ impl WsApp {
             armed: false,
             dialog: None,
             open: None,
-            want: None,
-            pane: None,
-            pane_error: None,
+            slots: HashMap::new(),
+            starting: HashSet::new(),
+            next_attempt: 0,
+            zoom: None,
+            panes_area: ws_ui::areas(Rect::new(0, 0, 100, 30), false).panes,
             actions: Vec::new(),
             disconnected: None,
             connected_once: false,
@@ -362,70 +441,194 @@ impl WsApp {
         if let Some(id) = &self.open
             && self.doc.workspace(id).is_none()
         {
-            self.close_pane();
+            self.open = None;
         }
         self.fix_sel();
+        self.sync();
     }
 
-    // ---- the pane -------------------------------------------------------------
+    // ---- the panes ------------------------------------------------------------
 
-    pub fn close_pane(&mut self) {
-        self.open = None;
-        self.want = None;
-        self.pane = None;
-        self.pane_error = None;
-        self.actions.push(Action::Detach);
+    /// The open workspace and its active tab.
+    pub fn active(&self) -> Option<(&Workspace, &Tab)> {
+        let (_, w) = self.doc.workspace(self.open.as_deref()?)?;
+        let t = w.tabs.get(w.active_tab).or(w.tabs.first())?;
+        Some((w, t))
     }
 
-    /// Show a workspace. Does nothing when it is already shown and its
-    /// program still runs.
+    /// The pane of the active tab that has the keyboard.
+    pub fn focused_pane(&self) -> Option<String> {
+        let (_, t) = self.active()?;
+        let p = t.layout.find(&t.focus).or_else(|| t.layout.panes().into_iter().next())?;
+        Some(p.id.clone())
+    }
+
+    pub fn zoomed(&self) -> bool {
+        self.active().is_some_and(|(_, t)| self.zoom.as_deref() == Some(t.id.as_str()))
+    }
+
+    /// Where the panes of the active tab are drawn (outer cells, borders
+    /// included). Zoomed: only the focused pane, over the whole area.
+    pub fn pane_rects(&self) -> Vec<(String, Rect)> {
+        let Some((_, t)) = self.active() else { return vec![] };
+        if self.zoomed()
+            && let Some(f) = self.focused_pane()
+        {
+            return vec![(f, self.panes_area)];
+        }
+        workspace::rects(&t.layout, self.panes_area)
+    }
+
+    /// The cells the program gets inside a pane's border.
+    fn inner(r: Rect) -> (u16, u16) {
+        (r.width.saturating_sub(2).max(1), r.height.saturating_sub(2).max(1))
+    }
+
+    fn size_of(&self, pane: &str) -> (u16, u16) {
+        let r = self.pane_rects().into_iter().find(|(id, _)| id == pane).map(|(_, r)| r);
+        Self::inner(r.unwrap_or(self.panes_area))
+    }
+
+    /// The screen changed size (or the banner came or went).
+    pub fn set_screen(&mut self, screen: Rect) {
+        self.panes_area = ws_ui::areas(screen, self.disconnected.is_some()).panes;
+        self.sync();
+    }
+
+    /// Make the open panes match what the document says is on screen: close
+    /// the ones that left, open the new ones (attach if the terminal still
+    /// runs, else start one), and resize the ones whose rectangle changed.
+    /// Safe to call at any time; it only acts on differences.
+    pub fn sync(&mut self) {
+        let (panes, tab) = match self.active() {
+            Some((_, t)) => (t.layout.panes().iter().map(|p| p.id.clone()).collect::<Vec<_>>(), t.id.clone()),
+            None => (vec![], String::new()),
+        };
+        if self.zoom.as_ref().is_some_and(|z| *z != tab) {
+            self.zoom = None;
+        }
+        let mut gone: Vec<String> = self.slots.keys().filter(|id| !panes.contains(id)).cloned().collect();
+        gone.sort();
+        for id in gone {
+            self.slots.remove(&id);
+            self.actions.push(Action::Detach(id));
+        }
+        let rects: HashMap<String, Rect> = self.pane_rects().into_iter().collect();
+        for id in &panes {
+            if !self.slots.contains_key(id) {
+                if !self.starting.contains(id) {
+                    self.open_slot(id, false);
+                }
+                continue;
+            }
+            let (Some(slot), Some(r)) = (self.slots.get_mut(id), rects.get(id)) else { continue };
+            let size = Self::inner(*r);
+            if let Some(view) = &mut slot.view
+                && slot.size != size
+            {
+                slot.size = size;
+                view.resize(size.0, size.1);
+                self.actions.push(Action::Resize { pane: id.clone(), cols: size.0, rows: size.1 });
+            }
+        }
+    }
+
+    fn open_slot(&mut self, pane: &str, fresh: bool) {
+        let Some(ws) = self.open.clone() else { return };
+        let Some(p) = plan(&self.doc, &self.set, &ws, pane, fresh) else { return };
+        let (cols, rows) = self.size_of(pane);
+        self.next_attempt += 1;
+        let attempt = self.next_attempt;
+        if matches!(p, Plan::Start { .. }) {
+            self.starting.insert(pane.to_string());
+        }
+        self.slots.insert(pane.to_string(), Slot { attempt, view: None, error: None, size: (cols, rows) });
+        self.actions.push(Action::Open { plan: p, attempt, cols, rows });
+    }
+
+    /// Open the workspace (when it is not open already).
     pub fn open_workspace(&mut self, id: &str) {
-        let shown = self.open.as_deref() == Some(id)
-            && (self.want.is_some() && self.pane.as_ref().is_none_or(|p| p.ended.is_none()));
-        if !shown {
-            self.show(id, false);
+        if self.open.as_deref() != Some(id) {
+            self.open = Some(id.to_string());
+            self.sync();
         }
     }
 
-    fn show(&mut self, id: &str, fresh: bool) {
-        self.pane = None;
-        self.pane_error = None;
-        self.open = Some(id.to_string());
-        self.actions.push(Action::Detach);
-        match plan(&self.doc, &self.set, id, fresh) {
-            Some(p) => {
-                self.want = Some(p.pane().to_string());
-                self.actions.push(Action::Open(p));
+    /// Enter on an ended pane starts a fresh shell (or its command) there; on a
+    /// failed one it tries the same again. A start already underway is left alone.
+    fn restart(&mut self, pane: &str, fresh: bool) {
+        if self.starting.contains(pane) {
+            return;
+        }
+        self.slots.remove(pane);
+        self.actions.push(Action::Detach(pane.to_string()));
+        self.open_slot(pane, fresh);
+    }
+
+    /// An open attempt finished. False when the pane has moved on (another tab
+    /// or workspace, or a newer attempt): the caller then closes the stream.
+    pub fn on_opened(&mut self, pane: &str, attempt: u64, result: Result<(String, u16, u16), String>) -> bool {
+        self.starting.remove(pane);
+        let Some(slot) = self.slots.get_mut(pane).filter(|s| s.attempt == attempt) else { return false };
+        let ok = result.is_ok();
+        match result {
+            Ok((addr, cols, rows)) => {
+                slot.view = Some(PaneView::new(addr.clone(), addr, cols, rows));
+                slot.size = (cols, rows);
+                slot.error = None;
             }
-            None => {
-                self.want = None;
-                self.pane_error = Some("this workspace has no pane".into());
-            }
+            Err(e) => slot.error = Some(e),
+        }
+        // The layout may have changed while we were attaching.
+        self.sync();
+        ok
+    }
+
+    /// Output or the end of a pane's stream.
+    pub fn on_stream(&mut self, pane: &str, msg: hc_client::StreamMsg) {
+        use hc_client::StreamMsg;
+        let Some(view) = self.slots.get_mut(pane).and_then(|s| s.view.as_mut()) else { return };
+        match msg {
+            StreamMsg::Data(bytes) => view.parser.process(&bytes),
+            StreamMsg::Resize { .. } => {}
+            StreamMsg::Closed(reason) => view.ended = Some(crate::attach::describe_close(reason.as_ref())),
         }
     }
 
-    pub fn wants(&self, pane: &str) -> bool {
-        self.want.as_deref() == Some(pane)
-    }
-
-    pub fn pane_attached(&mut self, addr: String, cols: u16, rows: u16) {
-        self.pane = Some(PaneView::new(addr.clone(), addr, cols, rows));
-    }
-
-    pub fn pane_failed(&mut self, err: String) {
-        self.want = None;
-        self.pane_error = Some(err);
-    }
-
+    /// The focused pane takes keys: attached and its program still runs.
     pub fn pane_live(&self) -> bool {
-        self.pane.as_ref().is_some_and(|p| p.ended.is_none())
+        self.focused_pane()
+            .and_then(|id| self.slots.get(&id))
+            .and_then(|s| s.view.as_ref())
+            .is_some_and(|v| v.ended.is_none())
     }
 
-    /// (project, workspace, tab, panes in the workspace) of the open workspace.
-    pub fn open_title(&self) -> Option<(String, String, String, usize)> {
-        let (p, w) = self.doc.workspace(self.open.as_deref()?)?;
-        let tab = w.tabs.get(w.active_tab).or(w.tabs.first()).map(|t| t.name.clone()).unwrap_or_default();
-        Some((p.name.clone(), w.name.clone(), tab, w.panes().len()))
+    /// Cursor-key mode of the focused pane's program, for encoding keys.
+    pub fn focused_app_cursor(&self) -> bool {
+        self.focused_pane()
+            .and_then(|id| self.slots.get(&id))
+            .and_then(|s| s.view.as_ref())
+            .is_some_and(|v| v.parser.screen().application_cursor())
+    }
+
+    pub fn focused_bracketed_paste(&self) -> bool {
+        self.focused_pane()
+            .and_then(|id| self.slots.get(&id))
+            .and_then(|s| s.view.as_ref())
+            .is_some_and(|v| v.parser.screen().bracketed_paste())
+    }
+
+    /// The terminal address recorded for a pane.
+    fn terminal_of(&self, pane: &str) -> Option<String> {
+        self.doc.pane(pane).and_then(|(_, _, p)| p.terminal.clone())
+    }
+
+    /// Apply an edit to our copy right away (so the next key already sees it)
+    /// and send it to the document.
+    fn edit(&mut self, op: WsOp) {
+        let _ = workspace::apply(&mut self.doc, &op);
+        self.actions.push(Action::Update(vec![op]));
+        self.sync();
     }
 
     // ---- messages -------------------------------------------------------------
@@ -443,6 +646,12 @@ impl WsApp {
 
     /// Handle a key; returns what to type into the pane's program, if anything.
     pub fn on_key(&mut self, k: KeyEvent) -> Option<Out> {
+        let out = self.key(k);
+        self.sync();
+        out
+    }
+
+    fn key(&mut self, k: KeyEvent) -> Option<Out> {
         if self.dialog.is_some() {
             self.dialog_key(k);
             return None;
@@ -490,21 +699,223 @@ impl WsApp {
             KeyCode::Char('?') => self.dialog = Some(Dialog::Help),
             KeyCode::Char('n') => self.add_workspace_form(),
             KeyCode::Char('N') => self.add_project_form(),
+            KeyCode::Char('t') => self.new_tab(None),
+            KeyCode::Char('T') => self.command_form(),
+            KeyCode::Char('v') => self.split(Dir::Horizontal, None),
+            KeyCode::Char('s') => self.split(Dir::Vertical, None),
+            KeyCode::Char('V') => self.split_form(Dir::Horizontal),
+            KeyCode::Char('S') => self.split_form(Dir::Vertical),
+            KeyCode::Char('h') | KeyCode::Left => self.move_focus(Nav::Left),
+            KeyCode::Char('j') | KeyCode::Down => self.move_focus(Nav::Down),
+            KeyCode::Char('k') | KeyCode::Up => self.move_focus(Nav::Up),
+            KeyCode::Char('l') | KeyCode::Right => self.move_focus(Nav::Right),
+            KeyCode::Char('H') => self.resize_focused(Dir::Horizontal, -RESIZE_STEP),
+            KeyCode::Char('L') => self.resize_focused(Dir::Horizontal, RESIZE_STEP),
+            KeyCode::Char('K') => self.resize_focused(Dir::Vertical, -RESIZE_STEP),
+            KeyCode::Char('J') => self.resize_focused(Dir::Vertical, RESIZE_STEP),
+            KeyCode::Char(c @ '1'..='9') => self.go_tab(Some(c as usize - '1' as usize), 0),
+            KeyCode::Char('[') => self.go_tab(None, -1),
+            KeyCode::Char(']') => self.go_tab(None, 1),
+            KeyCode::Char('r') => self.rename_tab_form(),
+            KeyCode::Char('x') => self.close_pane_confirm(),
+            KeyCode::Char('X') => self.close_tab_confirm(),
+            KeyCode::Char('z') => self.toggle_zoom(),
             _ => {} // Esc and anything unknown cancel
         }
         None
     }
 
     fn workspace_key(&mut self, k: KeyEvent) -> Option<Out> {
-        let ended = self.pane.as_ref().is_some_and(|p| p.ended.is_some());
-        if (ended || self.pane_error.is_some()) && k.code == KeyCode::Enter {
+        let id = self.focused_pane()?;
+        let slot = self.slots.get(&id)?;
+        let ended = slot.view.as_ref().is_some_and(|v| v.ended.is_some());
+        if (ended || slot.error.is_some()) && k.code == KeyCode::Enter {
             // A fresh shell where the program ended; a plain retry after a failed attach.
-            if let Some(id) = self.open.clone() {
-                self.show(&id, ended);
-            }
+            self.restart(&id, ended);
             return None;
         }
         self.pane_live().then_some(Out::Key(k))
+    }
+
+    // ---- tabs and splits ----------------------------------------------------
+
+    /// The open workspace, or a hint when there is none.
+    fn need_workspace(&mut self) -> Option<String> {
+        let id = self.active().map(|(w, _)| w.id.clone());
+        if id.is_none() {
+            self.flash_error("open a workspace first");
+        }
+        id
+    }
+
+    /// A tab name that is free in the workspace: `base`, `base 2`, `base 3`…
+    fn free_tab_name(w: &Workspace, base: &str) -> String {
+        let taken = |n: &str| w.tabs.iter().any(|t| t.name == n);
+        if !taken(base) {
+            return base.to_string();
+        }
+        (2..).map(|i| format!("{base} {i}")).find(|n| !taken(n)).unwrap()
+    }
+
+    /// The tab's name for a command: its program (`nvim .` is `nvim`).
+    fn tab_base(command: Option<&str>) -> String {
+        let prog = command.and_then(|c| c.split_whitespace().next()).and_then(|p| p.rsplit('/').next());
+        prog.filter(|p| !p.is_empty()).unwrap_or("shell").to_string()
+    }
+
+    /// The ops for a new tab running `command` (a shell when empty).
+    fn new_tab_ops(&self, workspace: &str, command: Option<String>) -> Option<Vec<WsOp>> {
+        let (_, w) = self.doc.workspace(workspace)?;
+        let pane_id = new_id("n");
+        let mut ops = vec![WsOp::AddTab {
+            workspace: workspace.to_string(),
+            id: new_id("t"),
+            name: Self::free_tab_name(w, &Self::tab_base(command.as_deref())),
+            pane_id: pane_id.clone(),
+        }];
+        if command.is_some() {
+            ops.push(WsOp::SetCommand { pane: pane_id, command });
+        }
+        Some(ops)
+    }
+
+    fn new_tab(&mut self, command: Option<String>) {
+        let Some(ws) = self.need_workspace() else { return };
+        if let Some(ops) = self.new_tab_ops(&ws, command) {
+            self.actions.push(Action::Update(ops));
+        }
+    }
+
+    fn split_ops(&self, pane: &str, dir: Dir, command: Option<String>) -> Vec<WsOp> {
+        let new_id = new_id("n");
+        let mut ops = vec![WsOp::SplitPane { pane: pane.to_string(), dir, new_id: new_id.clone() }];
+        if command.is_some() {
+            ops.push(WsOp::SetCommand { pane: new_id, command });
+        }
+        ops
+    }
+
+    fn split(&mut self, dir: Dir, command: Option<String>) {
+        if self.need_workspace().is_none() {
+            return;
+        }
+        let Some(pane) = self.focused_pane() else { return };
+        self.zoom = None;
+        let ops = self.split_ops(&pane, dir, command);
+        self.actions.push(Action::Update(ops));
+    }
+
+    fn command_form(&mut self) {
+        let Some(workspace) = self.need_workspace() else { return };
+        self.dialog = Some(Dialog::Form(Form {
+            kind: FormKind::NewTab { workspace },
+            title: "new tab: command (empty = shell)".into(),
+            fields: vec![Self::field("command", "")],
+            focus: 0,
+            error: None,
+        }));
+    }
+
+    fn split_form(&mut self, dir: Dir) {
+        if self.need_workspace().is_none() {
+            return;
+        }
+        let Some(pane) = self.focused_pane() else { return };
+        let side = if dir == Dir::Horizontal { "side by side" } else { "stacked" };
+        self.dialog = Some(Dialog::Form(Form {
+            kind: FormKind::NewSplit { pane, dir },
+            title: format!("split {side}: command (empty = shell)"),
+            fields: vec![Self::field("command", "")],
+            focus: 0,
+            error: None,
+        }));
+    }
+
+    fn move_focus(&mut self, nav: Nav) {
+        let Some((_, tab)) = self.active() else { return };
+        let Some(from) = self.focused_pane() else { return };
+        // Move by the real layout, so leave a zoom first.
+        let rects = workspace::rects(&tab.layout, self.panes_area);
+        self.zoom = None;
+        if let Some(pane) = neighbor(&rects, &from, nav) {
+            self.edit(WsOp::SetFocus { pane });
+        }
+    }
+
+    fn resize_focused(&mut self, dir: Dir, delta: i16) {
+        let Some((_, tab)) = self.active() else { return };
+        let Some(pane) = self.focused_pane() else { return };
+        let tab = tab.id.clone();
+        self.zoom = None;
+        self.edit(WsOp::ResizePane { tab, pane, dir, delta });
+    }
+
+    /// Switch to tab `index`, or step from the current one by `step` (wrapping).
+    fn go_tab(&mut self, index: Option<usize>, step: i32) {
+        let Some((w, _)) = self.active() else { return };
+        let n = w.tabs.len();
+        let to = match index {
+            Some(i) if i < n => i,
+            Some(i) => return self.flash_error(&format!("no tab {}", i + 1)),
+            None => (w.active_tab as i32 + step).rem_euclid(n as i32) as usize,
+        };
+        if to != w.active_tab {
+            let workspace = w.id.clone();
+            self.edit(WsOp::SetActiveTab { workspace, index: to });
+        }
+    }
+
+    fn toggle_zoom(&mut self) {
+        let Some((_, t)) = self.active() else { return };
+        let id = t.id.clone();
+        self.zoom = if self.zoom.as_deref() == Some(id.as_str()) { None } else { Some(id) };
+    }
+
+    fn rename_tab_form(&mut self) {
+        let Some((_, t)) = self.active() else {
+            self.flash_error("open a workspace first");
+            return;
+        };
+        let (id, name) = (t.id.clone(), t.name.clone());
+        self.dialog = Some(Dialog::Form(Form {
+            kind: FormKind::RenameTab { id },
+            title: "rename tab".into(),
+            fields: vec![Self::field("name", name)],
+            focus: 0,
+            error: None,
+        }));
+    }
+
+    /// Check an op against a copy of the document, so a refusal is shown at once.
+    fn check(&self, ops: &[WsOp]) -> Result<(), String> {
+        let mut scratch = self.doc.clone();
+        ops.iter().try_for_each(|op| workspace::apply(&mut scratch, op))
+    }
+
+    fn close_pane_confirm(&mut self) {
+        if self.need_workspace().is_none() {
+            return;
+        }
+        let Some(pane) = self.focused_pane() else { return };
+        if let Err(e) = self.check(&[WsOp::ClosePane { pane: pane.clone() }]) {
+            return self.flash_error(&e);
+        }
+        let what = self.doc.pane(&pane).and_then(|(_, _, p)| p.command.clone()).unwrap_or_else(|| "the shell".into());
+        let message = format!("Close this pane? Its program ({what}) will end.  y / n");
+        self.dialog = Some(Dialog::Confirm { kind: ConfirmKind::ClosePane(pane), message });
+    }
+
+    fn close_tab_confirm(&mut self) {
+        let Some((_, t)) = self.active() else {
+            self.flash_error("open a workspace first");
+            return;
+        };
+        let (id, name, n) = (t.id.clone(), t.name.clone(), t.layout.panes().len());
+        if let Err(e) = self.check(&[WsOp::CloseTab { id: id.clone() }]) {
+            return self.flash_error(&e);
+        }
+        let message = format!("Close tab \"{name}\" and its {n} pane(s)? Their programs will end.  y / n");
+        self.dialog = Some(Dialog::Confirm { kind: ConfirmKind::CloseTab(id), message });
     }
 
     fn sidebar_key(&mut self, k: KeyEvent) {
@@ -629,22 +1040,17 @@ impl WsApp {
             None => return,
         };
         // TODO(W4): offer to kill the terminals too.
-        self.dialog = Some(Dialog::Confirm { id: self.sel.clone(), message });
+        self.dialog = Some(Dialog::Confirm { kind: ConfirmKind::Delete(self.sel.clone()), message });
     }
 
     fn dialog_key(&mut self, k: KeyEvent) {
         match self.dialog.as_mut() {
             Some(Dialog::Help) => self.dialog = None,
-            Some(Dialog::Confirm { id, .. }) => match k.code {
+            Some(Dialog::Confirm { kind, .. }) => match k.code {
                 KeyCode::Char('y' | 'Y') => {
-                    let id = id.clone();
-                    let op = if self.doc.project(&id).is_some() {
-                        WsOp::DeleteProject { id }
-                    } else {
-                        WsOp::DeleteWorkspace { id }
-                    };
+                    let kind = kind.clone();
                     self.dialog = None;
-                    self.actions.push(Action::Update(vec![op]));
+                    self.confirmed(kind);
                 }
                 KeyCode::Char('n' | 'N') | KeyCode::Esc => self.dialog = None,
                 _ => {}
@@ -665,20 +1071,57 @@ impl WsApp {
         }
     }
 
+    /// The answer was yes.
+    fn confirmed(&mut self, kind: ConfirmKind) {
+        match kind {
+            ConfirmKind::Delete(id) => {
+                let op = if self.doc.project(&id).is_some() {
+                    WsOp::DeleteProject { id }
+                } else {
+                    WsOp::DeleteWorkspace { id }
+                };
+                self.actions.push(Action::Update(vec![op]));
+            }
+            ConfirmKind::ClosePane(pane) => {
+                let terminals: Vec<String> = self.terminal_of(&pane).into_iter().collect();
+                self.close_with(terminals, WsOp::ClosePane { pane });
+            }
+            ConfirmKind::CloseTab(id) => {
+                let terminals = match self.doc.tab(&id) {
+                    Some((_, t)) => t.layout.panes().iter().filter_map(|p| p.terminal.clone()).collect(),
+                    None => vec![],
+                };
+                self.close_with(terminals, WsOp::CloseTab { id });
+            }
+        }
+    }
+
+    /// End the programs, then drop the pane or tab from the document.
+    fn close_with(&mut self, terminals: Vec<String>, op: WsOp) {
+        if let Err(e) = self.check(std::slice::from_ref(&op)) {
+            return self.flash_error(&e);
+        }
+        self.zoom = None;
+        if !terminals.is_empty() {
+            self.actions.push(Action::Kill(terminals));
+        }
+        self.actions.push(Action::Update(vec![op]));
+    }
+
     /// Check the form against the document first, so mistakes show up inside
     /// the dialog instead of after it closed.
     fn submit_form(&mut self) {
         let Some(Dialog::Form(form)) = self.dialog.take() else { return };
         let built = self.build_op(&form);
         match built {
-            Ok((op, pending_sel, pending_open)) => {
-                let mut scratch = self.doc.clone();
-                if let Err(e) = workspace::apply(&mut scratch, &op) {
+            Ok((ops, pending_sel, pending_open)) => {
+                if let Err(e) = self.check(&ops) {
                     return self.form_error(form, e);
                 }
                 self.pending_sel = pending_sel;
                 self.pending_open = pending_open;
-                self.actions.push(Action::Update(vec![op]));
+                self.zoom = None;
+                self.actions.push(Action::Update(ops));
             }
             Err(e) => self.form_error(form, e),
         }
@@ -691,13 +1134,13 @@ impl WsApp {
 
     /// The op, and the project / workspace to select or open once it lands.
     #[allow(clippy::type_complexity)]
-    fn build_op(&self, form: &Form) -> Result<(WsOp, Option<String>, Option<String>), String> {
+    fn build_op(&self, form: &Form) -> Result<(Vec<WsOp>, Option<String>, Option<String>), String> {
         let name = form.fields[0].input.value().trim().to_string();
         let folder = || existing_dir(form.fields[1].input.value());
         Ok(match &form.kind {
             FormKind::AddProject => {
                 let id = new_id("p");
-                (WsOp::AddProject { id: id.clone(), name, root: folder()? }, Some(id), None)
+                (vec![WsOp::AddProject { id: id.clone(), name, root: folder()? }], Some(id), None)
             }
             FormKind::AddWorkspace { project } => {
                 let id = new_id("w");
@@ -709,7 +1152,7 @@ impl WsApp {
                     tab_id: new_id("t"),
                     pane_id: new_id("n"),
                 };
-                (op, None, Some(id))
+                (vec![op], None, Some(id))
             }
             FormKind::Rename { id } => {
                 let op = if self.doc.project(id).is_some() {
@@ -717,10 +1160,21 @@ impl WsApp {
                 } else {
                     WsOp::RenameWorkspace { id: id.clone(), name }
                 };
-                (op, None, None)
+                (vec![op], None, None)
             }
+            FormKind::RenameTab { id } => (vec![WsOp::RenameTab { id: id.clone(), name }], None, None),
+            FormKind::NewTab { workspace } => {
+                let ops = self.new_tab_ops(workspace, command(&form.fields[0].input));
+                (ops.ok_or("the workspace is gone")?, None, None)
+            }
+            FormKind::NewSplit { pane, dir } => (self.split_ops(pane, *dir, command(&form.fields[0].input)), None, None),
         })
     }
+}
+
+/// What was typed into a command prompt; empty means the shell.
+fn command(input: &TextInput) -> Option<String> {
+    Some(input.value().trim().to_string()).filter(|c| !c.is_empty())
 }
 
 /// An existing folder as an absolute path (`~` and relative paths allowed).
@@ -790,6 +1244,34 @@ mod tests {
             "state": if live { "live" } else { "finished" },
         }))
         .unwrap()
+    }
+
+    /// Open `ws` and answer every attach/start as if it worked: each pane gets
+    /// terminal `t-<pane>`. The actions are cleared afterwards.
+    fn open_attached(a: &mut WsApp, ws: &str) {
+        a.open_workspace(ws);
+        attach_pending(a);
+    }
+
+    fn attach_pending(a: &mut WsApp) {
+        for act in std::mem::take(&mut a.actions) {
+            if let Action::Open { plan, attempt, cols, rows } = act {
+                let pane = plan.pane().to_string();
+                a.on_opened(&pane, attempt, Ok((format!("t-{pane}"), cols, rows)));
+            }
+        }
+        // Resizes caused by the attaches themselves are not interesting.
+        a.actions.clear();
+    }
+
+    fn opens(a: &mut WsApp) -> Vec<Plan> {
+        std::mem::take(&mut a.actions)
+            .into_iter()
+            .filter_map(|x| match x {
+                Action::Open { plan, .. } => Some(plan),
+                _ => None,
+            })
+            .collect()
     }
 
     fn ids(a: &WsApp) -> Vec<String> {
@@ -885,7 +1367,7 @@ mod tests {
         // Nothing to type into yet.
         a.on_key(ctrl_space());
         assert_eq!(a.on_key(ctrl_space()), None);
-        a.pane_attached("t1".into(), 80, 24);
+        open_attached(&mut a, "w1");
         a.on_key(ctrl_space());
         assert_eq!(a.on_key(ctrl_space()), Some(Out::Bytes(vec![0])));
         assert!(!a.armed);
@@ -899,7 +1381,8 @@ mod tests {
 
         // A different prefix.
         let mut b = WsApp::new(Prefix::Ctrl('b'), None);
-        b.pane_attached("t1".into(), 80, 24);
+        b.on_doc(a.doc.clone());
+        open_attached(&mut b, "w1");
         b.focus = Focus::Workspace;
         assert_eq!(b.on_key(ctrl_space()), Some(Out::Key(ctrl_space())), "ctrl+space is no prefix now");
         b.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
@@ -912,12 +1395,12 @@ mod tests {
         let mut a = app();
         a.focus = Focus::Workspace;
         assert_eq!(a.on_key(key('x')), None, "nothing open");
-        a.pane_attached("t1".into(), 80, 24);
+        open_attached(&mut a, "w1");
         assert_eq!(a.on_key(key('x')), Some(Out::Key(key('x'))));
         // The sidebar's keys are not special in the workspace.
         assert_eq!(a.on_key(key('q')), Some(Out::Key(key('q'))));
         assert!(!a.quit);
-        a.pane.as_mut().unwrap().ended = Some("exited".into());
+        a.slots.get_mut("n-w1").unwrap().view.as_mut().unwrap().ended = Some("exited".into());
         assert_eq!(a.on_key(key('x')), None);
     }
 
@@ -945,7 +1428,7 @@ mod tests {
         a.doc = doc;
 
         // Recorded but not in the set: start.
-        let Some(Plan::Start { pane, params }) = plan(&a.doc, &a.set, "w1", false) else { panic!() };
+        let Some(Plan::Start { pane, params }) = plan(&a.doc, &a.set, "w1", "n-w1", false) else { panic!() };
         assert_eq!(pane, "n-w1");
         assert_eq!(params.cwd.as_deref(), Some("/tmp"));
         assert_eq!(params.line, None);
@@ -955,17 +1438,17 @@ mod tests {
 
         // Finished: still start.
         a.set.terminals.insert("t9".into(), terminal("t9", false));
-        assert!(matches!(plan(&a.doc, &a.set, "w1", false), Some(Plan::Start { .. })));
+        assert!(matches!(plan(&a.doc, &a.set, "w1", "n-w1", false), Some(Plan::Start { .. })));
 
         // Live: attach, unless a fresh one is asked for.
         a.set.terminals.insert("t9".into(), terminal("t9", true));
-        assert!(matches!(plan(&a.doc, &a.set, "w1", false), Some(Plan::Attach { addr, .. }) if addr == "t9"));
-        assert!(matches!(plan(&a.doc, &a.set, "w1", true), Some(Plan::Start { .. })));
+        assert!(matches!(plan(&a.doc, &a.set, "w1", "n-w1", false), Some(Plan::Attach { addr, .. }) if addr == "t9"));
+        assert!(matches!(plan(&a.doc, &a.set, "w1", "n-w1", true), Some(Plan::Start { .. })));
 
         // A pane with a command starts it through the shell line.
-        let Some(Plan::Start { params, .. }) = plan(&a.doc, &a.set, "w2", false) else { panic!() };
+        let Some(Plan::Start { params, .. }) = plan(&a.doc, &a.set, "w2", "n-w2", false) else { panic!() };
         assert_eq!(params.line.as_deref(), Some("nvim ."));
-        assert!(plan(&a.doc, &a.set, "nope", false).is_none());
+        assert!(plan(&a.doc, &a.set, "nope", "n-w1", false).is_none());
     }
 
     #[test]
@@ -975,7 +1458,7 @@ mod tests {
         a.on_key(code(KeyCode::Enter));
         assert_eq!(a.open.as_deref(), Some("w1"));
         assert_eq!(a.focus, Focus::Workspace);
-        assert!(matches!(a.actions[..], [Action::Detach, Action::Open(Plan::Start { .. })]));
+        assert!(matches!(a.actions[..], [Action::Open { plan: Plan::Start { .. }, .. }]));
         a.actions.clear();
 
         // Still opening: Enter again must not start a second terminal.
@@ -983,45 +1466,71 @@ mod tests {
         a.on_key(code(KeyCode::Enter));
         assert!(a.actions.is_empty());
 
-        a.pane_attached("t1".into(), 80, 24);
+        let attempt = a.slots["n-w1"].attempt;
+        assert!(a.on_opened("n-w1", attempt, Ok(("t1".into(), 98, 26))));
+        a.actions.clear();
         a.focus = Focus::Sidebar;
         a.on_key(code(KeyCode::Enter));
         assert!(a.actions.is_empty());
 
-        // Another workspace closes the stream first.
+        // Another workspace closes the old stream first.
         a.sel = "w2".into();
         a.focus = Focus::Sidebar;
         a.on_key(code(KeyCode::Enter));
         assert_eq!(a.open.as_deref(), Some("w2"));
-        assert!(a.pane.is_none());
-        assert!(matches!(a.actions[..], [Action::Detach, Action::Open(_)]));
-        assert!(a.wants("n-w2") && !a.wants("n-w1"), "a late attach for w1 is dropped");
+        assert!(matches!(&a.actions[..], [Action::Detach(p), Action::Open { .. }] if p == "n-w1"));
+        assert!(a.slots.contains_key("n-w2") && !a.slots.contains_key("n-w1"));
+        // A late attach for w1 is refused (so the caller closes it).
+        assert!(!a.on_opened("n-w1", attempt, Ok(("t1".into(), 98, 26))));
+    }
+
+    #[test]
+    fn a_late_answer_for_an_older_attempt_is_refused() {
+        let mut a = app();
+        a.open_workspace("w1");
+        let first = a.slots["n-w1"].attempt;
+        a.actions.clear();
+        a.open_workspace("w2");
+        a.open_workspace("w1");
+        // The first start is still underway, so no second terminal is started.
+        assert!(!a.slots.contains_key("n-w1"));
+        assert_eq!(opens(&mut a).len(), 1, "only w2's pane");
+        let mut doc = a.doc.clone();
+        apply(&mut doc, &WsOp::SetTerminal { pane: "n-w1".into(), terminal: Some("t1".into()) }).unwrap();
+        a.set.terminals.insert("t1".into(), terminal("t1", true));
+        assert!(!a.on_opened("n-w1", first, Ok(("t1".into(), 10, 5))), "stale: the stream is closed");
+        // Now that the start finished, the pane opens again, attaching this time.
+        a.on_doc(doc);
+        let again = opens(&mut a);
+        assert!(matches!(&again[..], [Plan::Attach { addr, .. }] if addr == "t1"), "{again:?}");
     }
 
     #[test]
     fn enter_restarts_an_ended_pane() {
         let mut a = app();
-        a.open_workspace("w1");
-        a.actions.clear();
-        a.pane_attached("t1".into(), 80, 24);
+        open_attached(&mut a, "w1");
         a.focus = Focus::Workspace;
-        a.pane.as_mut().unwrap().ended = Some("exited (code 0)".into());
+        a.slots.get_mut("n-w1").unwrap().view.as_mut().unwrap().ended = Some("exited (code 0)".into());
         a.on_key(code(KeyCode::Enter));
-        let [Action::Detach, Action::Open(Plan::Start { pane, .. })] = &a.actions[..] else { panic!("{:?}", a.actions) };
-        assert_eq!(pane, "n-w1");
+        let [Action::Detach(old), Action::Open { plan: Plan::Start { pane, .. }, .. }] = &a.actions[..] else {
+            panic!("{:?}", a.actions)
+        };
+        assert_eq!((old.as_str(), pane.as_str()), ("n-w1", "n-w1"));
+        // A second Enter while it starts does nothing.
+        a.actions.clear();
+        a.on_key(code(KeyCode::Enter));
+        assert!(a.actions.is_empty());
     }
 
     #[test]
-    fn deleting_the_open_workspace_closes_the_pane() {
+    fn deleting_the_open_workspace_closes_its_panes() {
         let mut a = app();
-        a.open_workspace("w1");
-        a.pane_attached("t1".into(), 80, 24);
-        a.actions.clear();
+        open_attached(&mut a, "w1");
         let mut doc = a.doc.clone();
         apply(&mut doc, &WsOp::DeleteWorkspace { id: "w1".into() }).unwrap();
         a.on_doc(doc);
-        assert!(a.open.is_none() && a.pane.is_none());
-        assert!(matches!(a.actions[..], [Action::Detach]));
+        assert!(a.open.is_none() && a.slots.is_empty());
+        assert!(matches!(&a.actions[..], [Action::Detach(p)] if p == "n-w1"));
     }
 
     #[test]
@@ -1170,5 +1679,493 @@ mod tests {
         assert_eq!(alerts[0].what, "blocked");
         assert!(alerts[0].body.contains("shosha › backend"));
         assert!(a.status_alerts().is_empty(), "same state, no second alert");
+    }
+
+    // ---- W3: tabs and splits ----------------------------------------------------
+
+    fn prefix_key(a: &mut WsApp, k: KeyEvent) -> Option<Out> {
+        a.on_key(ctrl_space());
+        a.on_key(k)
+    }
+
+    fn pk(a: &mut WsApp, c: char) {
+        assert_eq!(prefix_key(a, key(c)), None);
+    }
+
+    /// Take the pending updates, apply them to the document, and deliver it back.
+    fn commit(a: &mut WsApp) -> Vec<WsOp> {
+        let mut ops = Vec::new();
+        let mut rest = Vec::new();
+        for act in std::mem::take(&mut a.actions) {
+            match act {
+                Action::Update(o) => ops.extend(o),
+                other => rest.push(other),
+            }
+        }
+        let mut doc = a.doc.clone();
+        for op in &ops {
+            apply(&mut doc, op).unwrap();
+        }
+        a.actions = rest;
+        a.on_doc(doc);
+        ops
+    }
+
+    /// w1 open and attached, focus in the workspace.
+    fn open_w1() -> WsApp {
+        let mut a = app();
+        open_attached(&mut a, "w1");
+        a.focus = Focus::Workspace;
+        a
+    }
+
+    fn focused(a: &WsApp) -> String {
+        a.focused_pane().unwrap()
+    }
+
+    /// `n-w1` | (`b` over `c`), all attached; focus on `c` after the splits.
+    fn three_panes() -> WsApp {
+        let mut a = open_w1();
+        pk(&mut a, 'v');
+        commit(&mut a);
+        let b = focused(&a);
+        attach_pending(&mut a);
+        pk(&mut a, 's');
+        commit(&mut a);
+        attach_pending(&mut a);
+        assert_ne!(b, focused(&a));
+        a
+    }
+
+    fn rect(x: u16, y: u16, w: u16, h: u16) -> Rect {
+        Rect::new(x, y, w, h)
+    }
+
+    #[test]
+    fn neighbor_picks_the_nearest_overlapping_pane() {
+        // A B C in a row: the nearest wins.
+        let row = vec![("a".to_string(), rect(0, 0, 10, 10)), ("b".into(), rect(10, 0, 10, 10)), ("c".into(), rect(20, 0, 10, 10))];
+        assert_eq!(neighbor(&row, "a", Nav::Right).as_deref(), Some("b"));
+        assert_eq!(neighbor(&row, "c", Nav::Left).as_deref(), Some("b"));
+        assert_eq!(neighbor(&row, "a", Nav::Left), None);
+        assert_eq!(neighbor(&row, "a", Nav::Up), None);
+        assert_eq!(neighbor(&row, "a", Nav::Down), None);
+        assert_eq!(neighbor(&row, "zzz", Nav::Down), None);
+
+        // Uneven: a tall left pane next to two stacked ones of different heights.
+        let l = vec![("l".to_string(), rect(0, 0, 50, 40)), ("r1".into(), rect(50, 0, 50, 10)), ("r2".into(), rect(50, 10, 50, 30))];
+        assert_eq!(neighbor(&l, "l", Nav::Right).as_deref(), Some("r2"), "most overlap");
+        assert_eq!(neighbor(&l, "r1", Nav::Left).as_deref(), Some("l"));
+        assert_eq!(neighbor(&l, "r2", Nav::Up).as_deref(), Some("r1"));
+        assert_eq!(neighbor(&l, "r1", Nav::Down).as_deref(), Some("r2"));
+        assert_eq!(neighbor(&l, "r2", Nav::Right), None);
+
+        // Equal overlap: the first one (top / left).
+        let even = vec![("l".to_string(), rect(0, 0, 50, 40)), ("t".into(), rect(50, 0, 50, 20)), ("u".into(), rect(50, 20, 50, 20))];
+        assert_eq!(neighbor(&even, "l", Nav::Right).as_deref(), Some("t"));
+
+        // Staggered columns: moving down from the wide pane needs an overlap.
+        let st = vec![
+            ("top".to_string(), rect(0, 0, 100, 10)),
+            ("x".into(), rect(0, 10, 30, 30)),
+            ("y".into(), rect(30, 10, 70, 30)),
+        ];
+        assert_eq!(neighbor(&st, "top", Nav::Down).as_deref(), Some("y"));
+        assert_eq!(neighbor(&st, "x", Nav::Right).as_deref(), Some("y"));
+        assert_eq!(neighbor(&st, "y", Nav::Up).as_deref(), Some("top"));
+    }
+
+    #[test]
+    fn focus_keys_follow_the_layout_and_persist() {
+        let mut a = three_panes();
+        let c = focused(&a);
+        let ids: Vec<String> = a.active().unwrap().1.layout.panes().iter().map(|p| p.id.clone()).collect();
+        // a | (b over c), focus on c.
+        assert_eq!(ids[0], "n-w1");
+        let b = ids[1].clone();
+        pk(&mut a, 'k');
+        assert_eq!(focused(&a), b, "up from c");
+        assert!(matches!(&a.actions[..], [Action::Update(ops)] if ops == &[WsOp::SetFocus { pane: b.clone() }]));
+        a.actions.clear();
+        pk(&mut a, 'h');
+        assert_eq!(focused(&a), "n-w1");
+        a.actions.clear();
+        pk(&mut a, 'k');
+        assert_eq!(focused(&a), "n-w1", "nothing above: stays");
+        assert!(a.actions.is_empty(), "no edit when nothing moves");
+        // Arrow keys do the same.
+        assert_eq!(prefix_key(&mut a, code(KeyCode::Right)), None);
+        assert!(focused(&a) == b || focused(&a) == c);
+        let now = focused(&a);
+        a.on_key(ctrl_space());
+        a.on_key(code(KeyCode::Down));
+        assert_ne!(focused(&a), "n-w1");
+        let _ = now;
+        // The focus change is not a layout change: no pane opens or closes.
+        assert!(a.actions.iter().all(|x| matches!(x, Action::Update(_))));
+    }
+
+    #[test]
+    fn split_and_tab_keys_make_the_right_ops() {
+        let mut a = open_w1();
+        pk(&mut a, 'v');
+        let ops = commit(&mut a);
+        let [WsOp::SplitPane { pane, dir, new_id }] = &ops[..] else { panic!("{ops:?}") };
+        assert_eq!((pane.as_str(), *dir), ("n-w1", Dir::Horizontal));
+        // The new pane takes focus and opens as a shell.
+        assert_eq!(focused(&a), *new_id);
+        let o = opens(&mut a);
+        assert!(matches!(&o[..], [Plan::Start { pane, params }] if pane == new_id && params.line.is_none()));
+
+        pk(&mut a, 's');
+        let ops = commit(&mut a);
+        assert!(matches!(&ops[..], [WsOp::SplitPane { dir: Dir::Vertical, .. }]));
+
+        pk(&mut a, 't');
+        let ops = commit(&mut a);
+        let [WsOp::AddTab { workspace, name, .. }] = &ops[..] else { panic!("{ops:?}") };
+        assert_eq!((workspace.as_str(), name.as_str()), ("w1", "shell 2"), "\"shell\" is taken");
+        assert_eq!(a.active().unwrap().1.name, "shell 2");
+    }
+
+    #[test]
+    fn asking_for_a_command_saves_it_on_the_pane() {
+        let mut a = open_w1();
+        pk(&mut a, 'T');
+        let Some(Dialog::Form(f)) = &a.dialog else { panic!() };
+        assert!(f.title.contains("command"));
+        for c in "nvim .".chars() {
+            a.on_key(key(c));
+        }
+        a.on_key(code(KeyCode::Enter));
+        assert!(a.dialog.is_none());
+        let ops = commit(&mut a);
+        let [WsOp::AddTab { name, pane_id, .. }, WsOp::SetCommand { pane, command }] = &ops[..] else { panic!("{ops:?}") };
+        assert_eq!(name, "nvim");
+        assert_eq!((pane, command.as_deref()), (pane_id, Some("nvim .")));
+        // The pane starts through the shell line.
+        let o = opens(&mut a);
+        assert!(matches!(&o[..], [Plan::Start { params, .. }] if params.line.as_deref() == Some("nvim .")));
+
+        // Empty means a shell: no SetCommand.
+        pk(&mut a, 'T');
+        a.on_key(code(KeyCode::Enter));
+        let ops = commit(&mut a);
+        assert!(matches!(&ops[..], [WsOp::AddTab { .. }]), "{ops:?}");
+
+        // V / S ask too, and Esc cancels.
+        attach_pending(&mut a);
+        pk(&mut a, 'V');
+        for c in "claude".chars() {
+            a.on_key(key(c));
+        }
+        a.on_key(code(KeyCode::Enter));
+        let ops = commit(&mut a);
+        let [WsOp::SplitPane { dir, new_id, .. }, WsOp::SetCommand { pane, command }] = &ops[..] else { panic!("{ops:?}") };
+        assert_eq!((*dir, pane, command.as_deref()), (Dir::Horizontal, new_id, Some("claude")));
+        pk(&mut a, 'S');
+        a.on_key(code(KeyCode::Esc));
+        assert!(a.dialog.is_none() && a.actions.iter().all(|x| !matches!(x, Action::Update(_))));
+        pk(&mut a, 'S');
+        a.on_key(key('x'));
+        a.on_key(code(KeyCode::Enter));
+        let ops = commit(&mut a);
+        assert!(matches!(&ops[..], [WsOp::SplitPane { dir: Dir::Vertical, .. }, WsOp::SetCommand { .. }]));
+    }
+
+    #[test]
+    fn tab_names_are_made_unique() {
+        let mut a = open_w1();
+        for _ in 0..2 {
+            pk(&mut a, 'T');
+            for c in "sh -c 'x'".chars() {
+                a.on_key(key(c));
+            }
+            a.on_key(code(KeyCode::Enter));
+            commit(&mut a);
+        }
+        let names: Vec<_> = a.active().map(|(w, _)| w.tabs.iter().map(|t| t.name.clone()).collect()).unwrap();
+        assert_eq!(names, ["shell", "sh", "sh 2"]);
+    }
+
+    #[test]
+    fn resize_keys_send_resize_ops() {
+        let mut a = three_panes();
+        let tab = a.active().unwrap().1.id.clone();
+        let pane = focused(&a);
+        for (k, dir, sign) in [('L', Dir::Horizontal, 1), ('H', Dir::Horizontal, -1), ('J', Dir::Vertical, 1), ('K', Dir::Vertical, -1)] {
+            pk(&mut a, k);
+            let ops = commit(&mut a);
+            let [WsOp::ResizePane { tab: t, pane: p, dir: d, delta }] = &ops[..] else { panic!("{ops:?}") };
+            assert_eq!((t, p, *d), (&tab, &pane, dir));
+            assert_eq!(delta.signum(), sign);
+        }
+    }
+
+    #[test]
+    fn a_resize_reaches_the_streams_and_the_parsers() {
+        let mut a = three_panes();
+        a.actions.clear();
+        pk(&mut a, 'H'); // narrower, so the layout changes
+        let before: HashMap<String, (u16, u16)> = a.slots.iter().map(|(k, s)| (k.clone(), s.size)).collect();
+        commit(&mut a);
+        let resized: Vec<_> = a.actions.iter().filter(|x| matches!(x, Action::Resize { .. })).collect();
+        assert!(!resized.is_empty(), "{:?}", a.actions);
+        for (id, slot) in &a.slots {
+            let parser = slot.view.as_ref().unwrap().parser.screen().size();
+            assert_eq!((parser.1.get(), parser.0.get()), slot.size, "{id}: parser follows the stream");
+        }
+        assert_ne!(before, a.slots.iter().map(|(k, s)| (k.clone(), s.size)).collect::<HashMap<_, _>>());
+        a.actions.clear();
+
+        // The terminal got smaller: every pane is told once.
+        a.set_screen(rect(0, 0, 80, 20));
+        let n = a.actions.iter().filter(|x| matches!(x, Action::Resize { .. })).count();
+        assert_eq!(n, 3);
+        a.actions.clear();
+        a.set_screen(rect(0, 0, 80, 20));
+        assert!(a.actions.is_empty(), "same size: nothing to do");
+        // Sizes are always the inner cells of the rects.
+        for (id, r) in a.pane_rects() {
+            assert_eq!(a.slots[&id].size, (r.width - 2, r.height - 2));
+        }
+    }
+
+    #[test]
+    fn tab_keys_switch_and_wrap() {
+        let mut a = open_w1();
+        pk(&mut a, 't');
+        commit(&mut a);
+        pk(&mut a, 't');
+        commit(&mut a);
+        assert_eq!(a.active().unwrap().0.active_tab, 2);
+        attach_pending(&mut a);
+        pk(&mut a, '1');
+        assert!(matches!(&a.actions[0], Action::Update(ops) if ops == &[WsOp::SetActiveTab { workspace: "w1".into(), index: 0 }]));
+        assert_eq!(a.active().unwrap().0.active_tab, 0, "switches at once");
+        pk(&mut a, '[');
+        assert_eq!(a.active().unwrap().0.active_tab, 2, "wraps back");
+        pk(&mut a, ']');
+        assert_eq!(a.active().unwrap().0.active_tab, 0, "and forward");
+        pk(&mut a, '2');
+        assert_eq!(a.active().unwrap().0.active_tab, 1);
+        a.actions.clear();
+        pk(&mut a, '9');
+        assert!(a.actions.is_empty());
+        assert!(a.current_flash().is_some_and(|(m, e)| e && m.contains("no tab 9")));
+        assert_eq!(a.active().unwrap().0.active_tab, 1);
+    }
+
+    #[test]
+    fn switching_tabs_detaches_and_reattaches_the_same_terminals() {
+        let mut a = three_panes();
+        let first: Vec<String> = a.active().unwrap().1.layout.panes().iter().map(|p| p.id.clone()).collect();
+        // The loop records started terminals in the doc; do the same here.
+        let mut doc = a.doc.clone();
+        for p in &first {
+            apply(&mut doc, &WsOp::SetTerminal { pane: p.clone(), terminal: Some(format!("t-{p}")) }).unwrap();
+            a.set.terminals.insert(format!("t-{p}"), terminal(&format!("t-{p}"), true));
+        }
+        a.on_doc(doc);
+        a.actions.clear();
+        pk(&mut a, 't');
+        commit(&mut a);
+        let mut detached: Vec<String> = a.actions.iter().filter_map(|x| if let Action::Detach(p) = x { Some(p.clone()) } else { None }).collect();
+        detached.sort();
+        let mut want = first.clone();
+        want.sort();
+        assert_eq!(detached, want, "all three old panes close their streams");
+        let o = opens(&mut a);
+        assert!(matches!(&o[..], [Plan::Start { .. }]), "the new tab starts a shell");
+        attach_pending(&mut a);
+
+        // Back to tab 1: all three attach to the recorded terminals.
+        pk(&mut a, '1');
+        let o = opens(&mut a);
+        let mut addrs: Vec<String> = o.iter().map(|p| match p { Plan::Attach { addr, .. } => addr.clone(), other => panic!("{other:?}") }).collect();
+        addrs.sort();
+        let mut want: Vec<String> = first.iter().map(|p| format!("t-{p}")).collect();
+        want.sort();
+        assert_eq!(addrs, want);
+    }
+
+    #[test]
+    fn a_tab_with_missing_terminals_attaches_the_live_and_starts_the_rest() {
+        let mut a = three_panes();
+        let panes: Vec<String> = a.active().unwrap().1.layout.panes().iter().map(|p| p.id.clone()).collect();
+        let mut doc = a.doc.clone();
+        for (i, p) in panes.iter().enumerate() {
+            apply(&mut doc, &WsOp::SetTerminal { pane: p.clone(), terminal: Some(format!("t{i}")) }).unwrap();
+        }
+        apply(&mut doc, &WsOp::SetCommand { pane: panes[2].clone(), command: Some("nvim .".into()) }).unwrap();
+        a.set.terminals.insert("t0".into(), terminal("t0", true));
+        a.set.terminals.insert("t1".into(), terminal("t1", false));
+        // t2 is not known at all.
+        a.on_doc(doc);
+        // Leave the workspace and come back.
+        a.open_workspace("w2");
+        attach_pending(&mut a);
+        a.open_workspace("w1");
+        let o = opens(&mut a);
+        assert_eq!(o.len(), 3);
+        assert!(matches!(&o[0], Plan::Attach { addr, .. } if addr == "t0"));
+        assert!(matches!(&o[1], Plan::Start { params, .. } if params.line.is_none()), "finished: shell again");
+        assert!(matches!(&o[2], Plan::Start { params, .. } if params.line.as_deref() == Some("nvim .")), "lost: its command");
+    }
+
+    #[test]
+    fn zoom_fills_the_area_and_toggles() {
+        let mut a = three_panes();
+        a.actions.clear();
+        let f = focused(&a);
+        assert_eq!(a.pane_rects().len(), 3);
+        pk(&mut a, 'z');
+        assert!(a.zoomed());
+        let r = a.pane_rects();
+        assert_eq!(r, [(f.clone(), a.panes_area)]);
+        // Only the zoomed pane is resized; the others keep their streams.
+        assert!(matches!(&a.actions[..], [Action::Resize { pane, .. }] if *pane == f), "{:?}", a.actions);
+        assert!(a.slots.len() == 3);
+        a.actions.clear();
+        pk(&mut a, 'z');
+        assert!(!a.zoomed());
+        assert_eq!(a.pane_rects().len(), 3);
+        assert!(matches!(&a.actions[..], [Action::Resize { pane, .. }] if *pane == f));
+        assert!(!a.actions.iter().any(|x| matches!(x, Action::Update(_))), "zoom is not saved");
+
+        // Moving the focus or switching tabs ends the zoom.
+        pk(&mut a, 'z');
+        pk(&mut a, 'h');
+        assert!(!a.zoomed());
+        pk(&mut a, 'z');
+        pk(&mut a, 't');
+        commit(&mut a);
+        assert!(!a.zoomed());
+    }
+
+    #[test]
+    fn closing_a_pane_asks_then_kills_and_closes() {
+        let mut a = three_panes();
+        let f = focused(&a);
+        let mut doc = a.doc.clone();
+        apply(&mut doc, &WsOp::SetTerminal { pane: f.clone(), terminal: Some("t77".into()) }).unwrap();
+        a.on_doc(doc);
+        a.actions.clear();
+        pk(&mut a, 'x');
+        let Some(Dialog::Confirm { message, .. }) = &a.dialog else { panic!() };
+        assert!(message.contains("will end"), "{message}");
+        assert!(a.actions.is_empty());
+        a.on_key(key('q'));
+        assert!(a.dialog.is_some(), "other keys don't answer, and q does not quit");
+        a.on_key(key('n'));
+        assert!(a.dialog.is_none() && a.actions.is_empty());
+
+        pk(&mut a, 'x');
+        a.on_key(key('y'));
+        assert!(matches!(&a.actions[..], [Action::Kill(t), Action::Update(ops)]
+            if t == &["t77".to_string()] && ops == &[WsOp::ClosePane { pane: f.clone() }]), "{:?}", a.actions);
+        commit(&mut a);
+        // The pane is gone and its stream closes; the focus moved on.
+        assert!(a.actions.iter().any(|x| matches!(x, Action::Detach(p) if *p == f)));
+        assert_ne!(focused(&a), f);
+        assert!(!a.slots.contains_key(&f));
+    }
+
+    #[test]
+    fn closing_the_last_pane_of_the_last_tab_shows_the_error() {
+        let mut a = open_w1();
+        pk(&mut a, 'x');
+        assert!(a.dialog.is_none(), "no point asking");
+        assert!(a.current_flash().is_some_and(|(m, e)| e && m.contains("delete the workspace")));
+        pk(&mut a, 'X');
+        assert!(a.dialog.is_none());
+        assert!(a.actions.is_empty());
+    }
+
+    #[test]
+    fn closing_the_last_pane_of_a_tab_closes_the_tab() {
+        let mut a = open_w1();
+        pk(&mut a, 't');
+        commit(&mut a);
+        attach_pending(&mut a);
+        let only = focused(&a);
+        pk(&mut a, 'x');
+        a.on_key(key('y'));
+        // Nothing was started yet, so there is nothing to kill.
+        assert!(matches!(&a.actions[..], [Action::Update(ops)] if ops == &[WsOp::ClosePane { pane: only.clone() }]));
+        commit(&mut a);
+        assert_eq!(a.active().unwrap().0.tabs.len(), 1);
+    }
+
+    #[test]
+    fn closing_a_tab_kills_all_its_terminals() {
+        let mut a = three_panes();
+        let (tab, panes) = {
+            let (_, t) = a.active().unwrap();
+            (t.id.clone(), t.layout.panes().iter().map(|p| p.id.clone()).collect::<Vec<_>>())
+        };
+        let mut doc = a.doc.clone();
+        for (i, p) in panes.iter().enumerate().take(2) {
+            apply(&mut doc, &WsOp::SetTerminal { pane: p.clone(), terminal: Some(format!("t{i}")) }).unwrap();
+        }
+        a.on_doc(doc);
+        pk(&mut a, 't');
+        commit(&mut a);
+        // Back on tab 1.
+        pk(&mut a, '1');
+        a.actions.clear();
+        pk(&mut a, 'X');
+        let Some(Dialog::Confirm { message, .. }) = &a.dialog else { panic!() };
+        assert!(message.contains("3 pane"), "{message}");
+        a.on_key(key('y'));
+        let [Action::Kill(t), Action::Update(ops)] = &a.actions[..] else { panic!("{:?}", a.actions) };
+        assert_eq!(t, &["t0".to_string(), "t1".to_string()]);
+        assert_eq!(ops, &[WsOp::CloseTab { id: tab }]);
+    }
+
+    #[test]
+    fn rename_tab_form() {
+        let mut a = open_w1();
+        pk(&mut a, 'r');
+        let Some(Dialog::Form(f)) = &a.dialog else { panic!() };
+        assert_eq!(f.fields[0].input.value(), "shell");
+        for _ in 0..5 {
+            a.on_key(code(KeyCode::Backspace));
+        }
+        for c in "editor".chars() {
+            a.on_key(key(c));
+        }
+        a.on_key(code(KeyCode::Enter));
+        let ops = commit(&mut a);
+        assert!(matches!(&ops[..], [WsOp::RenameTab { name, .. }] if name == "editor"));
+        assert_eq!(a.active().unwrap().1.name, "editor");
+    }
+
+    #[test]
+    fn pane_keys_need_an_open_workspace() {
+        let mut a = app();
+        for c in ['t', 'T', 'v', 's', 'V', 'S', 'r', 'x', 'X'] {
+            pk(&mut a, c);
+            assert!(a.dialog.is_none() && a.actions.is_empty(), "{c}");
+            assert!(a.current_flash().is_some_and(|(m, _)| m.contains("open a workspace")), "{c}");
+        }
+        // Moving, resizing and zooming quietly do nothing.
+        for c in ['h', 'j', 'k', 'l', 'H', 'J', 'K', 'L', 'z', '1', '[', ']'] {
+            pk(&mut a, c);
+        }
+        assert!(a.actions.is_empty());
+    }
+
+    #[test]
+    fn keys_and_paste_go_only_to_the_focused_pane() {
+        let mut a = three_panes();
+        let f = focused(&a);
+        assert_eq!(a.on_key(key('a')), Some(Out::Key(key('a'))));
+        assert_eq!(a.on_paste("hi").as_deref(), Some("hi"));
+        // The loop sends to `focused_pane`, and that follows the doc.
+        pk(&mut a, 'h');
+        assert_ne!(focused(&a), f);
+        // Only the focused slot shows a cursor: the UI asks `focused_pane`.
+        assert_eq!(a.focused_pane().unwrap(), "n-w1");
     }
 }

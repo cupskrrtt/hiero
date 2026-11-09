@@ -150,19 +150,16 @@ impl WsDoc {
         self.projects.iter().find_map(|p| p.workspaces.iter().find(|w| w.id == id).map(|w| (p, w)))
     }
 
-    #[allow(dead_code)] // used by tabs and splits in W3
     pub fn tab(&self, id: &str) -> Option<(&Workspace, &Tab)> {
         self.all_workspaces().find_map(|w| w.tabs.iter().find(|t| t.id == id).map(|t| (w, t)))
     }
 
-    #[allow(dead_code)] // used by tabs and splits in W3
     pub fn pane(&self, id: &str) -> Option<(&Workspace, &Tab, &Pane)> {
         self.all_workspaces().find_map(|w| {
             w.tabs.iter().find_map(|t| t.layout.find(id).map(|p| (w, t, p)))
         })
     }
 
-    #[allow(dead_code)] // used by tabs and splits in W3
     fn all_workspaces(&self) -> impl Iterator<Item = &Workspace> {
         self.projects.iter().flat_map(|p| p.workspaces.iter())
     }
@@ -200,7 +197,6 @@ pub enum Move {
 
 /// One change to the document. Everything is addressed by id.
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // tab, split and folder ops are used from W3 on
 pub enum WsOp {
     AddProject { id: String, name: String, root: String },
     RenameProject { id: String, name: String },
@@ -210,6 +206,7 @@ pub enum WsOp {
     /// A new workspace starts with one tab holding one shell pane.
     AddWorkspace { project: String, id: String, name: String, folder: String, tab_id: String, pane_id: String },
     RenameWorkspace { id: String, name: String },
+    #[allow(dead_code)] // the CLI has no way to change a folder yet
     SetFolder { id: String, folder: String },
     DeleteWorkspace { id: String },
     /// Moves within its project.
@@ -225,6 +222,10 @@ pub enum WsOp {
     /// Closing the last pane of a tab closes the tab (refused for the last tab).
     ClosePane { pane: String },
     SetFocus { pane: String },
+    /// Grow (`delta` > 0) or shrink the pane's share of the nearest split that
+    /// lays out along `dir`. The neighbour gives or takes the difference; weights
+    /// never drop below 1, and at the limit nothing changes.
+    ResizePane { tab: String, pane: String, dir: Dir, delta: i16 },
     /// What the pane runs, for when its terminal has to be started again.
     SetCommand { pane: String, command: Option<String> },
     SetTerminal { pane: String, terminal: Option<String> },
@@ -446,6 +447,14 @@ pub fn apply(doc: &mut WsDoc, op: &WsOp) -> Result<(), String> {
             let (pi, wi, ti) = pane_tab_ix(doc, pane)?;
             doc.projects[pi].workspaces[wi].tabs[ti].focus = pane.clone();
         }
+        WsOp::ResizePane { tab, pane, dir, delta } => {
+            let (pi, wi, ti) = tab_ix(doc, tab)?;
+            let layout = &mut doc.projects[pi].workspaces[wi].tabs[ti].layout;
+            if layout.find(pane).is_none() {
+                return Err(format!("pane {pane} is not in tab {tab}"));
+            }
+            resize(layout, pane, *dir, *delta as i32);
+        }
         WsOp::SetCommand { pane, command } => {
             let (pi, wi, ti) = pane_tab_ix(doc, pane)?;
             if let Some(p) = doc.projects[pi].workspaces[wi].tabs[ti].layout.find_mut(pane) {
@@ -508,6 +517,52 @@ fn split(l: &mut Layout, id: &str, dir: Dir, new: Pane) -> Option<Pane> {
     }
 }
 
+/// Resize in the deepest split of `dir` above the pane. `None`: the pane is
+/// not in `l`; `Some(true)`: a split took care of it (even if it was at its limit).
+fn resize(l: &mut Layout, id: &str, dir: Dir, delta: i32) -> Option<bool> {
+    let Layout::Split { dir: d, children, sizes } = l else {
+        return matches!(l, Layout::Pane(p) if p.id == id).then_some(false);
+    };
+    let i = children.iter().position(|c| c.find(id).is_some())?;
+    if resize(&mut children[i], id, dir, delta)? {
+        return Some(true);
+    }
+    if *d != dir {
+        return Some(false);
+    }
+    sizes.resize(children.len(), 1);
+    shift_weight(sizes, i, delta);
+    Some(true)
+}
+
+/// Move `delta` of weight to child `i` from its next sibling (the previous
+/// one for the last child); a negative `delta` gives weight back. Weights are
+/// first made fine-grained (sum of at least 100) so a step is a few percent.
+/// Neither side goes below a small floor (always at least 1).
+fn shift_weight(sizes: &mut [u16], i: usize, delta: i32) {
+    if sizes.len() < 2 {
+        return;
+    }
+    let donor = if i + 1 < sizes.len() { i + 1 } else { i - 1 };
+    let mut w: Vec<i32> = sizes.iter().map(|&s| s.max(1) as i32).collect();
+    let sum: i32 = w.iter().sum();
+    if sum < 100 {
+        let k = (100 + sum - 1) / sum;
+        w.iter_mut().for_each(|x| *x *= k);
+    }
+    // Stop at about 5% so a pane never shrinks away to no cells.
+    let floor = 5;
+    let d = if delta > 0 { delta.min((w[donor] - floor).max(0)) } else { -(-delta).min((w[i] - floor).max(0)) };
+    if d == 0 {
+        return;
+    }
+    w[i] += d;
+    w[donor] -= d;
+    for (s, x) in sizes.iter_mut().zip(w) {
+        *s = x.clamp(1, u16::MAX as i32) as u16;
+    }
+}
+
 fn remove_pane(l: &mut Layout, id: &str) -> bool {
     let Layout::Split { children, sizes, .. } = l else { return false };
     sizes.resize(children.len(), 1);
@@ -556,7 +611,6 @@ fn normalize(l: &mut Layout) {
 
 /// Cut `total` cells into parts in proportion to `weights`. The parts add
 /// up to `total` exactly: part k ends where `total * (weights so far) / sum` says.
-#[allow(dead_code)] // used by splits in W3
 fn share(total: u16, weights: &[u16], n: usize) -> Vec<u16> {
     let w: Vec<u64> = (0..n).map(|i| weights.get(i).copied().unwrap_or(1).max(1) as u64).collect();
     let sum: u64 = w.iter().sum();
@@ -573,14 +627,12 @@ fn share(total: u16, weights: &[u16], n: usize) -> Vec<u16> {
 }
 
 /// Where each pane goes inside `area`. Every cell is given to exactly one pane.
-#[allow(dead_code)] // used by splits in W3
 pub fn rects(layout: &Layout, area: Rect) -> Vec<(String, Rect)> {
     let mut out = Vec::new();
     place(layout, area, &mut out);
     out
 }
 
-#[allow(dead_code)] // used by splits in W3
 fn place(l: &Layout, area: Rect, out: &mut Vec<(String, Rect)>) {
     match l {
         Layout::Pane(p) => out.push((p.id.clone(), area)),
@@ -1263,6 +1315,94 @@ mod tests {
         assert_eq!(r[1].1, Rect::new(40, 0, 41, 10));
         assert_eq!(r[2].1, Rect::new(40, 10, 41, 21));
         assert_exact_cover(&r, a);
+    }
+
+    fn do_resize(d: &mut WsDoc, pane: &str, dir: Dir, delta: i16) {
+        let tab = d.pane(pane).unwrap().1.id.clone();
+        ok(d, WsOp::ResizePane { tab, pane: s(pane), dir, delta });
+    }
+
+    fn widths(d: &WsDoc, tab: &str) -> Vec<(String, u16, u16)> {
+        let l = &d.tab(tab).unwrap().1.layout;
+        rects(l, Rect::new(0, 0, 100, 40)).into_iter().map(|(id, r)| (id, r.width, r.height)).collect()
+    }
+
+    #[test]
+    fn resize_grows_one_side_and_shrinks_its_neighbour() {
+        let mut d = base();
+        ok(&mut d, split_op("w1-p", Dir::Horizontal, "b"));
+        let before = widths(&d, "w1-t");
+        assert_eq!(before, [(s("w1-p"), 50, 40), (s("b"), 50, 40)]);
+        do_resize(&mut d, "w1-p", Dir::Horizontal, 10);
+        let w = widths(&d, "w1-t");
+        assert!(w[0].1 > 50 && w[1].1 < 50 && w[0].1 + w[1].1 == 100, "{w:?}");
+        // Shrinking the last pane gives the room to the previous one.
+        do_resize(&mut d, "b", Dir::Horizontal, -10);
+        let w2 = widths(&d, "w1-t");
+        assert!(w2[1].1 < w[1].1, "{w2:?}");
+        // The other axis has no split here: nothing changes.
+        let snapshot = d.clone();
+        do_resize(&mut d, "b", Dir::Vertical, 10);
+        assert_eq!(d, snapshot);
+    }
+
+    #[test]
+    fn resize_picks_the_nearest_split_of_that_direction() {
+        let mut d = base();
+        ok(&mut d, split_op("w1-p", Dir::Horizontal, "b"));
+        ok(&mut d, split_op("b", Dir::Vertical, "c"));
+        // a | (b over c). Vertical from b moves the inner border only.
+        do_resize(&mut d, "b", Dir::Vertical, 10);
+        let w = widths(&d, "w1-t");
+        assert_eq!(w[0], (s("w1-p"), 50, 40));
+        assert!(w[1].2 > 20 && w[2].2 < 20, "{w:?}");
+        // Horizontal from b goes past the inner split to the outer one.
+        do_resize(&mut d, "b", Dir::Horizontal, 10);
+        let w = widths(&d, "w1-t");
+        assert!(w[0].1 < 50 || w[1].1 > 50, "{w:?}");
+        assert_eq!(w[1].1, w[2].1);
+        // ...and from the left pane the same outer split grows it.
+        do_resize(&mut d, "w1-p", Dir::Horizontal, 20);
+        assert!(widths(&d, "w1-t")[0].1 > w[0].1);
+    }
+
+    #[test]
+    fn resize_weights_never_drop_below_one_and_stop_at_the_limit() {
+        let mut d = base();
+        ok(&mut d, split_op("w1-p", Dir::Horizontal, "b"));
+        ok(&mut d, split_op("b", Dir::Horizontal, "c"));
+        for _ in 0..60 {
+            do_resize(&mut d, "w1-p", Dir::Horizontal, 7);
+        }
+        let Layout::Split { sizes, .. } = &d.tab("w1-t").unwrap().1.layout else { panic!() };
+        assert!(sizes.iter().all(|&x| x >= 1), "{sizes:?}");
+        assert_eq!(sizes.len(), 3);
+        // The next pane gave all it could; asking for more is a no-op.
+        let snapshot = d.clone();
+        do_resize(&mut d, "w1-p", Dir::Horizontal, 7);
+        assert_eq!(d, snapshot);
+        // Shrinking to the floor stops too.
+        for _ in 0..60 {
+            do_resize(&mut d, "w1-p", Dir::Horizontal, -7);
+        }
+        let Layout::Split { sizes, .. } = &d.tab("w1-t").unwrap().1.layout else { panic!() };
+        assert!(sizes.iter().all(|&x| x >= 1));
+        let snapshot = d.clone();
+        do_resize(&mut d, "w1-p", Dir::Horizontal, -7);
+        assert_eq!(d, snapshot);
+        // Every pane still gets cells.
+        assert!(widths(&d, "w1-t").iter().all(|w| w.1 >= 1));
+    }
+
+    #[test]
+    fn resize_checks_its_ids() {
+        let mut d = base();
+        add_ws(&mut d, "p1", "w2", "backend");
+        ok(&mut d, split_op("w1-p", Dir::Horizontal, "b"));
+        let e = err(&mut d, WsOp::ResizePane { tab: s("w2-t"), pane: s("b"), dir: Dir::Horizontal, delta: 5 });
+        assert!(e.contains("not in tab"), "{e}");
+        let e = err(&mut d, WsOp::ResizePane { tab: s("nope"), pane: s("b"), dir: Dir::Horizontal, delta: 5 });
+        assert!(e.contains("no tab"), "{e}");
     }
 
     #[test]

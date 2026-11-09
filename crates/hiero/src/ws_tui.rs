@@ -1,15 +1,16 @@
-//! The workspace screen's event loop: keys, core events, the attached pane.
+//! The workspace screen's event loop: keys, core events, the attached panes.
 //! Same shape as the board's loop (`tui`), without the board's state.
 
 use crate::workspace::{self, WsDoc, WsOp};
 use crate::ws_app::{Action, Out, Plan, WsApp};
-use crate::{attach, config, keys, notify, ws_ui};
+use crate::{config, keys, notify, ws_ui};
 use anyhow::Result;
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, EventStream, KeyEventKind};
 use crossterm::execute;
 use futures::StreamExt;
-use hc_client::{AttachParams, AttachStream, Client, Filter, StreamMsg, WatchMsg, Watcher, endpoint};
+use hc_client::{AttachParams, AttachStream, Client, ErrorKind, Filter, StreamMsg, WatchMsg, Watcher, endpoint};
 use ratatui::layout::Rect;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -22,7 +23,56 @@ enum Msg {
     Doc(Result<WsDoc, String>),
     /// A change we made; an error is shown, the doc is taken as the new truth.
     Updated(Result<WsDoc, String>),
-    Opened { pane: String, addr: String, cols: u16, rows: u16, result: Result<Box<AttachStream>, String> },
+    Opened { pane: String, attempt: u64, addr: String, cols: u16, rows: u16, result: Result<Box<AttachStream>, String> },
+    /// Output or the end of a pane's stream, tagged with the attempt it belongs to.
+    Stream { pane: String, attempt: u64, msg: StreamMsg },
+}
+
+/// What the event loop asks a pane's task to do with its stream.
+enum PaneCmd {
+    Input(Vec<u8>),
+    Resize(u16, u16),
+    Focus(bool),
+    /// Detach; the program keeps running.
+    Close,
+}
+
+/// The loop's side of a pane's task.
+struct Handle {
+    attempt: u64,
+    cmd: mpsc::UnboundedSender<PaneCmd>,
+}
+
+/// One task per attached pane owns its stream (`recv` needs `&mut`) and
+/// waits on both the stream and the loop's commands. Everything it hears is
+/// forwarded to the loop tagged with the pane and attempt. It ends when the
+/// stream closes or the loop says so.
+async fn pane_task(
+    pane: String,
+    attempt: u64,
+    mut stream: AttachStream,
+    mut cmds: mpsc::UnboundedReceiver<PaneCmd>,
+    tx: mpsc::UnboundedSender<Msg>,
+) {
+    loop {
+        tokio::select! {
+            msg = stream.recv() => {
+                let closed = matches!(msg, StreamMsg::Closed(_));
+                if tx.send(Msg::Stream { pane: pane.clone(), attempt, msg }).is_err() || closed {
+                    return;
+                }
+            }
+            cmd = cmds.recv() => match cmd {
+                Some(PaneCmd::Input(b)) => { let _ = stream.input(&b).await; }
+                Some(PaneCmd::Resize(c, r)) => { let _ = stream.resize(c, r).await; }
+                Some(PaneCmd::Focus(g)) => { let _ = stream.focus(g).await; }
+                Some(PaneCmd::Close) | None => {
+                    stream.close().await;
+                    return;
+                }
+            },
+        }
+    }
 }
 
 pub async fn run(config_error: Option<String>) -> Result<()> {
@@ -34,11 +84,6 @@ pub async fn run(config_error: Option<String>) -> Result<()> {
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
-}
-
-fn pane_size(term: &ratatui::DefaultTerminal, banner: bool) -> Result<Rect> {
-    let size = term.size()?;
-    Ok(ws_ui::pane_inner(Rect::new(0, 0, size.width, size.height), banner))
 }
 
 async fn event_loop(
@@ -60,8 +105,10 @@ async fn event_loop(
     let mut connecting = false;
     let mut next_connect = Instant::now();
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
-    // The attach stream of the pane on screen.
-    let mut pane: Option<AttachStream> = None;
+    // The task of each attached pane, by pane id.
+    let mut handles: HashMap<String, Handle> = HashMap::new();
+    // The pane that last got the focus event.
+    let mut last_focus: Option<String> = None;
     let mut slow = interval(Duration::from_secs(1));
 
     loop {
@@ -80,11 +127,21 @@ async fn event_loop(
             });
         }
 
+        // Every pass recomputes where the panes go, so a resize, a layout
+        // change or the banner all end up as RESIZE of the streams.
+        let size = term.size()?;
+        app.set_screen(Rect::new(0, 0, size.width, size.height));
+
         for action in std::mem::take(&mut app.actions) {
             match action {
-                Action::Detach => {
-                    if let Some(p) = pane.take() {
-                        tokio::spawn(p.close());
+                Action::Detach(pane) => {
+                    if let Some(h) = handles.remove(&pane) {
+                        let _ = h.cmd.send(PaneCmd::Close);
+                    }
+                }
+                Action::Resize { pane, cols, rows } => {
+                    if let Some(h) = handles.get(&pane) {
+                        let _ = h.cmd.send(PaneCmd::Resize(cols, rows));
                     }
                 }
                 Action::LoadDoc => {
@@ -104,14 +161,37 @@ async fn event_loop(
                     }
                     None => app.flash_error("not connected to herdr-core"),
                 },
-                Action::Open(plan) => match &client {
-                    Some(c) => {
-                        let inner = pane_size(term, app.disconnected.is_some())?;
-                        tokio::spawn(open_pane(c.clone(), path.clone(), plan, inner, tx.clone()));
+                Action::Kill(addrs) => {
+                    if let Some(c) = &client {
+                        let c = c.clone();
+                        tokio::spawn(async move {
+                            for a in addrs {
+                                kill_and_remove(&c, &a).await;
+                            }
+                        });
                     }
-                    None => app.pane_failed("not connected to herdr-core".into()),
+                }
+                Action::Open { plan, attempt, cols, rows } => match &client {
+                    Some(c) => {
+                        tokio::spawn(open_pane(c.clone(), path.clone(), plan, attempt, (cols, rows), tx.clone()));
+                    }
+                    None => {
+                        let pane = plan.pane().to_string();
+                        app.on_opened(&pane, attempt, Err("not connected to herdr-core".into()));
+                    }
                 },
             }
+        }
+
+        // Tell the programs which pane has the keyboard.
+        let focused = app.focused_pane();
+        if focused != last_focus {
+            for (id, gained) in [(&last_focus, false), (&focused, true)] {
+                if let Some(h) = id.as_ref().and_then(|id| handles.get(id)) {
+                    let _ = h.cmd.send(PaneCmd::Focus(gained));
+                }
+            }
+            last_focus = focused;
         }
 
         term.draw(|f| ws_ui::draw(f, &app))?;
@@ -119,37 +199,28 @@ async fn event_loop(
         tokio::select! {
             ev = keys.next() => match ev {
                 Some(Ok(TermEvent::Key(k))) if k.kind != KeyEventKind::Release => {
-                    if let Some(out) = app.on_key(k)
-                        && let (Some(p), Some(view)) = (&pane, &app.pane)
-                    {
+                    if let Some(out) = app.on_key(k) {
                         let bytes = match out {
-                            Out::Key(k) => keys::encode(k, view.parser.screen().application_cursor()),
+                            Out::Key(k) => keys::encode(k, app.focused_app_cursor()),
                             Out::Bytes(b) => Some(b),
                         };
                         if let Some(b) = bytes {
-                            let _ = p.input(&b).await;
+                            send_input(&handles, &app, b);
                         }
                     }
                 }
                 Some(Ok(TermEvent::Paste(text))) => {
-                    if let Some(text) = app.on_paste(&text)
-                        && let (Some(p), Some(view)) = (&pane, &app.pane)
-                    {
-                        let bytes = if view.parser.screen().bracketed_paste() {
+                    if let Some(text) = app.on_paste(&text) {
+                        let bytes = if app.focused_bracketed_paste() {
                             format!("\x1b[200~{text}\x1b[201~")
                         } else {
                             text
                         };
-                        let _ = p.input(bytes.as_bytes()).await;
+                        send_input(&handles, &app, bytes.into_bytes());
                     }
                 }
-                Some(Ok(TermEvent::Resize(_, _))) => {
-                    if let (Some(p), Some(view)) = (&pane, &mut app.pane) {
-                        let inner = pane_size(term, app.disconnected.is_some())?;
-                        view.resize(inner.width, inner.height);
-                        let _ = p.resize(inner.width, inner.height).await;
-                    }
-                }
+                // The next pass round the loop recomputes every pane's size.
+                Some(Ok(TermEvent::Resize(_, _))) => {}
                 Some(Ok(_)) => {}
                 Some(Err(e)) => return Err(e.into()),
                 None => break,
@@ -161,18 +232,6 @@ async fn event_loop(
                 }
                 for a in app.on_watch(&msg) {
                     notify::alert(&a.what, &a.title, &a.body);
-                }
-            }
-            msg = crate::tui::pane_recv(&mut pane) => {
-                if let Some(view) = &mut app.pane {
-                    match msg {
-                        StreamMsg::Data(bytes) => view.parser.process(&bytes),
-                        StreamMsg::Resize { .. } => {}
-                        StreamMsg::Closed(reason) => {
-                            view.ended = Some(attach::describe_close(reason.as_ref()));
-                            pane = None;
-                        }
-                    }
                 }
             }
             Some(msg) = rx.recv() => match msg {
@@ -195,19 +254,30 @@ async fn event_loop(
                     app.flash_error(&format!("can't read workspaces: {e}"));
                 }
                 Msg::Updated(Err(e)) => app.flash_error(&e),
-                Msg::Opened { pane: id, addr, cols, rows, result } => match result {
-                    Ok(stream) if app.wants(&id) => {
-                        app.pane_attached(addr, cols, rows);
-                        let _ = stream.focus(true).await;
-                        pane = Some(*stream);
+                Msg::Opened { pane: id, attempt, addr, cols, rows, result } => match result {
+                    Ok(stream) if app.on_opened(&id, attempt, Ok((addr, cols, rows))) => {
+                        let (cmd, cmds) = mpsc::unbounded_channel();
+                        // The focus event of a pane that was attached just now.
+                        let _ = cmd.send(PaneCmd::Focus(app.focused_pane().as_deref() == Some(id.as_str())));
+                        tokio::spawn(pane_task(id.clone(), attempt, *stream, cmds, tx.clone()));
+                        handles.insert(id, Handle { attempt, cmd });
                     }
-                    // The person moved to another workspace meanwhile.
+                    // The person moved on meanwhile.
                     Ok(stream) => {
                         tokio::spawn(stream.close());
                     }
-                    Err(e) if app.wants(&id) => app.pane_failed(e),
-                    Err(_) => {}
+                    Err(e) => {
+                        app.on_opened(&id, attempt, Err(e));
+                    }
                 },
+                Msg::Stream { pane: id, attempt, msg } => {
+                    if handles.get(&id).is_some_and(|h| h.attempt == attempt) {
+                        if matches!(msg, StreamMsg::Closed(_)) {
+                            handles.remove(&id);
+                        }
+                        app.on_stream(&id, msg);
+                    }
+                }
             },
             _ = slow.tick() => {} // lets a message in the bottom bar expire
         }
@@ -220,17 +290,39 @@ async fn event_loop(
         state.workspace = app.open.clone();
         config::save_ui_state(&state);
     }
-    if let Some(p) = pane.take() {
-        p.close().await;
+    // Detach every stream cleanly; the programs keep running.
+    for (_, h) in handles.drain() {
+        let _ = h.cmd.send(PaneCmd::Close);
     }
+    tokio::time::sleep(Duration::from_millis(350)).await;
     Ok(())
+}
+
+/// Type into the focused pane's program.
+fn send_input(handles: &HashMap<String, Handle>, app: &WsApp, bytes: Vec<u8>) {
+    if let Some(h) = app.focused_pane().and_then(|id| handles.get(&id)) {
+        let _ = h.cmd.send(PaneCmd::Input(bytes));
+    }
+}
+
+/// End a pane's program and remove its terminal from hc. A just-killed
+/// terminal may take a moment before it can be removed.
+async fn kill_and_remove(c: &Client, addr: &str) {
+    let _ = c.kill(addr).await;
+    for _ in 0..10 {
+        match c.rm(addr).await {
+            Ok(_) => return,
+            Err(e) if e.is_kind(ErrorKind::NotFound) => return,
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
 }
 
 /// Start the pane's terminal if needed (recording it in the document), then
 /// attach to it as a viewer of the pane's size.
-async fn open_pane(c: Client, path: PathBuf, plan: Plan, inner: Rect, tx: mpsc::UnboundedSender<Msg>) {
+async fn open_pane(c: Client, path: PathBuf, plan: Plan, attempt: u64, size: (u16, u16), tx: mpsc::UnboundedSender<Msg>) {
     let pane = plan.pane().to_string();
-    let fail = |e: String| Msg::Opened { pane: pane.clone(), addr: String::new(), cols: 0, rows: 0, result: Err(e) };
+    let fail = |e: String| Msg::Opened { pane: pane.clone(), attempt, addr: String::new(), cols: 0, rows: 0, result: Err(e) };
     let addr = match plan {
         Plan::Attach { addr, .. } => addr,
         Plan::Start { pane, params } => match c.run(&params).await {
@@ -250,7 +342,7 @@ async fn open_pane(c: Client, path: PathBuf, plan: Plan, inner: Rect, tx: mpsc::
             }
         },
     };
-    let params = AttachParams::new(addr.clone(), inner.width, inner.height);
+    let params = AttachParams::new(addr.clone(), size.0, size.1);
     let result = AttachStream::open_at(&path, &params).await.map(Box::new).map_err(|e| e.to_string());
-    let _ = tx.send(Msg::Opened { pane: pane.clone(), addr, cols: inner.width, rows: inner.height, result });
+    let _ = tx.send(Msg::Opened { pane: pane.clone(), attempt, addr, cols: size.0, rows: size.1, result });
 }

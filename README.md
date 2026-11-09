@@ -42,7 +42,7 @@ The layout is remembered, and each pane stores its command so a missing terminal
 |---|---|---|
 | W1 | Workspace data model in hc doc `hiero-ws`, plus `hiero ws` CLI | ✅ done |
 | W2 | Sidebar and one live pane | ✅ done |
-| W3 | Tabs and splits | planned |
+| W3 | Tabs and splits | ✅ done |
 | W4 | Restore terminals, and a menu with the old views (board, tasks, pipelines) | planned |
 | W5 | Polish | planned |
 
@@ -53,7 +53,7 @@ there as `hiero board`.
 - Every pane is an hc terminal. Opening a workspace attaches to its terminal if it still runs, or
   starts a shell in the workspace folder (labels `hiero.ws`, `hiero.pane`, `hiero.project`) and saves
   its address in the doc. Switching workspaces or quitting Hiero leaves programs running.
-- Only the focused pane of the active tab is shown for now. Tabs and splits come in W3.
+- W2 showed only one pane. W3 shows tabs and splits.
 - Hiero's own keys sit behind a prefix key (default `ctrl+space`), so nvim and Claude get every
   other key. Set it with `[workspace] prefix = "ctrl+b"` (`ctrl+space` or `ctrl+<letter>`).
 - The sidebar shows a dot per workspace (● working, ◐ needs you, ✓ done) and a dot on a collapsed
@@ -64,18 +64,50 @@ there as `hiero board`.
 - Deleting a workspace or project only removes it from the list. Its terminals keep running
   (W4 will offer to stop them).
 
+**W3 ✅** The workspace area has a tabs bar and shows every pane of the active tab at once.
+
+- Tabs bar on top: the tab names in order, the active one highlighted. No status dots here; the
+  sidebar has them.
+- Each pane has its own border and title (its command or `shell`, and its terminal address, plus
+  `ended: …` when its program exited). The focused pane has a thick green border and the cursor.
+  Keys and paste go to the focused pane only.
+- Every pane keeps its own attach stream. Opening a tab attaches each pane's terminal if it still
+  runs, or starts it (its command, in its folder) and saves the address. Switching tabs or
+  workspaces closes the old streams, and the programs keep running. Coming back attaches the same
+  terminals again.
+- Every terminal resize, split, or border move resizes the streams to the pane's inner size.
+- `T`, `V`, `S` ask for a command first (for example `nvim .` or `claude`). The command is saved on
+  the pane, so a missing terminal can be started again.
+- Closing a pane or tab asks first, then kills and removes its terminals.
+- Zoom (`z`) is only a view: it is not saved. Moving the focus, splitting, or switching tab ends it.
+
 ### Workspace keys
 
 After the prefix (`ctrl+space`), the bar shows `prefix` until the next key:
 
 | Key | Action |
 |---|---|
+| `t` | new tab with a shell |
+| `T` | new tab, asks for a command first |
+| `v` / `s` | split the pane side by side / stacked (new shell, same folder, gets focus) |
+| `V` / `S` | same, but ask for a command first |
+| `h` `j` `k` `l` or arrows | move focus to the neighbouring pane |
+| `H` `J` `K` `L` | narrower / taller / shorter / wider (5% a press) |
+| `1` … `9` | go to tab N |
+| `[` / `]` | previous / next tab |
+| `r` | rename the tab |
+| `x` | close the pane (asks; its program ends) |
+| `X` | close the tab (asks; all its programs end) |
+| `z` | zoom the pane to the whole area, again to undo |
 | `w` | switch between sidebar and workspace |
 | `n` / `N` | new workspace in this project / new project |
 | `?` | help |
 | `q` | quit Hiero (terminals keep running) |
 | prefix again | send the prefix key itself to the program |
 | `Esc` | cancel |
+
+The last pane of a tab closes the tab. The last tab of a workspace can't be closed; delete the
+workspace instead.
 
 In the sidebar (no prefix needed):
 
