@@ -41,6 +41,18 @@ pub enum Mode {
     Pane,
 }
 
+/// Where the board opens. The workspace menu picks one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoardStart {
+    Board,
+    Tasks,
+    Pipelines,
+    Usage,
+    Templates,
+    /// The prompt that types one line into every live agent.
+    Broadcast,
+}
+
 pub struct TasksView {
     pub selected: usize,
 }
@@ -267,6 +279,9 @@ pub struct App {
     pub config_error: Option<String>,
     pub tick: u64,
     pub quit: bool,
+    /// The view to open on the first snapshot (set by the workspace menu).
+    pub start: Option<BoardStart>,
+    entered_start: bool,
 }
 
 impl Default for App {
@@ -309,6 +324,8 @@ impl App {
             config_error: None,
             tick: 0,
             quit: false,
+            start: None,
+            entered_start: false,
         }
     }
 
@@ -324,6 +341,9 @@ impl App {
                 self.disconnected = None;
                 self.connected_once = true;
                 self.preview.dirty = true;
+                if let Some(start) = self.start.take() {
+                    self.enter_start(start);
+                }
             }
             WatchMsg::Disconnected { error } => {
                 self.set.apply_watch(msg);
@@ -603,6 +623,52 @@ impl App {
         let mut list: Vec<&Run> = self.tasks.runs.values().collect();
         list.sort_by_key(|r| std::cmp::Reverse(r.started_ms));
         list
+    }
+
+    /// The broadcast prompt, or None (with a message) when nobody would get it.
+    fn broadcast_mode(&mut self) -> Option<Mode> {
+        let addrs = self.broadcast_targets();
+        if addrs.is_empty() {
+            self.flash_error("no live agents shown to broadcast to");
+            return None;
+        }
+        Some(Mode::Input(InputDialog {
+            title: format!("broadcast to {} agent{} shown", addrs.len(), if addrs.len() == 1 { "" } else { "s" }),
+            hint: "enter sends to every live agent in the list (search narrows it) · esc cancel".into(),
+            input: TextInput::default(),
+            purpose: InputPurpose::Broadcast(addrs),
+            force: false,
+        }))
+    }
+
+    /// Open the view the workspace menu asked for. Needs the terminals, so
+    /// it waits for the first snapshot.
+    fn enter_start(&mut self, start: BoardStart) {
+        let mode = match start {
+            BoardStart::Board => return,
+            BoardStart::Tasks => {
+                self.actions.push(Action::LoadDoc);
+                Mode::Tasks(TasksView { selected: 0 })
+            }
+            BoardStart::Pipelines => self.pipelines_view(),
+            BoardStart::Usage => self.usage_view(),
+            BoardStart::Templates => {
+                self.actions.push(Action::LoadTemplates);
+                self.templates_view()
+            }
+            BoardStart::Broadcast => match self.broadcast_mode() {
+                Some(m) => m,
+                None => return,
+            },
+        };
+        self.mode = mode;
+        self.entered_start = true;
+    }
+
+    /// The board was opened on a view and that view is closed again: the
+    /// board has done its job and the caller (the workspace) takes over.
+    pub fn start_done(&self) -> bool {
+        self.entered_start && matches!(self.mode, Mode::Normal)
     }
 
     fn pipelines_view(&mut self) -> Mode {
@@ -1020,17 +1086,8 @@ impl App {
                 });
             }
             KeyCode::Char('B') => {
-                let addrs = self.broadcast_targets();
-                if addrs.is_empty() {
-                    self.flash_error("no live agents shown to broadcast to");
-                } else {
-                    return Mode::Input(InputDialog {
-                        title: format!("broadcast to {} agent{} shown", addrs.len(), if addrs.len() == 1 { "" } else { "s" }),
-                        hint: "enter sends to every live agent in the list (search narrows it) · esc cancel".into(),
-                        input: TextInput::default(),
-                        purpose: InputPurpose::Broadcast(addrs),
-                        force: false,
-                    });
+                if let Some(m) = self.broadcast_mode() {
+                    return m;
                 }
             }
             KeyCode::Char('w') => return self.pipelines_view(),
@@ -1051,7 +1108,7 @@ impl App {
                 let task = self.selected.as_deref().and_then(|a| self.tasks.by_terminal(a)).cloned();
                 match task {
                     Some(t) => return self.open_review(&t),
-                    None => self.flash_error("no task here — start one with c and worktree on, or see T"),
+                    None => self.flash_error("no task here — start one with c and worktree on (space), or see T"),
                 }
             }
             KeyCode::Char('t') => {

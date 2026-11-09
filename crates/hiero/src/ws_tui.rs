@@ -3,7 +3,7 @@
 
 use crate::workspace::{self, WsDoc, WsOp};
 use crate::ws_app::{Action, Out, Plan, WsApp};
-use crate::{config, keys, notify, ws_ui};
+use crate::{config, keys, notify, tui, ws_ui};
 use anyhow::Result;
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, EventStream, KeyEventKind};
 use crossterm::execute;
@@ -23,6 +23,8 @@ enum Msg {
     Doc(Result<WsDoc, String>),
     /// A change we made; an error is shown, the doc is taken as the new truth.
     Updated(Result<WsDoc, String>),
+    /// A background start finished (its terminal is recorded in the doc first).
+    Started { pane: String, result: Result<String, String> },
     Opened { pane: String, attempt: u64, addr: String, cols: u16, rows: u16, result: Result<Box<AttachStream>, String> },
     /// Output or the end of a pane's stream, tagged with the attempt it belongs to.
     Stream { pane: String, attempt: u64, msg: StreamMsg },
@@ -95,6 +97,7 @@ async fn event_loop(
     let remember = config::get().board.remember;
     let restore = if remember { config::load_ui_state().workspace } else { None };
     let mut app = WsApp::new(config::get().prefix(), restore);
+    app.auto_restore = config::get().workspace.restore;
     if let Some(e) = config_error {
         tracing::warn!("{e}");
         app.flash_error(&format!("config ignored: {e}"));
@@ -169,6 +172,33 @@ async fn event_loop(
                                 kill_and_remove(&c, &a).await;
                             }
                         });
+                    }
+                }
+                Action::Start { pane, params } => match &client {
+                    Some(c) => {
+                        tokio::spawn(start_pane(c.clone(), pane, params, tx.clone()));
+                    }
+                    None => app.on_started(&pane, Err("not connected to herdr-core".into())),
+                },
+                Action::Board(start) => {
+                    // Let go of the screen and the streams (the programs keep
+                    // running), run the board here, then take everything back.
+                    for (_, h) in handles.drain() {
+                        let _ = h.cmd.send(PaneCmd::Close);
+                    }
+                    last_focus = None;
+                    app.suspend();
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    drop(keys);
+                    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+                    ratatui::restore();
+                    let r = tui::run_board(start, None).await;
+                    tui::resume(term)?;
+                    keys = EventStream::new();
+                    // Events from before were not read; a new snapshot is a clean baseline.
+                    *watch = Watcher::spawn(path.clone(), Filter::default());
+                    if let Err(e) = r {
+                        app.flash_error(&format!("board: {e}"));
                     }
                 }
                 Action::Open { plan, attempt, cols, rows } => match &client {
@@ -254,6 +284,7 @@ async fn event_loop(
                     app.flash_error(&format!("can't read workspaces: {e}"));
                 }
                 Msg::Updated(Err(e)) => app.flash_error(&e),
+                Msg::Started { pane, result } => app.on_started(&pane, result),
                 Msg::Opened { pane: id, attempt, addr, cols, rows, result } => match result {
                     Ok(stream) if app.on_opened(&id, attempt, Ok((addr, cols, rows))) => {
                         let (cmd, cmds) = mpsc::unbounded_channel();
@@ -318,6 +349,26 @@ async fn kill_and_remove(c: &Client, addr: &str) {
     }
 }
 
+/// Start a terminal for a pane that is not on screen and record it. The
+/// document update goes to the loop before `Started`, so the pane already
+/// has its address when the start counts as done.
+async fn start_pane(c: Client, pane: String, params: hc_client::RunParams, tx: mpsc::UnboundedSender<Msg>) {
+    let result = match c.run(&params).await {
+        Ok(t) => {
+            let op = WsOp::SetTerminal { pane: pane.clone(), terminal: Some(t.address.clone()) };
+            match workspace::update(&c, &[op]).await {
+                Ok(doc) => {
+                    let _ = tx.send(Msg::Doc(Ok(doc)));
+                }
+                Err(e) => tracing::warn!("could not record terminal {}: {e}", t.address),
+            }
+            Ok(t.address)
+        }
+        Err(e) => Err(e.to_string()),
+    };
+    let _ = tx.send(Msg::Started { pane, result });
+}
+
 /// Start the pane's terminal if needed (recording it in the document), then
 /// attach to it as a viewer of the pane's size.
 async fn open_pane(c: Client, path: PathBuf, plan: Plan, attempt: u64, size: (u16, u16), tx: mpsc::UnboundedSender<Msg>) {
@@ -325,6 +376,8 @@ async fn open_pane(c: Client, path: PathBuf, plan: Plan, attempt: u64, size: (u1
     let fail = |e: String| Msg::Opened { pane: pane.clone(), attempt, addr: String::new(), cols: 0, rows: 0, result: Err(e) };
     let addr = match plan {
         Plan::Attach { addr, .. } => addr,
+        // Nothing to attach to; the app never asks for this.
+        Plan::Ended { .. } => return,
         Plan::Start { pane, params } => match c.run(&params).await {
             Ok(t) => {
                 let op = WsOp::SetTerminal { pane, terminal: Some(t.address.clone()) };

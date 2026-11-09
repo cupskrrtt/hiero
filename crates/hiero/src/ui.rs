@@ -502,7 +502,7 @@ fn draw_tasks(f: &mut Frame, app: &App, area: Rect, selected: usize) {
     let [body, keys] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
     if list.is_empty() {
         f.render_widget(
-            Paragraph::new("No tasks yet. Press c on the board, keep worktree on, and give it a task.").dim(),
+            Paragraph::new("No tasks yet. Press c on the board, turn worktree on, and give it a task.").dim(),
             body,
         );
     } else {

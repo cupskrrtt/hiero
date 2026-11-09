@@ -1,7 +1,7 @@
 //! The board's event loop: keys, core events, screen reads, actions,
 //! attached agents and timers.
 
-use crate::app::{Action, App, Mode, PaneView};
+use crate::app::{Action, App, BoardStart, Mode, PaneView};
 use crate::pipeline;
 use crate::tasks::{self, TaskOp, TaskStatus};
 use crate::{attach, forms, keys, notify, ui, worktree};
@@ -36,12 +36,20 @@ enum Msg {
     PaneOpened { addr: String, name: String, cols: u16, rows: u16, result: Result<Box<AttachStream>, String> },
 }
 
+/// `hiero board`: the board on its own screen.
 pub async fn run(config_error: Option<String>) -> Result<()> {
+    run_board(BoardStart::Board, config_error).await
+}
+
+/// Run the board on its own terminal setup, opening on `start`. With a view
+/// other than the board, closing that view ends this call (the workspace
+/// screen calls it from its menu and takes the terminal back afterwards).
+pub async fn run_board(start: BoardStart, config_error: Option<String>) -> Result<()> {
     let path = endpoint::socket_path();
     let mut watch = Watcher::spawn(path.clone(), Filter::default());
     let mut term = ratatui::init();
     execute!(std::io::stdout(), EnableBracketedPaste)?;
-    let result = event_loop(&mut term, &mut watch, path, config_error).await;
+    let result = event_loop(&mut term, &mut watch, path, config_error, start).await;
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
@@ -52,8 +60,10 @@ async fn event_loop(
     watch: &mut mpsc::Receiver<WatchMsg>,
     path: PathBuf,
     config_error: Option<String>,
+    start: BoardStart,
 ) -> Result<()> {
     let mut app = App::new();
+    app.start = Some(start);
     app.apply_config(crate::config::get());
     if let Some(e) = config_error {
         tracing::warn!("{e}");
@@ -293,7 +303,7 @@ async fn event_loop(
         for a in std::mem::take(&mut app.alerts) {
             notify::alert(&a.what, &a.title, &a.body);
         }
-        if app.quit {
+        if app.quit || app.start_done() {
             break;
         }
     }
@@ -323,7 +333,7 @@ fn pane_size(term: &ratatui::DefaultTerminal, banner: bool) -> Result<Rect> {
 ///
 /// Uses a fresh terminal handle instead of `Terminal::clear`, which asks the
 /// terminal for the cursor position and fails if that reply gets lost.
-fn resume(term: &mut ratatui::DefaultTerminal) -> Result<()> {
+pub(crate) fn resume(term: &mut ratatui::DefaultTerminal) -> Result<()> {
     terminal::enable_raw_mode()?;
     execute!(
         std::io::stdout(),

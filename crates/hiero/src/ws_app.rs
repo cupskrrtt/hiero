@@ -3,13 +3,13 @@
 //! loop (`ws_tui`) carries out the [`Action`]s this asks for, so all of it
 //! can be tested.
 
-use crate::app::{Alert, PaneView, status_from_labels};
+use crate::app::{Alert, BoardStart, PaneView, status_from_labels};
 use crate::config::Prefix;
 use crate::forms::{TextInput, expand_home};
 use crate::workspace::{self, Dir, Move, Tab, Workspace, WsDoc, WsOp, WsStatus, new_id};
 use crate::ws_ui;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use hc_client::{EventData, RunParams, TerminalSet, WatchMsg};
+use hc_client::{EventData, RunParams, Terminal, TerminalSet, WatchMsg};
 use ratatui::layout::Rect;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -49,12 +49,14 @@ pub enum Plan {
     Attach { pane: String, addr: String },
     /// There is none (never started, or gone): start one, then record it.
     Start { pane: String, params: RunParams },
+    /// Its program ended on its own: show that, and start nothing.
+    Ended { pane: String, addr: String, why: String },
 }
 
 impl Plan {
     pub fn pane(&self) -> &str {
         match self {
-            Plan::Attach { pane, .. } | Plan::Start { pane, .. } => pane,
+            Plan::Attach { pane, .. } | Plan::Start { pane, .. } | Plan::Ended { pane, .. } => pane,
         }
     }
 }
@@ -73,6 +75,42 @@ pub enum Action {
     Resize { pane: String, cols: u16, rows: u16 },
     /// Kill these terminals and remove them from hc.
     Kill(Vec<String>),
+    /// Start a pane's terminal in the background (no attach) and record it.
+    Start { pane: String, params: RunParams },
+    /// Hand the screen to the old board, opened on this view.
+    Board(BoardStart),
+}
+
+/// What a pane's terminal needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fate {
+    /// Still running.
+    Running,
+    /// Not there, or taken down by the system: start it again.
+    Missing,
+    /// Its program ended on its own or was killed: leave it, say why.
+    Ended(String),
+}
+
+/// The restart rule. A terminal that is gone from hc, or that finished
+/// because the system went down (a reboot, a core restart), comes back by
+/// itself. One that exited or was killed was ended on purpose, so it stays
+/// ended until the person asks.
+pub fn fate(t: Option<&Terminal>) -> Fate {
+    let Some(t) = t else { return Fate::Missing };
+    if t.is_live() {
+        return Fate::Running;
+    }
+    match t.reason.as_deref() {
+        Some("server_stop" | "host_shutdown" | "holder_lost" | "stopped_by_restart") => Fate::Missing,
+        reason => {
+            let why = reason.unwrap_or("ended").replace('_', " ");
+            Fate::Ended(match t.exit_code {
+                Some(code) => format!("{why} (code {code})"),
+                None => why,
+            })
+        }
+    }
 }
 
 /// How to fill one pane. With `fresh` a new terminal is started even if the
@@ -80,11 +118,12 @@ pub enum Action {
 pub fn plan(doc: &WsDoc, set: &TerminalSet, ws_id: &str, pane_id: &str, fresh: bool) -> Option<Plan> {
     let (project, w) = doc.workspace(ws_id)?;
     let pane = w.panes().into_iter().find(|p| p.id == pane_id)?;
-    if !fresh
-        && let Some(addr) = &pane.terminal
-        && set.get(addr).is_some_and(|t| t.is_live())
-    {
-        return Some(Plan::Attach { pane: pane.id.clone(), addr: addr.clone() });
+    if !fresh && let Some(addr) = &pane.terminal {
+        match fate(set.get(addr)) {
+            Fate::Running => return Some(Plan::Attach { pane: pane.id.clone(), addr: addr.clone() }),
+            Fate::Ended(why) => return Some(Plan::Ended { pane: pane.id.clone(), addr: addr.clone(), why }),
+            Fate::Missing => {}
+        }
     }
     let mut params = RunParams::new().cwd(pane.cwd.clone().unwrap_or_else(|| w.folder.clone()));
     if let Some(cmd) = &pane.command {
@@ -170,10 +209,23 @@ pub struct Form {
 }
 
 pub enum Dialog {
-    Help,
+    /// The help text, scrolled by this many lines.
+    Help(usize),
     Form(Form),
     Confirm { kind: ConfirmKind, message: String },
+    /// The menu of the old views; the index is the cursor.
+    Menu(usize),
 }
+
+/// The menu entries, in order.
+pub const MENU: [(&str, BoardStart); 6] = [
+    ("Agents board", BoardStart::Board),
+    ("Tasks", BoardStart::Tasks),
+    ("Pipelines", BoardStart::Pipelines),
+    ("Usage", BoardStart::Usage),
+    ("Templates", BoardStart::Templates),
+    ("Broadcast", BoardStart::Broadcast),
+];
 
 /// What a key press means for the program in the pane.
 #[derive(Debug, PartialEq)]
@@ -189,6 +241,8 @@ pub struct Slot {
     /// Present once attached.
     pub view: Option<PaneView>,
     pub error: Option<String>,
+    /// Not started on purpose (`restore = false`): Enter starts it.
+    pub idle: bool,
     /// Inner cells (cols, rows) the stream and the parser have.
     pub size: (u16, u16),
 }
@@ -216,11 +270,20 @@ pub struct WsApp {
     pub slots: HashMap<String, Slot>,
     /// Panes whose terminal is being started right now (never start one twice).
     starting: HashSet<String>,
+    /// Terminals started in this run, by pane: the terminal list may not
+    /// know them yet, and they must not be started a second time.
+    recent: HashMap<String, String>,
+    /// Background starts that failed; they are not retried until the pane is opened.
+    failed: HashSet<String>,
+    /// `[workspace] restore`: start missing terminals without being asked.
+    pub auto_restore: bool,
     next_attempt: u64,
     /// The tab (id) whose focused pane fills the area. View only, not saved.
     pub zoom: Option<String>,
     /// Where the panes go (below the tabs bar).
     pub panes_area: Rect,
+    /// Height of the whole screen, for the scrolling help.
+    screen_h: u16,
     pub actions: Vec<Action>,
     pub disconnected: Option<String>,
     pub connected_once: bool,
@@ -250,9 +313,13 @@ impl WsApp {
             open: None,
             slots: HashMap::new(),
             starting: HashSet::new(),
+            recent: HashMap::new(),
+            failed: HashSet::new(),
+            auto_restore: true,
             next_attempt: 0,
             zoom: None,
             panes_area: ws_ui::areas(Rect::new(0, 0, 100, 30), false).panes,
+            screen_h: 30,
             actions: Vec::new(),
             disconnected: None,
             connected_once: false,
@@ -392,6 +459,9 @@ impl WsApp {
                 // A fresh snapshot is a new baseline, not a change.
                 self.last_status = self.statuses();
                 self.synced = true;
+                // Only now do we know which terminals exist, so only now is
+                // it safe to decide what is missing.
+                self.sync();
                 Vec::new()
             }
             WatchMsg::Disconnected { error } => {
@@ -489,9 +559,17 @@ impl WsApp {
         Self::inner(r.unwrap_or(self.panes_area))
     }
 
+    /// The screen goes to the board for a while: drop every pane's stream
+    /// state. `sync` opens them again (attaching to the same terminals).
+    pub fn suspend(&mut self) {
+        self.slots.clear();
+        self.zoom = None;
+    }
+
     /// The screen changed size (or the banner came or went).
     pub fn set_screen(&mut self, screen: Rect) {
         self.panes_area = ws_ui::areas(screen, self.disconnected.is_some()).panes;
+        self.screen_h = screen.height;
         self.sync();
     }
 
@@ -500,6 +578,10 @@ impl WsApp {
     /// runs, else start one), and resize the ones whose rectangle changed.
     /// Safe to call at any time; it only acts on differences.
     pub fn sync(&mut self) {
+        // Before the first snapshot every terminal looks missing.
+        if !self.synced {
+            return;
+        }
         let (panes, tab) = match self.active() {
             Some((_, t)) => (t.layout.panes().iter().map(|p| p.id.clone()).collect::<Vec<_>>(), t.id.clone()),
             None => (vec![], String::new()),
@@ -517,7 +599,7 @@ impl WsApp {
         for id in &panes {
             if !self.slots.contains_key(id) {
                 if !self.starting.contains(id) {
-                    self.open_slot(id, false);
+                    self.open_slot(id, false, false);
                 }
                 continue;
             }
@@ -531,18 +613,89 @@ impl WsApp {
                 self.actions.push(Action::Resize { pane: id.clone(), cols: size.0, rows: size.1 });
             }
         }
+        self.restore_hidden();
     }
 
-    fn open_slot(&mut self, pane: &str, fresh: bool) {
+    /// The terminal started in this run for `pane` that the terminal list
+    /// does not show yet.
+    fn recently_started(&self, pane: &str) -> Option<String> {
+        let addr = self.recent.get(pane)?;
+        (self.terminal_of(pane).as_ref() == Some(addr) && self.set.get(addr).is_none()).then(|| addr.clone())
+    }
+
+    /// Start, in the background, the missing terminals of the panes that are
+    /// not on screen (other tabs), so the whole workspace is running.
+    fn restore_hidden(&mut self) {
+        let set = &self.set;
+        self.recent.retain(|_, a| set.get(a).is_none());
+        if !self.auto_restore {
+            return;
+        }
         let Some(ws) = self.open.clone() else { return };
-        let Some(p) = plan(&self.doc, &self.set, &ws, pane, fresh) else { return };
+        let Some((w, active)) = self.active().map(|(w, t)| (w, t.id.clone())) else { return };
+        let panes: Vec<String> =
+            w.tabs.iter().filter(|t| t.id != active).flat_map(|t| t.layout.panes()).map(|p| p.id.clone()).collect();
+        for pane in panes {
+            if self.starting.contains(&pane) || self.failed.contains(&pane) || self.recently_started(&pane).is_some() {
+                continue;
+            }
+            if let Some(Plan::Start { pane, params }) = plan(&self.doc, &self.set, &ws, &pane, false) {
+                self.starting.insert(pane.clone());
+                self.actions.push(Action::Start { pane, params });
+            }
+        }
+    }
+
+    /// A background start finished (the terminal is recorded in the document
+    /// before this arrives).
+    pub fn on_started(&mut self, pane: &str, result: Result<String, String>) {
+        self.starting.remove(pane);
+        match result {
+            Ok(addr) => {
+                self.recent.insert(pane.to_string(), addr);
+            }
+            Err(e) => {
+                self.failed.insert(pane.to_string());
+                self.flash_error(&format!("can't restore a terminal: {e}"));
+            }
+        }
+        self.sync();
+    }
+
+    /// `manual`: the person asked (Enter), so `restore = false` does not apply.
+    fn open_slot(&mut self, pane: &str, fresh: bool, manual: bool) {
+        let Some(ws) = self.open.clone() else { return };
+        let p = match self.recently_started(pane).filter(|_| !fresh) {
+            Some(addr) => Plan::Attach { pane: pane.to_string(), addr },
+            None => match plan(&self.doc, &self.set, &ws, pane, fresh) {
+                Some(p) => p,
+                None => return,
+            },
+        };
+        self.failed.remove(pane);
         let (cols, rows) = self.size_of(pane);
         self.next_attempt += 1;
         let attempt = self.next_attempt;
-        if matches!(p, Plan::Start { .. }) {
-            self.starting.insert(pane.to_string());
+        let mut slot = Slot { attempt, view: None, error: None, idle: false, size: (cols, rows) };
+        match &p {
+            Plan::Ended { addr, why, .. } => {
+                let mut view = PaneView::new(addr.clone(), addr.clone(), cols, rows);
+                view.ended = Some(why.clone());
+                slot.view = Some(view);
+                self.slots.insert(pane.to_string(), slot);
+                return;
+            }
+            Plan::Start { .. } if !manual && !self.auto_restore => {
+                slot.idle = true;
+                self.slots.insert(pane.to_string(), slot);
+                return;
+            }
+            Plan::Start { .. } => {
+                self.starting.insert(pane.to_string());
+            }
+            Plan::Attach { .. } => {}
         }
-        self.slots.insert(pane.to_string(), Slot { attempt, view: None, error: None, size: (cols, rows) });
+        self.slots.insert(pane.to_string(), slot);
         self.actions.push(Action::Open { plan: p, attempt, cols, rows });
     }
 
@@ -562,13 +715,16 @@ impl WsApp {
         }
         self.slots.remove(pane);
         self.actions.push(Action::Detach(pane.to_string()));
-        self.open_slot(pane, fresh);
+        self.open_slot(pane, fresh, true);
     }
 
     /// An open attempt finished. False when the pane has moved on (another tab
     /// or workspace, or a newer attempt): the caller then closes the stream.
     pub fn on_opened(&mut self, pane: &str, attempt: u64, result: Result<(String, u16, u16), String>) -> bool {
-        self.starting.remove(pane);
+        let was_start = self.starting.remove(pane);
+        if was_start && let Ok((addr, ..)) = &result {
+            self.recent.insert(pane.to_string(), addr.clone());
+        }
         let Some(slot) = self.slots.get_mut(pane).filter(|s| s.attempt == attempt) else { return false };
         let ok = result.is_ok();
         match result {
@@ -696,7 +852,8 @@ impl WsApp {
                 self.focus = if self.focus == Focus::Sidebar { Focus::Workspace } else { Focus::Sidebar };
             }
             KeyCode::Char('q') => self.quit = true,
-            KeyCode::Char('?') => self.dialog = Some(Dialog::Help),
+            KeyCode::Char('?') => self.dialog = Some(Dialog::Help(0)),
+            KeyCode::Char('m') => self.dialog = Some(Dialog::Menu(0)),
             KeyCode::Char('n') => self.add_workspace_form(),
             KeyCode::Char('N') => self.add_project_form(),
             KeyCode::Char('t') => self.new_tab(None),
@@ -729,8 +886,9 @@ impl WsApp {
         let id = self.focused_pane()?;
         let slot = self.slots.get(&id)?;
         let ended = slot.view.as_ref().is_some_and(|v| v.ended.is_some());
-        if (ended || slot.error.is_some()) && k.code == KeyCode::Enter {
-            // A fresh shell where the program ended; a plain retry after a failed attach.
+        if (ended || slot.error.is_some() || slot.idle) && k.code == KeyCode::Enter {
+            // A fresh shell where the program ended; a plain retry after a
+            // failed attach, or the first start of a pane left alone.
             self.restart(&id, ended);
             return None;
         }
@@ -948,7 +1106,7 @@ impl WsApp {
             KeyCode::Char('K') => self.reorder(Move::Up),
             KeyCode::Esc | KeyCode::Tab | KeyCode::Char('l') | KeyCode::Right => self.focus = Focus::Workspace,
             KeyCode::Char('q') => self.quit = true,
-            KeyCode::Char('?') => self.dialog = Some(Dialog::Help),
+            KeyCode::Char('?') => self.dialog = Some(Dialog::Help(0)),
             _ => {}
         }
     }
@@ -1023,36 +1181,70 @@ impl WsApp {
         }));
     }
 
+    /// The terminals of every pane of a workspace or project.
+    fn terminals_of(&self, id: &str) -> Vec<String> {
+        let ws: Vec<&Workspace> = match self.doc.project(id) {
+            Some(p) => p.workspaces.iter().collect(),
+            None => self.doc.workspace(id).map(|(_, w)| w).into_iter().collect(),
+        };
+        ws.iter().flat_map(|w| w.panes()).filter_map(|p| p.terminal.clone()).collect()
+    }
+
     fn delete_confirm(&mut self) {
-        let message = match self.selected() {
+        let what = match self.selected() {
             Some(Row::Project(id)) => {
                 let Some(p) = self.doc.project(&id) else { return };
-                format!(
-                    "Delete project \"{}\" and its {} workspace(s)? Their terminals keep running.  y / n",
-                    p.name,
-                    p.workspaces.len()
-                )
+                format!("project \"{}\" and its {} workspace(s)", p.name, p.workspaces.len())
             }
             Some(Row::Workspace(id)) => {
                 let Some((_, w)) = self.doc.workspace(&id) else { return };
-                format!("Delete workspace \"{}\"? Its terminals keep running.  y / n", w.name)
+                format!("workspace \"{}\"", w.name)
             }
             None => return,
         };
-        // TODO(W4): offer to kill the terminals too.
+        let message = format!("Delete {what}?  y: end its terminals and delete · k: keep them running and delete · n: cancel");
         self.dialog = Some(Dialog::Confirm { kind: ConfirmKind::Delete(self.sel.clone()), message });
     }
 
     fn dialog_key(&mut self, k: KeyEvent) {
         match self.dialog.as_mut() {
-            Some(Dialog::Help) => self.dialog = None,
+            Some(Dialog::Help(top)) => {
+                // The help may be taller than the screen: it scrolls, any other key closes.
+                let max = ws_ui::help_lines("").len().saturating_sub(self.screen_h.saturating_sub(4) as usize);
+                match k.code {
+                    KeyCode::Char('j') | KeyCode::Down => *top = (*top + 1).min(max),
+                    KeyCode::Char('k') | KeyCode::Up => *top = top.saturating_sub(1),
+                    KeyCode::PageDown | KeyCode::Char(' ') => *top = (*top + 10).min(max),
+                    KeyCode::PageUp => *top = top.saturating_sub(10),
+                    KeyCode::Char('g') | KeyCode::Home => *top = 0,
+                    KeyCode::Char('G') | KeyCode::End => *top = max,
+                    _ => self.dialog = None,
+                }
+            }
             Some(Dialog::Confirm { kind, .. }) => match k.code {
                 KeyCode::Char('y' | 'Y') => {
                     let kind = kind.clone();
                     self.dialog = None;
                     self.confirmed(kind);
                 }
+                // Only a delete has a third answer: keep the terminals.
+                KeyCode::Char('k' | 'K') if matches!(kind, ConfirmKind::Delete(_)) => {
+                    let ConfirmKind::Delete(id) = kind.clone() else { return };
+                    self.dialog = None;
+                    self.delete(id, false);
+                }
                 KeyCode::Char('n' | 'N') | KeyCode::Esc => self.dialog = None,
+                _ => {}
+            },
+            Some(Dialog::Menu(i)) => match k.code {
+                KeyCode::Char('j') | KeyCode::Down => *i = (*i + 1).min(MENU.len() - 1),
+                KeyCode::Char('k') | KeyCode::Up => *i = i.saturating_sub(1),
+                KeyCode::Enter => {
+                    let start = MENU[*i].1;
+                    self.dialog = None;
+                    self.actions.push(Action::Board(start));
+                }
+                KeyCode::Esc | KeyCode::Char('q') => self.dialog = None,
                 _ => {}
             },
             Some(Dialog::Form(f)) => match k.code {
@@ -1074,14 +1266,7 @@ impl WsApp {
     /// The answer was yes.
     fn confirmed(&mut self, kind: ConfirmKind) {
         match kind {
-            ConfirmKind::Delete(id) => {
-                let op = if self.doc.project(&id).is_some() {
-                    WsOp::DeleteProject { id }
-                } else {
-                    WsOp::DeleteWorkspace { id }
-                };
-                self.actions.push(Action::Update(vec![op]));
-            }
+            ConfirmKind::Delete(id) => self.delete(id, true),
             ConfirmKind::ClosePane(pane) => {
                 let terminals: Vec<String> = self.terminal_of(&pane).into_iter().collect();
                 self.close_with(terminals, WsOp::ClosePane { pane });
@@ -1094,6 +1279,16 @@ impl WsApp {
                 self.close_with(terminals, WsOp::CloseTab { id });
             }
         }
+    }
+
+    /// Delete a project or workspace; with `kill` its terminals end first.
+    fn delete(&mut self, id: String, kill: bool) {
+        let terminals = if kill { self.terminals_of(&id) } else { vec![] };
+        let op = if self.doc.project(&id).is_some() { WsOp::DeleteProject { id } } else { WsOp::DeleteWorkspace { id } };
+        if !terminals.is_empty() {
+            self.actions.push(Action::Kill(terminals));
+        }
+        self.actions.push(Action::Update(vec![op]));
     }
 
     /// End the programs, then drop the pane or tab from the document.
@@ -1233,6 +1428,8 @@ mod tests {
         add_project(&mut doc, "p2", "solo");
         add_ws(&mut doc, "p2", "w3", "main");
         let mut a = WsApp::new(Prefix::Space, None);
+        // As if the first snapshot of the terminals had arrived.
+        a.synced = true;
         a.on_doc(doc);
         a.actions.clear();
         a
@@ -1242,6 +1439,16 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "address": addr,
             "state": if live { "live" } else { "finished" },
+        }))
+        .unwrap()
+    }
+
+    fn finished(addr: &str, reason: &str, code: Option<i32>) -> Terminal {
+        serde_json::from_value(serde_json::json!({
+            "address": addr,
+            "state": "finished",
+            "reason": reason,
+            "exit_code": code,
         }))
         .unwrap()
     }
@@ -1351,7 +1558,7 @@ mod tests {
 
         a.on_key(ctrl_space());
         a.on_key(key('?'));
-        assert!(matches!(a.dialog, Some(Dialog::Help)));
+        assert!(matches!(a.dialog, Some(Dialog::Help(_))));
         a.on_key(key('x'));
         assert!(a.dialog.is_none());
 
@@ -1381,6 +1588,7 @@ mod tests {
 
         // A different prefix.
         let mut b = WsApp::new(Prefix::Ctrl('b'), None);
+        b.synced = true;
         b.on_doc(a.doc.clone());
         open_attached(&mut b, "w1");
         b.focus = Focus::Workspace;
@@ -1436,8 +1644,13 @@ mod tests {
         assert_eq!(params.labels[LABEL_PANE], "n-w1");
         assert_eq!(params.labels[LABEL_PROJECT], "shosha");
 
-        // Finished: still start.
-        a.set.terminals.insert("t9".into(), terminal("t9", false));
+        // Finished on its own: shown as ended, not started again...
+        a.set.terminals.insert("t9".into(), finished("t9", "exited", Some(0)));
+        assert!(matches!(plan(&a.doc, &a.set, "w1", "n-w1", false), Some(Plan::Ended { why, .. }) if why == "exited (code 0)"));
+        // ...unless a fresh one is asked for (Enter).
+        assert!(matches!(plan(&a.doc, &a.set, "w1", "n-w1", true), Some(Plan::Start { .. })));
+        // Finished because the system went down: start again.
+        a.set.terminals.insert("t9".into(), finished("t9", "server_stop", None));
         assert!(matches!(plan(&a.doc, &a.set, "w1", "n-w1", false), Some(Plan::Start { .. })));
 
         // Live: attach, unless a fresh one is asked for.
@@ -1590,7 +1803,7 @@ mod tests {
         a.sel = "w3".into();
         a.on_key(key('D'));
         let Some(Dialog::Confirm { message, .. }) = &a.dialog else { panic!() };
-        assert!(message.contains("keep running"));
+        assert!(message.contains("keep them running"));
         a.on_key(key('x'));
         assert!(a.dialog.is_some(), "other keys don't answer");
         a.on_key(key('n'));
@@ -2007,10 +2220,239 @@ mod tests {
         attach_pending(&mut a);
         a.open_workspace("w1");
         let o = opens(&mut a);
-        assert_eq!(o.len(), 3);
+        // The ended pane needs no stream: it shows why it ended.
+        assert_eq!(o.len(), 2);
         assert!(matches!(&o[0], Plan::Attach { addr, .. } if addr == "t0"));
-        assert!(matches!(&o[1], Plan::Start { params, .. } if params.line.is_none()), "finished: shell again");
-        assert!(matches!(&o[2], Plan::Start { params, .. } if params.line.as_deref() == Some("nvim .")), "lost: its command");
+        assert!(matches!(&o[1], Plan::Start { params, .. } if params.line.as_deref() == Some("nvim .")), "lost: its command");
+        let ended = a.slots[&panes[1]].view.as_ref().unwrap();
+        assert!(ended.ended.is_some() && ended.addr == "t1", "finished on its own: stays ended");
+    }
+
+    // ---- W4 -------------------------------------------------------------------
+
+    #[test]
+    fn restart_rule() {
+        assert_eq!(fate(None), Fate::Missing);
+        assert_eq!(fate(Some(&terminal("t", true))), Fate::Running);
+        for r in ["server_stop", "host_shutdown", "holder_lost", "stopped_by_restart"] {
+            assert_eq!(fate(Some(&finished("t", r, None))), Fate::Missing, "{r}");
+        }
+        assert_eq!(fate(Some(&finished("t", "exited", Some(2)))), Fate::Ended("exited (code 2)".into()));
+        assert_eq!(fate(Some(&finished("t", "killed", None))), Fate::Ended("killed".into()));
+        // No reason at all: leave it alone rather than guess.
+        assert!(matches!(fate(Some(&terminal("t", false))), Fate::Ended(_)));
+    }
+
+    /// Workspace w1 with two tabs: tab 1 (open) has 1 pane, tab 2 has 2.
+    /// Every pane records a terminal `t-<pane>`; the set is empty.
+    fn two_tabs() -> (WsApp, Vec<String>) {
+        let mut a = app();
+        a.open_workspace("w1");
+        attach_pending(&mut a);
+        let mut doc = a.doc.clone();
+        apply(&mut doc, &WsOp::AddTab { workspace: "w1".into(), id: "t2".into(), name: "two".into(), pane_id: "x1".into() }).unwrap();
+        apply(&mut doc, &WsOp::SplitPane { pane: "x1".into(), dir: Dir::Horizontal, new_id: "x2".into() }).unwrap();
+        apply(&mut doc, &WsOp::SetCommand { pane: "x2".into(), command: Some("nvim .".into()) }).unwrap();
+        apply(&mut doc, &WsOp::SetActiveTab { workspace: "w1".into(), index: 0 }).unwrap();
+        let panes = ["n-w1", "x1", "x2"].map(String::from).to_vec();
+        for p in &panes {
+            apply(&mut doc, &WsOp::SetTerminal { pane: p.clone(), terminal: Some(format!("t-{p}")) }).unwrap();
+        }
+        a.on_doc(doc);
+        // Forget what loading the doc already asked for: tests start from a clean slate.
+        a.actions.clear();
+        a.starting.clear();
+        a.recent.clear();
+        a.slots.clear();
+        (a, panes)
+    }
+
+    fn starts(a: &mut WsApp) -> Vec<(String, Option<String>)> {
+        std::mem::take(&mut a.actions)
+            .into_iter()
+            .filter_map(|x| match x {
+                Action::Start { pane, params } => Some((pane, params.line)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn restore_starts_hidden_panes_without_attaching_and_never_twice() {
+        let (mut a, _) = two_tabs();
+        a.actions.clear();
+        // Nothing is known: the visible pane gets a stream, the hidden two are started in the background.
+        a.slots.clear();
+        a.sync();
+        let acts = std::mem::take(&mut a.actions);
+        let mut started: Vec<_> = acts
+            .iter()
+            .filter_map(|x| match x {
+                Action::Start { pane, params } => Some((pane.clone(), params.line.clone())),
+                _ => None,
+            })
+            .collect();
+        started.sort();
+        assert_eq!(started, [("x1".to_string(), None), ("x2".to_string(), Some("nvim .".to_string()))]);
+        let opened: Vec<_> = acts.iter().filter(|x| matches!(x, Action::Open { .. })).collect();
+        assert_eq!(opened.len(), 1, "only the visible tab gets attach streams");
+        assert!(a.slots.keys().all(|p| p == "n-w1"));
+
+        // Syncing again while they start does nothing.
+        a.sync();
+        a.sync();
+        assert!(starts(&mut a).is_empty());
+
+        // One finished; the terminal list does not show it yet: still nothing.
+        a.on_started("x1", Ok("t-x1".into()));
+        assert!(starts(&mut a).is_empty());
+        // The other one failed: not retried in a loop.
+        a.on_started("x2", Err("boom".into()));
+        a.sync();
+        assert!(starts(&mut a).is_empty());
+        assert!(a.current_flash().is_some_and(|(m, e)| e && m.contains("boom")));
+    }
+
+    #[test]
+    fn restore_waits_for_the_first_snapshot_and_skips_running_and_ended() {
+        let (mut a, _) = two_tabs();
+        a.actions.clear();
+        a.synced = false;
+        a.sync();
+        assert!(a.actions.is_empty(), "before the snapshot every terminal looks missing");
+        a.set.terminals.insert("t-x1".into(), terminal("t-x1", true));
+        a.set.terminals.insert("t-x2".into(), finished("t-x2", "killed", None));
+        a.set.terminals.insert("t-n-w1".into(), terminal("t-n-w1", true));
+        a.synced = true;
+        a.sync();
+        assert!(starts(&mut a).is_empty(), "one runs, one was killed on purpose");
+        // After a reboot the killed-by-system one comes back.
+        a.set.terminals.insert("t-x2".into(), finished("t-x2", "host_shutdown", None));
+        a.sync();
+        assert_eq!(starts(&mut a), [("x2".to_string(), Some("nvim .".to_string()))]);
+    }
+
+    #[test]
+    fn restore_off_starts_nothing_until_enter() {
+        let (mut a, _) = two_tabs();
+        a.auto_restore = false;
+        a.actions.clear();
+        a.slots.clear();
+        a.sync();
+        assert!(a.actions.is_empty(), "{:?}", a.actions);
+        let slot = &a.slots["n-w1"];
+        assert!(slot.idle && slot.view.is_none());
+        a.focus = Focus::Workspace;
+        assert_eq!(a.on_key(code(KeyCode::Enter)), None);
+        let o = opens(&mut a);
+        assert!(matches!(&o[..], [Plan::Start { pane, .. }] if pane == "n-w1"));
+        // Switching to the hidden tab leaves its panes idle too.
+        pk(&mut a, '2');
+        assert!(a.slots.values().all(|s| s.idle));
+    }
+
+    #[test]
+    fn delete_asks_about_the_terminals() {
+        let (mut a, panes) = two_tabs();
+        for p in &panes {
+            a.set.terminals.insert(format!("t-{p}"), terminal(&format!("t-{p}"), true));
+        }
+        a.slots.clear();
+        a.sync();
+        a.actions.clear();
+        a.focus = Focus::Sidebar;
+        a.sel = "w1".into();
+        // y: end the terminals, then delete.
+        a.on_key(key('D'));
+        a.on_key(key('y'));
+        let acts = std::mem::take(&mut a.actions);
+        let Action::Kill(addrs) = &acts[0] else { panic!("{acts:?}") };
+        let mut addrs = addrs.clone();
+        addrs.sort();
+        assert_eq!(addrs, ["t-n-w1", "t-x1", "t-x2"]);
+        assert!(matches!(&acts[1], Action::Update(ops) if ops == &[WsOp::DeleteWorkspace { id: "w1".into() }]));
+        assert_eq!(acts.len(), 2);
+        // k: only delete.
+        a.on_key(key('D'));
+        a.on_key(key('k'));
+        assert_eq!(only_update(&mut a), [WsOp::DeleteWorkspace { id: "w1".into() }]);
+        // n and Esc: nothing.
+        for c in [key('n'), code(KeyCode::Esc)] {
+            a.on_key(key('D'));
+            a.on_key(c);
+            assert!(a.dialog.is_none() && a.actions.is_empty());
+        }
+        // A project kills the terminals of all its workspaces.
+        a.sel = "p1".into();
+        a.on_key(key('D'));
+        a.on_key(key('y'));
+        let acts = std::mem::take(&mut a.actions);
+        assert!(matches!(&acts[0], Action::Kill(v) if v.len() == 3));
+        assert!(matches!(&acts[1], Action::Update(ops) if ops == &[WsOp::DeleteProject { id: "p1".into() }]));
+        // `k` means nothing in other questions.
+        a.focus = Focus::Workspace;
+        a.on_key(ctrl_space());
+        a.on_key(key('x'));
+        assert!(matches!(a.dialog, Some(Dialog::Confirm { .. })) || a.dialog.is_none());
+    }
+
+    #[test]
+    fn menu_moves_and_picks_a_view() {
+        let mut a = app();
+        a.focus = Focus::Workspace;
+        a.on_key(ctrl_space());
+        a.on_key(key('m'));
+        assert!(matches!(a.dialog, Some(Dialog::Menu(0))));
+        a.on_key(key('j'));
+        a.on_key(code(KeyCode::Down));
+        assert!(matches!(a.dialog, Some(Dialog::Menu(2))));
+        a.on_key(key('k'));
+        a.on_key(code(KeyCode::Enter));
+        assert!(a.dialog.is_none());
+        assert!(matches!(&a.actions[..], [Action::Board(BoardStart::Tasks)]));
+        a.actions.clear();
+        // The list stops at both ends, and the last entry is Broadcast.
+        a.on_key(ctrl_space());
+        a.on_key(key('m'));
+        for _ in 0..10 {
+            a.on_key(key('j'));
+        }
+        a.on_key(code(KeyCode::Enter));
+        assert!(matches!(&a.actions[..], [Action::Board(BoardStart::Broadcast)]));
+        a.actions.clear();
+        // Esc closes without a board.
+        a.on_key(ctrl_space());
+        a.on_key(key('m'));
+        a.on_key(code(KeyCode::Esc));
+        assert!(a.dialog.is_none() && a.actions.is_empty());
+    }
+
+    #[test]
+    fn suspend_drops_the_streams_and_sync_reattaches_the_same_terminals() {
+        let (mut a, _) = two_tabs();
+        a.set.terminals.insert("t-n-w1".into(), terminal("t-n-w1", true));
+        a.slots.clear();
+        a.sync();
+        attach_pending(&mut a);
+        a.suspend();
+        assert!(a.slots.is_empty());
+        a.sync();
+        let o = opens(&mut a);
+        assert!(matches!(&o[..], [Plan::Attach { addr, .. }] if addr == "t-n-w1"));
+    }
+
+    #[test]
+    fn help_scrolls_and_any_other_key_closes() {
+        let mut a = app();
+        a.set_screen(Rect::new(0, 0, 80, 24));
+        a.dialog = Some(Dialog::Help(0));
+        a.on_key(key('j'));
+        assert!(matches!(a.dialog, Some(Dialog::Help(1))));
+        a.on_key(key('G'));
+        let Some(Dialog::Help(end)) = a.dialog else { panic!() };
+        assert_eq!(end, ws_ui::help_lines("").len() - 20, "the last line is visible on 24 rows");
+        a.on_key(key('x'));
+        assert!(a.dialog.is_none());
     }
 
     #[test]

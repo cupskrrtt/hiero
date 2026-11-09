@@ -43,7 +43,7 @@ The layout is remembered, and each pane stores its command so a missing terminal
 | W1 | Workspace data model in hc doc `hiero-ws`, plus `hiero ws` CLI | ✅ done |
 | W2 | Sidebar and one live pane | ✅ done |
 | W3 | Tabs and splits | ✅ done |
-| W4 | Restore terminals, and a menu with the old views (board, tasks, pipelines) | planned |
+| W4 | Restore terminals, and a menu with the old views (board, tasks, pipelines) | ✅ done |
 | W5 | Polish | planned |
 
 **W2 ✅** `hiero` now opens the workspace screen: a sidebar of projects and workspaces, the open
@@ -62,8 +62,7 @@ there as `hiero board`.
   bell and notify, using the `[notify]` rules.
 - `hiero ws …` edits show up live. The open workspace is remembered (`remember = true`).
 - When a pane's program ends, the title says so and `Enter` starts a fresh shell there.
-- Deleting a workspace or project only removes it from the list. Its terminals keep running
-  (W4 will offer to stop them).
+- Deleting a workspace or project asks what to do with its terminals (W4).
 
 **W3 ✅** The workspace area has a tabs bar and shows every pane of the active tab at once.
 
@@ -81,6 +80,28 @@ there as `hiero board`.
   the pane, so a missing terminal can be started again.
 - Closing a pane or tab asks first, then kills and removes its terminals.
 - Zoom (`z`) is only a view: it is not saved. Moving the focus, splitting, or switching tab ends it.
+
+**W4 ✅** Layouts come back by themselves, and the old features sit behind a menu.
+
+- **Restore.** When a workspace opens, every pane of every tab gets a running terminal, not only
+  the visible tab. Missing ones start in the background (the pane's command or a shell, in its
+  folder) and the new address is saved. Only the visible tab's panes get attach streams; the other
+  tabs are just kept running. Nothing starts twice, and nothing starts before Hiero has seen the
+  list of terminals.
+- **Restart rule.** A pane's terminal starts again by itself when it is gone from hc, or when it
+  finished because the system went down (`server_stop`, `host_shutdown`, `holder_lost`,
+  `stopped_by_restart`: a reboot or a core restart). If it ended on its own (`exited`) or you
+  killed it, the pane stays as `ended: …` in every tab, and `Enter` starts it again.
+- `[workspace] restore = false` turns the automatic start off. Panes without a terminal then say
+  "not running", and `Enter` starts one.
+- **Delete.** `D` on a workspace or project asks: `y` ends its terminals and deletes, `k` deletes
+  and leaves the terminals running, `n` or `Esc` cancels.
+- **Menu.** `prefix` then `m` lists Agents board, Tasks, Pipelines, Usage, Templates and
+  Broadcast (`j` `k` `Enter`, `Esc` closes). A choice hands the screen to the old board, opened on
+  that view. Closing the view (`q`, or `Esc` for the broadcast prompt) brings the workspace back
+  as it was: the panes attach to the same terminals again. Programs keep running meanwhile.
+- **Worktrees are opt-in.** The switch in the new-agent form (`c` on the board) now starts off.
+- The help (`?`) scrolls (`j` `k`) when the terminal is short.
 
 ### Workspace keys
 
@@ -102,6 +123,7 @@ After the prefix (`ctrl+b`), the bar shows `prefix` until the next key:
 | `z` | zoom the pane to the whole area, again to undo |
 | `w` | switch between sidebar and workspace |
 | `n` / `N` | new workspace in this project / new project |
+| `m` | menu of the old views (see W4) |
 | `?` | help |
 | `q` | quit Hiero (terminals keep running) |
 | prefix again | send the prefix key itself to the program |
@@ -118,7 +140,7 @@ In the sidebar (no prefix needed):
 | `Enter` | open a workspace; on a project, fold or unfold it |
 | `a` / `A` | add workspace under this project / add project (name and folder) |
 | `r` | rename |
-| `D` | delete (asks first) |
+| `D` | delete (asks: `y` end its terminals · `k` keep them running · `n` cancel) |
 | `J` / `K` | move down / up |
 | `z` | fold or unfold the project |
 | `Esc`, `l`, `Tab` | back to the workspace |
@@ -196,7 +218,7 @@ A [git worktree](https://git-scm.com/docs/git-worktree) is a second working fold
 same repo with its own branch checked out, so each agent gets its own copy of the code but
 everything shares one history.
 
-- [x] New-agent form has a **worktree** switch (on by default inside a git repo): Hiero makes
+- [x] New-agent form has a **worktree** switch (off by default; turn it on with space): Hiero makes
   `../<repo>.hiero/<slug>` on branch `hiero/<slug>` from the repo's HEAD and starts the agent there
   (`slug-2`, `slug-3`… when taken; the worktree is removed again if the agent fails to start)
 - [x] Task records in herdr-core doc `hiero`: title, prompt, agent, repo, base branch/commit, branch,
@@ -309,6 +331,7 @@ grouping = "tree"            # project, tree or flat
 
 [workspace]
 prefix = "ctrl+b"            # or ctrl+<letter> (not c, h, i, j, m) or ctrl+space
+restore = true               # start missing terminals when a workspace opens
 
 [notify]
 bell = false

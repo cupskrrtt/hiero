@@ -2,7 +2,7 @@
 
 use crate::ui::{draw_input, draw_vt, popup};
 use crate::workspace::WsStatus;
-use crate::ws_app::{Dialog, Focus, Form, Row, WsApp};
+use crate::ws_app::{Dialog, Focus, Form, MENU, Row, WsApp};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -55,7 +55,8 @@ pub fn draw(f: &mut Frame, app: &WsApp) {
     draw_panes(f, app, a.panes);
     draw_bottom(f, app, a.bottom);
     match &app.dialog {
-        Some(Dialog::Help) => draw_help(f, f.area(), &app.prefix.label()),
+        Some(Dialog::Help(top)) => draw_help(f, f.area(), &app.prefix.label(), *top),
+        Some(Dialog::Menu(i)) => draw_menu(f, f.area(), *i),
         Some(Dialog::Form(form)) => draw_form(f, form, f.area()),
         Some(Dialog::Confirm { message, .. }) => {
             let w = (message.chars().count() as u16 + 4).min(f.area().width.saturating_sub(4)).max(30);
@@ -191,8 +192,15 @@ fn draw_pane(f: &mut Frame, app: &WsApp, id: &str, r: Rect, is_focused: bool, in
         .border_type(if is_focused && in_workspace { BorderType::Thick } else { BorderType::Plain })
         .border_style(color)
         .title(Line::from(title));
-    if is_focused && (ended.is_some() || slot.is_some_and(|s| s.error.is_some())) {
-        let hint = if ended.is_some() { " enter: start a new shell here " } else { " enter: try again " };
+    let idle = slot.is_some_and(|s| s.idle);
+    if is_focused && (ended.is_some() || idle || slot.is_some_and(|s| s.error.is_some())) {
+        let hint = if ended.is_some() {
+            " enter: start a new shell here "
+        } else if idle {
+            " enter: start it "
+        } else {
+            " enter: try again "
+        };
         block = block.title_bottom(Line::from(Span::styled(hint, Style::new().dim())));
     }
     let inner = block.inner(r);
@@ -204,6 +212,7 @@ fn draw_pane(f: &mut Frame, app: &WsApp, id: &str, r: Rect, is_focused: bool, in
     }
     let text = match slot.and_then(|s| s.error.as_ref()) {
         Some(err) => Line::from(Span::styled(format!("can't open this pane: {err}"), Style::new().fg(Color::Red))),
+        None if slot.is_some_and(|s| s.idle) => Line::from("not running — Enter starts it").dim(),
         None => Line::from("opening…").dim(),
     };
     f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
@@ -215,19 +224,19 @@ fn draw_bottom(f: &mut Frame, app: &WsApp, area: Rect) {
     if app.armed {
         spans.push(Span::styled(" prefix ", Style::new().bg(Color::Yellow).fg(Color::Black).bold()));
         spans.push(Span::raw(
-            " t/T tab · v/s split (V/S ask) · hjkl move · HJKL size · 1-9 [ ] tab · r rename · x/X close · z zoom · w sidebar · ? help",
+            " t/T tab · v/s split (V/S ask) · hjkl move · HJKL size · 1-9 [ ] tab · r rename · x/X close · z zoom · w sidebar · m menu · ? help",
         ));
     } else if let Some((msg, error)) = app.current_flash() {
         let style = if error { Style::new().fg(Color::Red) } else { Style::new().fg(Color::Green) };
         spans.push(Span::styled(format!(" {msg}"), style));
     } else if app.focus == Focus::Sidebar {
         spans.push(Span::styled(
-            " j/k move · enter open · a add · A project · r rename · D delete · J/K reorder · esc back",
+            format!(" j/k move · enter open · a add · A project · r rename · D delete · J/K reorder · esc back · {label} m menu"),
             Style::new().dim(),
         ));
     } else {
         spans.push(Span::styled(format!(" {label}"), Style::new().bold()));
-        spans.push(Span::styled(" then  t tab · v s split · hjkl move · z zoom · w sidebar · ? help · q quit", Style::new().dim()));
+        spans.push(Span::styled(" then  t tab · v s split · hjkl move · z zoom · m menu · ? help · q quit", Style::new().dim()));
     }
     let right = app.attention().map(|(p, w)| Span::styled(format!("◐ {p} › {w} needs you "), Style::new().fg(Color::Red).bold()));
     let rw = right.as_ref().map(|s| s.width() as u16).unwrap_or(0);
@@ -258,8 +267,9 @@ fn draw_form(f: &mut Frame, form: &Form, area: Rect) {
     f.render_widget(Paragraph::new("tab next · enter ok · esc cancel").dim(), rows[n + 1]);
 }
 
-fn draw_help(f: &mut Frame, area: Rect, prefix: &str) {
-    let text = vec![
+/// The help text. It is taller than a small screen, so it scrolls.
+pub fn help_lines(prefix: &str) -> Vec<Line<'static>> {
+    vec![
         Line::from(format!("Prefix: {prefix}, then").bold()),
         Line::from("  t / T      new tab (T asks for a command first)"),
         Line::from("  v / s      split side by side / stacked (V / S ask for a command)"),
@@ -271,6 +281,7 @@ fn draw_help(f: &mut Frame, area: Rect, prefix: &str) {
         Line::from("  z          zoom the pane to the whole area, again to undo"),
         Line::from("  w          sidebar / back to the workspace"),
         Line::from("  n / N      new workspace in this project / new project"),
+        Line::from("  m          menu: agents board, tasks, pipelines, usage, templates, broadcast"),
         Line::from("  ?          this help        q   quit Hiero (terminals keep running)"),
         Line::from(format!("  {prefix}   send the prefix key itself to the program")),
         Line::from("  esc        cancel"),
@@ -278,21 +289,44 @@ fn draw_help(f: &mut Frame, area: Rect, prefix: &str) {
         Line::from("Sidebar".bold()),
         Line::from("  j k, ↑ ↓   move              enter   open workspace / fold project"),
         Line::from("  a          add workspace     A       add project"),
-        Line::from("  r          rename            D       delete (terminals keep running)"),
+        Line::from("  r          rename            D       delete (asks about its terminals)"),
         Line::from("  J K        move down / up    z       fold project"),
         Line::from("  esc, l, tab  back to the workspace          q   quit"),
         Line::from(""),
         Line::from(Span::styled("status: ● working  ◐ needs you  ✓ done  ○ idle  · no terminal", Style::new().dim())),
-        Line::from(Span::styled("press any key to close", Style::new().dim())),
-    ];
+    ]
+}
+
+fn draw_help(f: &mut Frame, area: Rect, prefix: &str, top: usize) {
+    let text = help_lines(prefix);
     let w = 78.min(area.width.saturating_sub(4));
     let h = (text.len() as u16 + 2).min(area.height.saturating_sub(2));
     let r = Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h);
+    let visible = h.saturating_sub(2) as usize;
+    let scrolls = text.len() > visible;
+    let top = top.min(text.len().saturating_sub(visible));
+    let title = if scrolls { " keys · ↑↓ scroll · any other key closes " } else { " keys · any key closes " };
     f.render_widget(Clear, r);
     f.render_widget(
         Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .block(Block::new().borders(Borders::ALL).border_type(BorderType::Rounded).title(" keys ")),
+            .scroll((top as u16, 0))
+            .block(Block::new().borders(Borders::ALL).border_type(BorderType::Rounded).title(title)),
         r,
     );
+}
+
+/// The menu of the old views.
+fn draw_menu(f: &mut Frame, area: Rect, cursor: usize) {
+    let inner = popup(f, area, 34, MENU.len() as u16 + 4, "menu");
+    let mut lines: Vec<Line> = MENU
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| {
+            let style = if i == cursor { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+            Line::from(Span::styled(format!(" {name:<30}"), style))
+        })
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from("j/k move · enter open · esc").dim());
+    f.render_widget(Paragraph::new(lines), inner);
 }

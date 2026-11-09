@@ -43,11 +43,14 @@ impl Default for Board {
 pub struct WorkspaceCfg {
     /// The key that reaches Hiero's own controls: `ctrl+space` or `ctrl+<letter>`.
     pub prefix: String,
+    /// Start the terminals of every pane that has none (or lost it to a
+    /// reboot) when a workspace opens. Off: they show "not running".
+    pub restore: bool,
 }
 
 impl Default for WorkspaceCfg {
     fn default() -> Self {
-        WorkspaceCfg { prefix: "ctrl+b".into() }
+        WorkspaceCfg { prefix: "ctrl+b".into(), restore: true }
     }
 }
 
@@ -284,6 +287,7 @@ remember = true          # restore grouping, filters and selection on start
 
 [workspace]
 prefix = "ctrl+b"        # reaches Hiero's controls; ctrl+<letter> (not c, h, i, j, m) or ctrl+space
+restore = true           # start missing terminals of a workspace when it opens
 
 [notify]
 bell = true
@@ -375,6 +379,10 @@ mod tests {
         assert!(toml::from_str::<Config>("[workspace]\ntypo = 1").is_err());
         assert_eq!(toml::from_str::<Config>(DEFAULT_TOML).unwrap().prefix(), Prefix::Ctrl('b'));
         assert_eq!(Config::default().prefix(), Prefix::Ctrl('b'));
+        assert!(Config::default().workspace.restore);
+        assert!(toml::from_str::<Config>(DEFAULT_TOML).unwrap().workspace.restore);
+        let c: Config = toml::from_str("[workspace]\nrestore = false").unwrap();
+        assert!(!c.workspace.restore);
     }
 
     #[test]

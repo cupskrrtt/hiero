@@ -252,7 +252,8 @@ impl SpawnForm {
             field: if preselect.is_some() { SpawnField::Task } else { SpawnField::Agent },
             agents,
             agent,
-            worktree: git::probe(&expand_home(&folder)).is_some(),
+            // Opt-in: a worktree is a bigger step than a plain agent.
+            worktree: false,
             folder: TextInput::new(folder),
             task: TextInput::default(),
             name: TextInput::default(),
@@ -533,6 +534,15 @@ mod tests {
         let p = form(AgentKind::Shell).plan().unwrap();
         assert!(p.params.argv.is_empty());
         assert_eq!(p.send_after.as_deref(), Some("fix the bug"));
+    }
+
+    #[test]
+    fn worktree_is_off_by_default() {
+        let agents = vec![AgentChoice { label: "x".into(), detail: String::new(), kind: AgentKind::Shell }];
+        // This folder is a git repo, and the switch is still off.
+        let f = SpawnForm::new(agents, env!("CARGO_MANIFEST_DIR").into(), None);
+        assert!(!f.worktree);
+        assert!(f.plan().unwrap().task.is_none());
     }
 
     #[test]
