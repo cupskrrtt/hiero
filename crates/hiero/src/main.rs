@@ -11,6 +11,7 @@ mod tasks;
 mod tui;
 mod ui;
 mod usage;
+mod workspace;
 mod worktree;
 
 use anyhow::Result;
@@ -74,6 +75,9 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Workspaces: projects, named workspaces, tabs and panes.
+    #[command(subcommand)]
+    Ws(WsCmd),
     /// Hiero's settings file.
     Config {
         #[command(subcommand)]
@@ -82,6 +86,42 @@ enum Command {
     /// Called by agent hooks; reports status to herdr-core.
     #[command(hide = true)]
     Hook { agent: String, event: String, arg: Option<String> },
+}
+
+#[derive(Subcommand)]
+enum WsCmd {
+    /// Print the tree: projects, workspaces, tabs and panes.
+    List,
+    /// Add a project.
+    AddProject {
+        name: String,
+        /// Project folder (default: the current folder).
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+    },
+    /// Add a workspace to a project.
+    Add {
+        project: String,
+        name: String,
+        /// Workspace folder (default: the project's folder).
+        #[arg(long)]
+        folder: Option<std::path::PathBuf>,
+    },
+    /// Rename a project (`<project> <new-name>`) or a workspace (`<project> <workspace> <new-name>`).
+    Rename {
+        #[arg(num_args = 2..=3, required = true)]
+        args: Vec<String>,
+    },
+    /// Remove a project (`<project>`) or a workspace (`<project> <workspace>`).
+    Rm {
+        #[arg(num_args = 1..=2, required = true)]
+        args: Vec<String>,
+    },
+    /// Move a project (`<project> up|down`) or a workspace (`<project> <workspace> up|down`).
+    Move {
+        #[arg(num_args = 2..=3, required = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -143,6 +183,7 @@ async fn main() -> Result<()> {
         None => tui::run(config_error).await,
         Some(Command::Config { action }) => config_cmd(action, config_error),
         Some(Command::Debug(d)) => debug(d).await,
+        Some(Command::Ws(w)) => ws_cmd(w).await,
         Some(Command::Hook { agent, event, arg }) => {
             integrate::run_hook(&agent, &event, arg.as_deref()).await;
             Ok(())
@@ -207,6 +248,90 @@ fn config_cmd(action: Option<ConfigCmd>, error: Option<String>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// An existing folder, as an absolute path.
+fn existing_dir(p: &std::path::Path) -> Result<String> {
+    let abs = p.canonicalize().map_err(|e| anyhow::anyhow!("{}: {e}", p.display()))?;
+    if !abs.is_dir() {
+        anyhow::bail!("{} is not a folder", abs.display());
+    }
+    Ok(abs.to_string_lossy().into_owned())
+}
+
+async fn ws_cmd(cmd: WsCmd) -> Result<()> {
+    use workspace::{Move, WsOp, new_id};
+    let hc = Client::connect().await?;
+    let doc = workspace::load(&hc).await.map_err(anyhow::Error::msg)?;
+    let project = |name: &str| {
+        doc.project_by_name(name).ok_or_else(|| anyhow::anyhow!("no project named \"{name}\""))
+    };
+    let op = match cmd {
+        WsCmd::List => {
+            print!("{}", workspace::render_tree(&doc));
+            return Ok(());
+        }
+        WsCmd::AddProject { name, root } => {
+            let root = match root {
+                Some(r) => r,
+                None => std::env::current_dir()?,
+            };
+            WsOp::AddProject { id: new_id("p"), name, root: existing_dir(&root)? }
+        }
+        WsCmd::Add { project: pname, name, folder } => {
+            let p = project(&pname)?;
+            let folder = match folder {
+                Some(f) => existing_dir(&f)?,
+                None => existing_dir(std::path::Path::new(&p.root))?,
+            };
+            WsOp::AddWorkspace {
+                project: p.id.clone(),
+                id: new_id("w"),
+                name,
+                folder,
+                tab_id: new_id("t"),
+                pane_id: new_id("n"),
+            }
+        }
+        WsCmd::Rename { args } => {
+            let p = project(&args[0])?;
+            match &args[..] {
+                [_, new] => WsOp::RenameProject { id: p.id.clone(), name: new.clone() },
+                [_, w, new] => WsOp::RenameWorkspace { id: find_ws(p, w)?, name: new.clone() },
+                _ => unreachable!("clap allows 2 or 3 arguments"),
+            }
+        }
+        WsCmd::Rm { args } => {
+            let p = project(&args[0])?;
+            match &args[..] {
+                [_] => WsOp::DeleteProject { id: p.id.clone() },
+                [_, w] => WsOp::DeleteWorkspace { id: find_ws(p, w)? },
+                _ => unreachable!("clap allows 1 or 2 arguments"),
+            }
+        }
+        WsCmd::Move { args } => {
+            let p = project(&args[0])?;
+            let dir = match args.last().map(String::as_str) {
+                Some("up") => Move::Up,
+                Some("down") => Move::Down,
+                _ => anyhow::bail!("the last argument must be up or down"),
+            };
+            match &args[..] {
+                [_, _] => WsOp::MoveProject { id: p.id.clone(), dir },
+                [_, w, _] => WsOp::MoveWorkspace { id: find_ws(p, w)?, dir },
+                _ => unreachable!("clap allows 2 or 3 arguments"),
+            }
+        }
+    };
+    workspace::update(&hc, &[op]).await.map_err(anyhow::Error::msg)?;
+    println!("ok");
+    Ok(())
+}
+
+fn find_ws(p: &workspace::Project, name: &str) -> Result<String> {
+    p.workspace_by_name(name)
+        .map(|w| w.id.clone())
+        .ok_or_else(|| anyhow::anyhow!("project \"{}\" has no workspace named \"{name}\"", p.name))
 }
 
 async fn broadcast(text: &str, labels: &[String], force: bool) -> Result<()> {

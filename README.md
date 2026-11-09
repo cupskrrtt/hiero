@@ -31,6 +31,21 @@ herdr-core's document store. Close Hiero, reopen it, and everything is still the
 | 5 | Orchestration: pipelines, broadcast, machines | ✅ done |
 | 6 | Polish: usage, config, packaging | ✅ done |
 
+## Redesign: workspace
+
+Hiero is becoming a terminal workspace. A sidebar lists projects, each with named workspaces you
+create and sort by hand. A workspace has a folder and shows its terminals in tabs and splits
+(nvim, Claude Code, shells). Every pane is an hc terminal, so it keeps running in the background.
+The layout is remembered, and each pane stores its command so a missing terminal can be started again.
+
+| Phase | What | State |
+|---|---|---|
+| W1 | Workspace data model in hc doc `hiero-ws`, plus `hiero ws` CLI | ✅ done |
+| W2 | Sidebar and one live pane | planned |
+| W3 | Tabs and splits | planned |
+| W4 | Restore terminals, and a menu with the old views (board, tasks, pipelines) | planned |
+| W5 | Polish | planned |
+
 ## Development phases
 
 ### Phase 0: Foundation ✅
@@ -251,7 +266,18 @@ cargo run -p hiero -- integrate claude            # install (declines on Claude 
 cargo run -p hiero -- integrate codex             # prints the Codex notify line
 hiero report blocked --kind question --msg "pick a database"   # from inside an hc terminal
 hiero broadcast --label hiero.project=shosha "please rebase on main"
+
+# workspaces (W1: no UI yet; stored in hc doc "hiero-ws")
+hiero ws add-project shosha --root ~/code/shosha   # root defaults to the current folder
+hiero ws add shosha frontend --folder ~/code/shosha/web   # folder defaults to the project root
+hiero ws list                                       # projects > workspaces > tabs > panes
+hiero ws rename shosha frontend web                 # or: rename shosha shosha-app
+hiero ws move shosha web up                         # or: move shosha down
+hiero ws rm shosha web                              # or: rm shosha
 ```
+
+Projects and workspaces are named exactly on the command line. Names must not be empty and must
+be unique among siblings. Folders must exist. Reset with `hiero debug doc null --name hiero-ws`.
 
 | Setting | Meaning |
 |---|---|
@@ -327,6 +353,7 @@ crates/
     ├── keys.rs       key events → terminal bytes
     ├── integrate.rs  status bridge: hooks, report, installers
     ├── tasks.rs      task records in doc "hiero"
+    ├── workspace.rs  projects, workspaces, tabs, split layouts in doc "hiero-ws"
     ├── worktree.rs   git worktrees: create, review, merge, PR, remove
     ├── pipeline.rs   pipeline specs, runs and the stage driver
     ├── config.rs     config.toml, key remaps, remembered UI state
