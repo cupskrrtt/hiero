@@ -47,7 +47,7 @@ pub struct WorkspaceCfg {
 
 impl Default for WorkspaceCfg {
     fn default() -> Self {
-        WorkspaceCfg { prefix: "ctrl+space".into() }
+        WorkspaceCfg { prefix: "ctrl+b".into() }
     }
 }
 
@@ -196,7 +196,7 @@ impl Config {
 
     /// The workspace prefix key (`load` has checked it).
     pub fn prefix(&self) -> Prefix {
-        Prefix::parse(&self.workspace.prefix).unwrap_or(Prefix::Space)
+        Prefix::parse(&self.workspace.prefix).unwrap_or(Prefix::Ctrl('b'))
     }
 
     pub fn agent(&self, name: &str) -> Option<&AgentConfig> {
@@ -283,7 +283,7 @@ preview_history = 200    # lines above the screen in the preview
 remember = true          # restore grouping, filters and selection on start
 
 [workspace]
-prefix = "ctrl+space"    # reaches Hiero's controls; or ctrl+<letter> (not c, h, i, j, m)
+prefix = "ctrl+b"        # reaches Hiero's controls; ctrl+<letter> (not c, h, i, j, m) or ctrl+space
 
 [notify]
 bell = true
@@ -373,7 +373,8 @@ mod tests {
         let c: Config = toml::from_str("[workspace]\nprefix = \"ctrl+a\"").unwrap();
         assert_eq!(c.prefix(), Prefix::Ctrl('a'));
         assert!(toml::from_str::<Config>("[workspace]\ntypo = 1").is_err());
-        assert_eq!(toml::from_str::<Config>(DEFAULT_TOML).unwrap().prefix(), Prefix::Space);
+        assert_eq!(toml::from_str::<Config>(DEFAULT_TOML).unwrap().prefix(), Prefix::Ctrl('b'));
+        assert_eq!(Config::default().prefix(), Prefix::Ctrl('b'));
     }
 
     #[test]

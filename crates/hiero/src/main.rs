@@ -161,6 +161,8 @@ enum Debug {
         #[arg(long)]
         raw: bool,
     },
+    /// Show the key events your terminal sends (to check a prefix key).
+    Keys,
     /// Type raw bytes into a terminal over an attach stream.
     /// Escapes: \r \n \t \e \\ and \xNN.
     Type { terminal: String, text: String },
@@ -506,6 +508,7 @@ async fn debug(cmd: Debug) -> Result<()> {
                 }
             }
         }
+        Debug::Keys => debug_keys()?,
         Debug::Type { terminal, text } => {
             let hc = Client::connect().await?;
             let t = hc.get(&terminal).await?;
@@ -531,6 +534,36 @@ async fn debug(cmd: Debug) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Print each key event as crossterm sees it, and whether it is the prefix.
+fn debug_keys() -> Result<()> {
+    use crossterm::event::{Event, KeyCode, KeyEventKind, read};
+    let prefix = config::get().prefix();
+    println!("Press keys to see what Hiero receives (prefix is {}). Esc twice quits.\r", prefix.label());
+    crossterm::terminal::enable_raw_mode()?;
+    let result = (|| -> Result<()> {
+        let mut last_esc = false;
+        loop {
+            if let Event::Key(k) = read()? {
+                if k.kind == KeyEventKind::Release {
+                    continue;
+                }
+                let tag = if prefix.matches(&k) { "  <- PREFIX" } else { "" };
+                println!("{:?} {:?}{tag}\r", k.code, k.modifiers);
+                if k.code == KeyCode::Esc {
+                    if last_esc {
+                        return Ok(());
+                    }
+                    last_esc = true;
+                } else {
+                    last_esc = false;
+                }
+            }
+        }
+    })();
+    crossterm::terminal::disable_raw_mode()?;
+    result
 }
 
 fn unescape(s: &str) -> Vec<u8> {

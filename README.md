@@ -54,8 +54,9 @@ there as `hiero board`.
   starts a shell in the workspace folder (labels `hiero.ws`, `hiero.pane`, `hiero.project`) and saves
   its address in the doc. Switching workspaces or quitting Hiero leaves programs running.
 - W2 showed only one pane. W3 shows tabs and splits.
-- Hiero's own keys sit behind a prefix key (default `ctrl+space`), so nvim and Claude get every
-  other key. Set it with `[workspace] prefix = "ctrl+b"` (`ctrl+space` or `ctrl+<letter>`).
+- Hiero's own keys sit behind a prefix key (default `ctrl+b`, like tmux), so nvim and Claude get
+  every other key. Change it with `[workspace] prefix = "ctrl+a"` (`ctrl+<letter>` or `ctrl+space`).
+  `hiero debug keys` shows what your terminal sends, if a prefix doesn't seem to work.
 - The sidebar shows a dot per workspace (● working, ◐ needs you, ✓ done) and a dot on a collapsed
   project. The bottom bar names a workspace that needs you. Changes to attention or done ring the
   bell and notify, using the `[notify]` rules.
@@ -83,7 +84,7 @@ there as `hiero board`.
 
 ### Workspace keys
 
-After the prefix (`ctrl+space`), the bar shows `prefix` until the next key:
+After the prefix (`ctrl+b`), the bar shows `prefix` until the next key:
 
 | Key | Action |
 |---|---|
@@ -307,7 +308,7 @@ Then run `hiero` (the workspace screen) or `hiero board` (the agent board). Opti
 grouping = "tree"            # project, tree or flat
 
 [workspace]
-prefix = "ctrl+space"        # or ctrl+<letter>; not c, h, i, j, m
+prefix = "ctrl+b"            # or ctrl+<letter> (not c, h, i, j, m) or ctrl+space
 
 [notify]
 bell = false
