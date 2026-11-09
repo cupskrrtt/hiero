@@ -190,6 +190,7 @@ pub enum FormKind {
     AddWorkspace { project: String },
     Rename { id: String },
     RenameTab { id: String },
+    RenamePane { pane: String },
     /// A new tab, asking what it runs first.
     NewTab { workspace: String },
     /// A split of `pane`, asking what the new pane runs first.
@@ -1043,6 +1044,7 @@ impl WsApp {
             KeyCode::Char('[') => self.go_tab(None, -1),
             KeyCode::Char(']') => self.go_tab(None, 1),
             KeyCode::Char('r') => self.rename_tab_form(),
+            KeyCode::Char('R') => self.rename_pane_form(),
             KeyCode::Char('x') => self.close_pane_confirm(),
             KeyCode::Char('X') => self.close_tab_confirm(),
             KeyCode::Char('z') => self.toggle_zoom(),
@@ -1196,6 +1198,21 @@ impl WsApp {
         let Some((_, t)) = self.active() else { return };
         let id = t.id.clone();
         self.zoom = if self.zoom.as_deref() == Some(id.as_str()) { None } else { Some(id) };
+    }
+
+    fn rename_pane_form(&mut self) {
+        let Some(pane) = self.focused_pane() else {
+            self.flash_error("open a workspace first");
+            return;
+        };
+        let name = self.doc.pane(&pane).and_then(|(_, _, p)| p.name.clone()).unwrap_or_default();
+        self.dialog = Some(Dialog::Form(Form {
+            kind: FormKind::RenamePane { pane },
+            title: "rename pane (empty: show what it runs)".into(),
+            fields: vec![Self::field("name", name)],
+            focus: 0,
+            error: None,
+        }));
     }
 
     fn rename_tab_form(&mut self) {
@@ -1533,6 +1550,10 @@ impl WsApp {
                 (vec![op], None, None)
             }
             FormKind::RenameTab { id } => (vec![WsOp::RenameTab { id: id.clone(), name }], None, None),
+            FormKind::RenamePane { pane } => {
+                let name = (!name.trim().is_empty()).then(|| name.trim().to_string());
+                (vec![WsOp::RenamePane { pane: pane.clone(), name }], None, None)
+            }
             FormKind::NewTab { workspace } => {
                 let ops = self.new_tab_ops(workspace, command(&form.fields[0].input));
                 (ops.ok_or("the workspace is gone")?, None, None)
@@ -2795,6 +2816,33 @@ mod tests {
         let [Action::Kill(t), Action::Update(ops)] = &a.actions[..] else { panic!("{:?}", a.actions) };
         assert_eq!(t, &["t0".to_string(), "t1".to_string()]);
         assert_eq!(ops, &[WsOp::CloseTab { id: tab }]);
+    }
+
+    #[test]
+    fn rename_pane_form() {
+        let mut a = open_w1();
+        let pane = a.focused_pane().unwrap();
+        pk(&mut a, 'R');
+        let Some(Dialog::Form(f)) = &a.dialog else { panic!() };
+        assert_eq!(f.fields[0].input.value(), "", "no name yet");
+        for c in "api server".chars() {
+            a.on_key(key(c));
+        }
+        a.on_key(code(KeyCode::Enter));
+        let ops = commit(&mut a);
+        assert!(matches!(&ops[..], [WsOp::RenamePane { pane: p, name: Some(n) }] if *p == pane && n == "api server"));
+        assert_eq!(a.doc.pane(&pane).unwrap().2.name.as_deref(), Some("api server"));
+
+        // Opening it again shows the name; clearing it sends None.
+        pk(&mut a, 'R');
+        let Some(Dialog::Form(f)) = &a.dialog else { panic!() };
+        assert_eq!(f.fields[0].input.value(), "api server");
+        for _ in 0.."api server".len() {
+            a.on_key(code(KeyCode::Backspace));
+        }
+        a.on_key(code(KeyCode::Enter));
+        let ops = commit(&mut a);
+        assert!(matches!(&ops[..], [WsOp::RenamePane { name: None, .. }]));
     }
 
     #[test]

@@ -179,7 +179,7 @@ fn draw_pane(f: &mut Frame, app: &WsApp, id: &str, r: Rect, is_focused: bool, in
     let ended = view.and_then(|v| v.ended.as_ref());
 
     let mut title = vec![Span::styled(
-        format!(" {} ", pane.command.as_deref().unwrap_or("shell")),
+        format!(" {} ", pane.name.as_deref().or(pane.command.as_deref()).unwrap_or("shell")),
         if is_focused { Style::new().bold() } else { Style::new() },
     )];
     if let Some(v) = view {
@@ -231,7 +231,7 @@ fn draw_bottom(f: &mut Frame, app: &WsApp, area: Rect) {
     if app.armed {
         spans.push(Span::styled(" prefix ", Style::new().bg(Color::Yellow).fg(Color::Black).bold()));
         spans.push(Span::raw(
-            " t/T tab · v/s split (V/S ask) · hjkl move · HJKL size · 1-9 [ ] tab · r rename · x/X close · z zoom · w sidebar · b hide · < > size · m menu · ? help",
+            " t/T tab · v/s split (V/S ask) · hjkl move · HJKL size · 1-9 [ ] tab · r/R rename tab/pane · x/X close · z zoom · w sidebar · b hide · < > size · m menu · ? help",
         ));
     } else if let Some((msg, error)) = app.current_flash() {
         let style = if error { Style::new().fg(Color::Red) } else { Style::new().fg(Color::Green) };
@@ -284,6 +284,7 @@ pub fn help_lines(prefix: &str) -> Vec<Line<'static>> {
         Line::from("  H J K L    narrower / taller / shorter / wider"),
         Line::from("  1 .. 9     go to tab N        [ ]   previous / next tab"),
         Line::from("  r          rename the tab"),
+        Line::from("  R          rename the pane (empty: show what it runs)"),
         Line::from("  x / X      close the pane / the tab (ends its programs)"),
         Line::from("  z          zoom the pane to the whole area, again to undo"),
         Line::from("  w          sidebar / back to the workspace (shows a hidden sidebar)"),

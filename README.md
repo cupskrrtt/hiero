@@ -65,6 +65,7 @@ After the prefix (`ctrl+b`) the bottom bar shows `prefix` until the next key.
 | `1` … `9` | go to tab N |
 | `[` / `]` | previous / next tab |
 | `r` | rename the tab |
+| `R` | rename the pane (empty brings back the automatic title) |
 | `x` / `X` | close the pane / the tab (asks; its programs end) |
 | `z` | zoom the pane to the whole area, again to undo (a view only, not saved) |
 | `w` | switch between sidebar and workspace (shows a hidden sidebar) |

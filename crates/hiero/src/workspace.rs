@@ -28,6 +28,9 @@ pub enum Dir {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pane {
     pub id: String,
+    /// A name the person gave it; `None` shows what it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// What to run; `None` is the machine's shell. Kept so a missing
     /// terminal can be started again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -42,7 +45,7 @@ pub struct Pane {
 
 impl Pane {
     pub fn shell(id: &str) -> Pane {
-        Pane { id: id.into(), command: None, cwd: None, terminal: None }
+        Pane { id: id.into(), name: None, command: None, cwd: None, terminal: None }
     }
 }
 
@@ -228,6 +231,8 @@ pub enum WsOp {
     ResizePane { tab: String, pane: String, dir: Dir, delta: i16 },
     /// What the pane runs, for when its terminal has to be started again.
     SetCommand { pane: String, command: Option<String> },
+    /// Name a pane; `None` or blank brings back the automatic title.
+    RenamePane { pane: String, name: Option<String> },
     SetTerminal { pane: String, terminal: Option<String> },
 }
 
@@ -454,6 +459,13 @@ pub fn apply(doc: &mut WsDoc, op: &WsOp) -> Result<(), String> {
                 return Err(format!("pane {pane} is not in tab {tab}"));
             }
             resize(layout, pane, *dir, *delta as i32);
+        }
+        WsOp::RenamePane { pane, name } => {
+            let (pi, wi, ti) = pane_tab_ix(doc, pane)?;
+            let name = name.as_deref().map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
+            if let Some(p) = doc.projects[pi].workspaces[wi].tabs[ti].layout.find_mut(pane) {
+                p.name = name;
+            }
         }
         WsOp::SetCommand { pane, command } => {
             let (pi, wi, ti) = pane_tab_ix(doc, pane)?;
@@ -754,7 +766,8 @@ fn render_layout(l: &Layout, focus: &str, depth: usize, s: &mut String) {
             let cmd = p.command.as_deref().unwrap_or("shell");
             let term = p.terminal.as_deref().unwrap_or("-");
             let f = if p.id == focus { " *" } else { "" };
-            let _ = writeln!(s, "{pad}pane {}  {cmd}  terminal {term}{f}", p.id);
+            let name = p.name.as_deref().map(|n| format!("\"{n}\"  ")).unwrap_or_default();
+            let _ = writeln!(s, "{pad}pane {}  {name}{cmd}  terminal {term}{f}", p.id);
         }
         Layout::Split { dir, children, sizes } => {
             let name = if *dir == Dir::Horizontal { "horizontal" } else { "vertical" };
@@ -1208,6 +1221,28 @@ mod tests {
         assert!(err(&mut d, WsOp::SetFocus { pane: s("zz") }).contains("no pane"));
         assert!(err(&mut d, WsOp::SetTerminal { pane: s("zz"), terminal: None }).contains("no pane"));
         assert!(err(&mut d, WsOp::SetCommand { pane: s("zz"), command: None }).contains("no pane"));
+    }
+
+    #[test]
+    fn rename_pane() {
+        let mut d = WsDoc::default();
+        ok(&mut d, WsOp::AddProject { id: s("p"), name: s("p"), root: s("/r") });
+        ok(&mut d, WsOp::AddWorkspace { project: s("p"), id: s("w"), name: s("w"), folder: s("/r"), tab_id: s("t"), pane_id: s("n") });
+        ok(&mut d, WsOp::RenamePane { pane: s("n"), name: Some(s("  api server ")) });
+        assert_eq!(d.pane("n").unwrap().2.name.as_deref(), Some("api server"));
+        // Blank or None clears it.
+        ok(&mut d, WsOp::RenamePane { pane: s("n"), name: Some(s("  ")) });
+        assert_eq!(d.pane("n").unwrap().2.name, None);
+        ok(&mut d, WsOp::RenamePane { pane: s("n"), name: Some(s("x")) });
+        ok(&mut d, WsOp::RenamePane { pane: s("n"), name: None });
+        assert_eq!(d.pane("n").unwrap().2.name, None);
+        assert!(err(&mut d, WsOp::RenamePane { pane: s("zz"), name: None }).contains("no pane"));
+        // Names round-trip and are left out of the JSON when unset.
+        ok(&mut d, WsOp::RenamePane { pane: s("n"), name: Some(s("api")) });
+        let v = serde_json::to_value(&d).unwrap();
+        assert!(v.to_string().contains("\"name\":\"api\""));
+        let back: WsDoc = serde_json::from_value(v).unwrap();
+        assert_eq!(back.pane("n").unwrap().2.name.as_deref(), Some("api"));
     }
 
     #[test]
