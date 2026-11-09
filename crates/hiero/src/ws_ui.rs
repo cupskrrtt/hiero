@@ -1,7 +1,7 @@
 //! Drawing the workspace screen: sidebar, pane area, bottom bar, dialogs.
 
 use crate::ui::{draw_input, draw_vt, popup};
-use crate::workspace::WsStatus;
+use crate::workspace::{Workspace, WsStatus};
 use crate::ws_app::{Dialog, Focus, Form, MENU, Row, WsApp};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -33,6 +33,37 @@ pub fn areas(area: Rect, banner: bool, sidebar: u16) -> Areas {
     let [sidebar, work] = Layout::horizontal([Constraint::Length(sb), Constraint::Min(1)]).areas(body);
     let [tabs, panes] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(work);
     Areas { banner: banner_row, sidebar, tabs, panes, bottom }
+}
+
+/// The rows of the sidebar list (inside its border).
+pub fn sidebar_inner(area: Rect) -> Rect {
+    Block::new().borders(Borders::ALL).inner(area)
+}
+
+/// The first row shown: the list scrolls just enough to keep the cursor in view.
+pub fn sidebar_top(cursor: usize, height: usize) -> usize {
+    (cursor + 1).saturating_sub(height)
+}
+
+/// The label of each tab in the tabs bar.
+fn tab_label(i: usize, name: &str) -> String {
+    format!(" {} {} ", i + 1, name)
+}
+
+/// Where each tab sits in the tabs bar: (first column, width), relative to
+/// the bar's left edge. One blank cell leads the bar and one follows each tab.
+pub fn tab_cells(w: &Workspace) -> Vec<(u16, u16)> {
+    let mut x = 1u16;
+    w.tabs
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let width = Span::raw(tab_label(i, &t.name)).width() as u16;
+            let cell = (x, width);
+            x = x.saturating_add(width + 1);
+            cell
+        })
+        .collect()
 }
 
 fn dot(s: WsStatus) -> Span<'static> {
@@ -86,7 +117,7 @@ fn draw_sidebar(f: &mut Frame, app: &WsApp, area: Rect) {
         .border_type(if focused { BorderType::Thick } else { BorderType::Plain })
         .border_style(border(focused))
         .title(Span::styled(" projects ", Style::new().bold()));
-    let inner = block.inner(area);
+    let inner = sidebar_inner(area);
     f.render_widget(block, area);
 
     let rows = app.rows();
@@ -96,7 +127,7 @@ fn draw_sidebar(f: &mut Frame, app: &WsApp, area: Rect) {
     }
     let cursor = rows.iter().position(|r| r.id() == app.sel).unwrap_or(0);
     let h = inner.height as usize;
-    let top = (cursor + 1).saturating_sub(h);
+    let top = sidebar_top(cursor, h);
     for (i, row) in rows.iter().enumerate().skip(top).take(h) {
         let line = match row {
             Row::Project(id) => {
@@ -136,7 +167,7 @@ fn draw_tabs(f: &mut Frame, app: &WsApp, area: Rect) {
     };
     let mut spans = vec![Span::raw(" ")];
     for (i, t) in w.tabs.iter().enumerate() {
-        let label = format!(" {} {} ", i + 1, t.name);
+        let label = tab_label(i, &t.name);
         let style = if t.id == active.id {
             Style::new().bg(Color::Green).fg(Color::Black).bold()
         } else {

@@ -5,7 +5,9 @@ use crate::workspace::{self, WsDoc, WsOp};
 use crate::ws_app::{Action, Out, Plan, WsApp};
 use crate::{config, keys, notify, tui, ws_ui};
 use anyhow::Result;
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, EventStream, KeyEventKind};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event as TermEvent, EventStream, KeyEventKind,
+};
 use crossterm::execute;
 use futures::StreamExt;
 use hc_client::{AttachParams, AttachStream, Client, ErrorKind, Filter, StreamMsg, WatchMsg, Watcher, endpoint};
@@ -82,8 +84,11 @@ pub async fn run(config_error: Option<String>) -> Result<()> {
     let mut watch = Watcher::spawn(path.clone(), Filter::default());
     let mut term = ratatui::init();
     execute!(std::io::stdout(), EnableBracketedPaste)?;
+    if config::get().workspace.mouse {
+        execute!(std::io::stdout(), EnableMouseCapture)?;
+    }
     let result = event_loop(&mut term, &mut watch, path, config_error).await;
-    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
     result
 }
@@ -192,10 +197,13 @@ async fn event_loop(
                     app.suspend();
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     drop(keys);
-                    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+                    let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
                     ratatui::restore();
                     let r = tui::run_board(start, None).await;
                     tui::resume(term)?;
+                    if config::get().workspace.mouse {
+                        execute!(std::io::stdout(), EnableMouseCapture)?;
+                    }
                     keys = EventStream::new();
                     // Events from before were not read; a new snapshot is a clean baseline.
                     *watch = Watcher::spawn(path.clone(), Filter::default());
@@ -249,6 +257,13 @@ async fn event_loop(
                             text
                         };
                         send_input(&handles, &app, bytes.into_bytes());
+                    }
+                }
+                Some(Ok(TermEvent::Mouse(m))) => {
+                    if let Some((pane, bytes)) = app.on_mouse(m)
+                        && let Some(h) = handles.get(&pane)
+                    {
+                        let _ = h.cmd.send(PaneCmd::Input(bytes));
                     }
                 }
                 // The next pass round the loop recomputes every pane's size.

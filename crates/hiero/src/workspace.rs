@@ -229,6 +229,10 @@ pub enum WsOp {
     /// lays out along `dir`. The neighbour gives or takes the difference; weights
     /// never drop below 1, and at the limit nothing changes.
     ResizePane { tab: String, pane: String, dir: Dir, delta: i16 },
+    /// Set the weights of the split at `path` (child indices from the tab's
+    /// root) in one go: a border dragged with the mouse. One non-zero weight
+    /// per child (the drag keeps each at 5% or more, see `drag_sizes`).
+    SetSizes { tab: String, path: Vec<usize>, sizes: Vec<u16> },
     /// What the pane runs, for when its terminal has to be started again.
     SetCommand { pane: String, command: Option<String> },
     /// Name a pane; `None` or blank brings back the automatic title.
@@ -460,6 +464,24 @@ pub fn apply(doc: &mut WsDoc, op: &WsOp) -> Result<(), String> {
             }
             resize(layout, pane, *dir, *delta as i32);
         }
+        WsOp::SetSizes { tab, path, sizes: new } => {
+            let (pi, wi, ti) = tab_ix(doc, tab)?;
+            let mut l = &mut doc.projects[pi].workspaces[wi].tabs[ti].layout;
+            for &i in path {
+                l = match l {
+                    Layout::Split { children, .. } if i < children.len() => &mut children[i],
+                    _ => return Err(format!("no split at {path:?} in tab {tab}")),
+                };
+            }
+            let Layout::Split { children, sizes, .. } = l else { return Err(format!("no split at {path:?} in tab {tab}")) };
+            if new.len() != children.len() {
+                return Err(format!("the split has {} children, not {}", children.len(), new.len()));
+            }
+            if new.contains(&0) {
+                return Err("a pane can't have no share of the split".into());
+            }
+            *sizes = new.clone();
+        }
         WsOp::RenamePane { pane, name } => {
             let (pi, wi, ti) = pane_tab_ix(doc, pane)?;
             let name = name.as_deref().map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
@@ -528,6 +550,9 @@ fn split(l: &mut Layout, id: &str, dir: Dir, new: Pane) -> Option<Pane> {
         }
     }
 }
+
+/// No child of a split gets less than this many percent of it.
+const MIN_SHARE: u32 = 5;
 
 /// Resize in the deepest split of `dir` above the pane. `None`: the pane is
 /// not in `l`; `Some(true)`: a split took care of it (even if it was at its limit).
@@ -643,6 +668,89 @@ pub fn rects(layout: &Layout, area: Rect) -> Vec<(String, Rect)> {
     let mut out = Vec::new();
     place(layout, area, &mut out);
     out
+}
+
+/// The line between two neighbours of a split, for dragging it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Border {
+    /// Child indices from the root to the split.
+    pub path: Vec<usize>,
+    /// Between child `index` and `index + 1`.
+    pub index: usize,
+    pub dir: Dir,
+    /// Where the split is drawn.
+    pub area: Rect,
+    /// Where child `index + 1` starts: column (side by side) or row (stacked).
+    /// The border is the cell before it and this one.
+    pub at: u16,
+}
+
+impl Border {
+    /// Whether the cell is on the border: the last cell of the first pane or
+    /// the first of the next, along the split's whole length.
+    pub fn contains(&self, x: u16, y: u16) -> bool {
+        let a = self.area;
+        if x < a.x || y < a.y || x >= a.x + a.width || y >= a.y + a.height {
+            return false;
+        }
+        let v = if self.dir == Dir::Horizontal { x } else { y };
+        v + 1 == self.at || v == self.at
+    }
+}
+
+/// Every border of the layout inside `area`, outer splits first.
+pub fn borders(layout: &Layout, area: Rect) -> Vec<Border> {
+    let mut out = Vec::new();
+    place_borders(layout, area, &mut Vec::new(), &mut out);
+    out
+}
+
+fn place_borders(l: &Layout, area: Rect, path: &mut Vec<usize>, out: &mut Vec<Border>) {
+    let Layout::Split { dir, children, sizes } = l else { return };
+    let horizontal = *dir == Dir::Horizontal;
+    let total = if horizontal { area.width } else { area.height };
+    let mut at = if horizontal { area.x } else { area.y };
+    let lens = share(total, sizes, children.len());
+    for (i, (c, len)) in children.iter().zip(&lens).enumerate() {
+        let r = if horizontal { Rect::new(at, area.y, *len, area.height) } else { Rect::new(area.x, at, area.width, *len) };
+        at += len;
+        if i + 1 < children.len() {
+            out.push(Border { path: path.clone(), index: i, dir: *dir, area, at });
+        }
+        path.push(i);
+        place_borders(c, r, path, out);
+        path.pop();
+    }
+}
+
+/// The weights of the split at `b` once its border is dragged to `pointer`
+/// (a column or row): the two neighbours share their cells anew, the others
+/// keep theirs. Each of the two keeps at least 5% of the split. Weights are
+/// the cell counts, so what is drawn is what is saved.
+pub fn drag_sizes(layout: &Layout, b: &Border, pointer: u16) -> Option<Vec<u16>> {
+    let mut l = layout;
+    for &i in &b.path {
+        let Layout::Split { children, .. } = l else { return None };
+        l = children.get(i)?;
+    }
+    let Layout::Split { children, sizes, .. } = l else { return None };
+    let horizontal = b.dir == Dir::Horizontal;
+    let (start, total) = if horizontal { (b.area.x, b.area.width) } else { (b.area.y, b.area.height) };
+    let mut lens = share(total, sizes, children.len());
+    if b.index + 1 >= lens.len() {
+        return None;
+    }
+    let first: u16 = lens[..b.index].iter().sum();
+    let pair = lens[b.index] + lens[b.index + 1];
+    // The border sits at the start of the next child; at least 5% each side.
+    let floor = ((total as u32 * MIN_SHARE).div_ceil(100) as u16).max(1);
+    if pair < floor * 2 {
+        return None;
+    }
+    let new = pointer.saturating_sub(start + first).clamp(floor, pair - floor);
+    lens[b.index] = new;
+    lens[b.index + 1] = pair - new;
+    Some(lens)
 }
 
 fn place(l: &Layout, area: Rect, out: &mut Vec<(String, Rect)>) {
@@ -1337,6 +1445,69 @@ mod tests {
         let r = rects(&l, area(11, 3));
         assert_eq!(r[0].1.width + r[1].1.width, 11);
         assert_eq!(r[0].1.width, 5);
+    }
+
+    #[test]
+    fn borders_sit_between_neighbours_and_nest() {
+        let inner = Layout::Split { dir: Dir::Vertical, children: vec![pane("b"), pane("c")], sizes: vec![1, 2] };
+        let l = Layout::Split { dir: Dir::Horizontal, children: vec![pane("a"), inner, pane("d")], sizes: vec![1, 1, 1] };
+        let a = Rect::new(0, 0, 90, 30);
+        let bs = borders(&l, a);
+        assert_eq!(bs.len(), 3);
+        assert_eq!((bs[0].path.clone(), bs[0].index, bs[0].at, bs[0].dir), (vec![], 0, 30, Dir::Horizontal));
+        assert_eq!((bs[1].path.clone(), bs[1].index, bs[1].at), (vec![], 1, 60));
+        assert_eq!((bs[2].path.clone(), bs[2].index, bs[2].at, bs[2].dir), (vec![1], 0, 10, Dir::Vertical));
+        // Two cells, along the whole length of the split only.
+        assert!(bs[0].contains(29, 0) && bs[0].contains(30, 29));
+        assert!(!bs[0].contains(28, 5) && !bs[0].contains(31, 5) && !bs[0].contains(30, 30));
+        assert!(bs[2].contains(45, 9) && bs[2].contains(45, 10));
+        assert!(!bs[2].contains(29, 10), "outside the inner split");
+        assert!(borders(&pane("a"), a).is_empty());
+    }
+
+    #[test]
+    fn drag_sizes_follow_the_pointer_and_keep_five_percent() {
+        let l = Layout::Split { dir: Dir::Horizontal, children: vec![pane("a"), pane("b"), pane("c")], sizes: vec![1, 1, 1] };
+        let a = Rect::new(10, 0, 90, 30);
+        let b = borders(&l, a)[0].clone(); // between a and b: at = 40
+        assert_eq!(drag_sizes(&l, &b, 50), Some(vec![40, 20, 30]), "c keeps its cells");
+        assert_eq!(drag_sizes(&l, &b, 40), Some(vec![30, 30, 30]));
+        // Never closer than 5% (5 cells of 90, rounded up) to the neighbours' far edges.
+        assert_eq!(drag_sizes(&l, &b, 0), Some(vec![5, 55, 30]));
+        assert_eq!(drag_sizes(&l, &b, 500), Some(vec![55, 5, 30]));
+        let b2 = borders(&l, a)[1].clone();
+        assert_eq!(drag_sizes(&l, &b2, 500), Some(vec![30, 55, 5]));
+        // Vertical splits use rows.
+        let v = Layout::Split { dir: Dir::Vertical, children: vec![pane("a"), pane("b")], sizes: vec![] };
+        let vb = borders(&v, Rect::new(0, 2, 40, 20))[0].clone();
+        assert_eq!(drag_sizes(&v, &vb, 7), Some(vec![5, 15]));
+        // A split that is not there (the layout changed under the drag).
+        assert_eq!(drag_sizes(&pane("a"), &b, 50), None);
+    }
+
+    #[test]
+    fn set_sizes_sets_one_split() {
+        let mut d = base();
+        ok(&mut d, split_op("w1-p", Dir::Horizontal, "b"));
+        ok(&mut d, split_op("b", Dir::Vertical, "c"));
+        let tab = s("w1-t");
+        let op = |path: Vec<usize>, sizes: Vec<u16>| WsOp::SetSizes { tab: tab.clone(), path, sizes };
+        ok(&mut d, op(vec![], vec![30, 70]));
+        ok(&mut d, op(vec![1], vec![1, 3]));
+        let Layout::Split { sizes, children, .. } = &d.tab("w1-t").unwrap().1.layout else { panic!() };
+        assert_eq!(sizes, &vec![30, 70]);
+        let Layout::Split { sizes: inner, .. } = &children[1] else { panic!() };
+        assert_eq!(inner, &vec![1, 3]);
+        assert_eq!(widths(&d, "w1-t")[0], ("w1-p".to_string(), 30, 40));
+        // Refused: wrong count, zero weight, not a split, no such path or tab.
+        assert!(err(&mut d, op(vec![], vec![1, 2, 3])).contains("2 children"));
+        assert!(err(&mut d, op(vec![], vec![0, 5])).contains("no share"));
+        assert!(err(&mut d, op(vec![0], vec![1])).contains("no split"));
+        assert!(err(&mut d, op(vec![7], vec![1])).contains("no split"));
+        assert!(err(&mut d, WsOp::SetSizes { tab: s("nope"), path: vec![], sizes: vec![1, 1] }).contains("no tab"));
+        // Nothing changed by the refusals.
+        let Layout::Split { sizes, .. } = &d.tab("w1-t").unwrap().1.layout else { panic!() };
+        assert_eq!(sizes, &vec![30, 70]);
     }
 
     #[test]

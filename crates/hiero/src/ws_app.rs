@@ -6,9 +6,10 @@
 use crate::app::{Alert, BoardStart, LABEL_AGENT, PaneView, status_from_labels};
 use crate::config::Prefix;
 use crate::forms::{TextInput, expand_home};
-use crate::workspace::{self, Dir, Move, Tab, Workspace, WsDoc, WsOp, WsStatus, new_id};
+use crate::keys::{self, MouseAct};
+use crate::workspace::{self, Border, Dir, Move, Tab, Workspace, WsDoc, WsOp, WsStatus, new_id};
 use crate::ws_ui;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use hc_client::{EventData, RunParams, Terminal, TerminalSet, WatchMsg};
 use ratatui::layout::Rect;
 use std::collections::{HashMap, HashSet};
@@ -24,6 +25,14 @@ pub const LABEL_PROJECT: &str = "hiero.project";
 
 /// How much one `H` `J` `K` `L` press moves a border, in percent of the split.
 const RESIZE_STEP: i16 = 5;
+
+/// Arrow keys sent for one wheel notch to a full-screen program that doesn't take the mouse.
+const WHEEL_LINES: usize = 3;
+
+/// X10 mode (`?9`) reports presses only, without modifiers.
+fn mods_for(s: &vt100::Screen, mods: KeyModifiers) -> KeyModifiers {
+    if s.mouse_protocol_mode() == vt100::MouseProtocolMode::Press { KeyModifiers::NONE } else { mods }
+}
 
 /// How many columns `<` `>` move the sidebar edge.
 const SIDEBAR_STEP: u16 = 4;
@@ -245,6 +254,31 @@ pub enum Out {
     Bytes(Vec<u8>),
 }
 
+/// What is under a screen cell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Hit {
+    /// A sidebar row (project or workspace id).
+    Sidebar(String),
+    /// A tab of the tabs bar.
+    Tab(usize),
+    /// A pane. `cell` is pane-local (0-based, inside the border); `None` on
+    /// the border or the title.
+    Pane { id: String, cell: Option<(u16, u16)> },
+    /// The line between two panes, for dragging.
+    Border(Border),
+    Nothing,
+}
+
+/// A mouse button held down, and where it started.
+enum Drag {
+    /// Started on a pane whose program takes mouse reports: the drag and the
+    /// release go to it, wherever the pointer is.
+    Pane(String),
+    /// A border being moved. The sizes are applied here as the pointer moves
+    /// and sent to the document on release.
+    Border { tab: String, border: Border, grab: i32, moved: Option<Vec<u16>> },
+}
+
 /// One pane of the active tab: its stream's screen, or why it has none.
 pub struct Slot {
     pub attempt: u64,
@@ -307,6 +341,7 @@ pub struct WsApp {
     /// The request connection works (the watcher's is events-only).
     client_up: bool,
     pub actions: Vec<Action>,
+    drag: Option<Drag>,
     pub disconnected: Option<String>,
     pub connected_once: bool,
     pub quit: bool,
@@ -348,6 +383,7 @@ impl WsApp {
             reconnected: false,
             client_up: false,
             actions: Vec::new(),
+            drag: None,
             disconnected: None,
             connected_once: false,
             quit: false,
@@ -999,6 +1035,229 @@ impl WsApp {
             }
             Some(_) => None,
             None => to_pane.then(|| text.to_string()),
+        }
+    }
+
+    // ---- mouse ----------------------------------------------------------------
+
+    /// What is at screen cell (`x`, `y`), from the same geometry the screen
+    /// is drawn with. Dialogs are not considered (the caller ignores the mouse then).
+    pub fn hit_test(&self, x: u16, y: u16) -> Hit {
+        let a = ws_ui::areas(self.screen, self.disconnected.is_some(), self.sidebar_cols());
+        let inside = |r: Rect| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
+        if inside(a.sidebar) {
+            let list = ws_ui::sidebar_inner(a.sidebar);
+            if !inside(list) {
+                return Hit::Nothing;
+            }
+            let rows = self.rows();
+            let cursor = rows.iter().position(|r| r.id() == self.sel).unwrap_or(0);
+            let i = ws_ui::sidebar_top(cursor, list.height as usize) + (y - list.y) as usize;
+            return rows.get(i).map_or(Hit::Nothing, |r| Hit::Sidebar(r.id().to_string()));
+        }
+        if inside(a.tabs) {
+            let Some((w, _)) = self.active() else { return Hit::Nothing };
+            let at = x - a.tabs.x;
+            let i = ws_ui::tab_cells(w).iter().position(|&(from, width)| at >= from && at < from + width);
+            return i.map_or(Hit::Nothing, Hit::Tab);
+        }
+        if !inside(self.panes_area) {
+            return Hit::Nothing;
+        }
+        if !self.zoomed()
+            && let Some((_, t)) = self.active()
+            && let Some(b) = workspace::borders(&t.layout, self.panes_area).into_iter().rev().find(|b| b.contains(x, y))
+        {
+            return Hit::Border(b);
+        }
+        for (id, r) in self.pane_rects() {
+            if inside(r) {
+                let in_border = x > r.x && x + 1 < r.x + r.width && y > r.y && y + 1 < r.y + r.height;
+                let cell = in_border.then(|| (x - r.x - 1, y - r.y - 1));
+                return Hit::Pane { id, cell };
+            }
+        }
+        Hit::Nothing
+    }
+
+    /// The screen of a pane whose program is running, if it asked for mouse reports.
+    fn mouse_screen(&self, pane: &str) -> Option<&vt100::Screen> {
+        let v = self.slots.get(pane)?.view.as_ref().filter(|v| v.ended.is_none())?;
+        let s = v.parser.screen();
+        (s.mouse_protocol_mode() != vt100::MouseProtocolMode::None).then_some(s)
+    }
+
+    /// A pointer event, or `None`. The answer is what to type into a pane's
+    /// program: (pane id, bytes). Not while a dialog is open: those are
+    /// keyboard only.
+    pub fn on_mouse(&mut self, ev: MouseEvent) -> Option<(String, Vec<u8>)> {
+        let out = self.mouse(ev);
+        self.sync();
+        out
+    }
+
+    fn mouse(&mut self, ev: MouseEvent) -> Option<(String, Vec<u8>)> {
+        if self.dialog.is_some() {
+            self.drag = None;
+            return None;
+        }
+        let (x, y, mods) = (ev.column, ev.row, ev.modifiers);
+        match ev.kind {
+            MouseEventKind::Down(button) => {
+                self.armed = false;
+                self.press(button, mods, x, y)
+            }
+            MouseEventKind::Drag(button) => self.drag_to(button, mods, x, y),
+            MouseEventKind::Up(button) => self.release(button, mods, x, y),
+            MouseEventKind::Moved => {
+                if self.drag.is_some() {
+                    return None;
+                }
+                let Hit::Pane { id, cell: Some((cx, cy)) } = self.hit_test(x, y) else { return None };
+                let s = self.mouse_screen(&id)?;
+                if s.mouse_protocol_mode() != vt100::MouseProtocolMode::AnyMotion {
+                    return None;
+                }
+                let bytes = keys::encode_mouse(MouseAct::Move, mods, cx, cy, s.mouse_protocol_encoding())?;
+                Some((id, bytes))
+            }
+            MouseEventKind::ScrollUp => self.wheel(MouseAct::WheelUp, mods, x, y),
+            MouseEventKind::ScrollDown => self.wheel(MouseAct::WheelDown, mods, x, y),
+            MouseEventKind::ScrollLeft => self.wheel(MouseAct::WheelLeft, mods, x, y),
+            MouseEventKind::ScrollRight => self.wheel(MouseAct::WheelRight, mods, x, y),
+        }
+    }
+
+    fn press(&mut self, button: MouseButton, mods: KeyModifiers, x: u16, y: u16) -> Option<(String, Vec<u8>)> {
+        self.drag = None;
+        let left = button == MouseButton::Left;
+        match self.hit_test(x, y) {
+            Hit::Sidebar(id) if left => {
+                self.sel = id.clone();
+                if self.doc.workspace(&id).is_some() {
+                    self.open_workspace(&id);
+                    self.focus = Focus::Workspace;
+                } else {
+                    self.focus = Focus::Sidebar;
+                    self.toggle_collapse(&id);
+                }
+            }
+            Hit::Tab(i) if left => {
+                self.focus = Focus::Workspace;
+                self.go_tab(Some(i), 0);
+            }
+            Hit::Border(border) if left => {
+                let (_, t) = self.active()?;
+                let v = if border.dir == Dir::Horizontal { x } else { y };
+                let grab = border.at as i32 - v as i32;
+                self.drag = Some(Drag::Border { tab: t.id.clone(), border, grab, moved: None });
+            }
+            Hit::Pane { id, cell } => {
+                self.focus = Focus::Workspace;
+                if self.focused_pane().as_deref() != Some(id.as_str()) {
+                    self.edit(WsOp::SetFocus { pane: id.clone() });
+                }
+                let (cx, cy) = cell?;
+                let s = self.mouse_screen(&id)?;
+                let bytes = keys::encode_mouse(MouseAct::Press(button), mods_for(s, mods), cx, cy, s.mouse_protocol_encoding());
+                self.drag = Some(Drag::Pane(id.clone()));
+                return Some((id, bytes?));
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// Pointer cell inside the pane's inner area, whether or not the pointer is.
+    fn clamp_to(&self, pane: &str, x: u16, y: u16) -> Option<(u16, u16)> {
+        let (_, r) = self.pane_rects().into_iter().find(|(id, _)| id == pane)?;
+        let (w, h) = Self::inner(r);
+        Some((x.saturating_sub(r.x + 1).min(w - 1), y.saturating_sub(r.y + 1).min(h - 1)))
+    }
+
+    fn drag_to(&mut self, button: MouseButton, mods: KeyModifiers, x: u16, y: u16) -> Option<(String, Vec<u8>)> {
+        match self.drag.as_ref()? {
+            Drag::Pane(id) => {
+                let id = id.clone();
+                let (cx, cy) = self.clamp_to(&id, x, y)?;
+                let s = self.mouse_screen(&id)?;
+                if !matches!(s.mouse_protocol_mode(), vt100::MouseProtocolMode::ButtonMotion | vt100::MouseProtocolMode::AnyMotion) {
+                    return None;
+                }
+                let bytes = keys::encode_mouse(MouseAct::Drag(button), mods, cx, cy, s.mouse_protocol_encoding())?;
+                Some((id, bytes))
+            }
+            Drag::Border { tab, border, grab, .. } => {
+                let (tab, border) = (tab.clone(), border.clone());
+                let v = if border.dir == Dir::Horizontal { x } else { y };
+                let pointer = (v as i32 + grab).max(0) as u16;
+                let (_, t) = self.doc.tab(&tab)?;
+                let sizes = workspace::drag_sizes(&t.layout, &border, pointer)?;
+                let op = WsOp::SetSizes { tab, path: border.path.clone(), sizes: sizes.clone() };
+                if workspace::apply(&mut self.doc, &op).is_ok()
+                    && let Some(Drag::Border { moved, .. }) = &mut self.drag
+                {
+                    *moved = Some(sizes);
+                }
+                None
+            }
+        }
+    }
+
+    fn release(&mut self, button: MouseButton, mods: KeyModifiers, x: u16, y: u16) -> Option<(String, Vec<u8>)> {
+        match self.drag.take()? {
+            Drag::Pane(id) => {
+                let (cx, cy) = self.clamp_to(&id, x, y)?;
+                let s = self.mouse_screen(&id)?;
+                if s.mouse_protocol_mode() == vt100::MouseProtocolMode::Press {
+                    return None;
+                }
+                let bytes = keys::encode_mouse(MouseAct::Release(button), mods, cx, cy, s.mouse_protocol_encoding())?;
+                Some((id, bytes))
+            }
+            Drag::Border { tab, border, moved, .. } => {
+                // One document write for the whole drag.
+                if let Some(sizes) = moved {
+                    self.actions.push(Action::Update(vec![WsOp::SetSizes { tab, path: border.path, sizes }]));
+                }
+                None
+            }
+        }
+    }
+
+    /// The wheel: a program with mouse reporting gets it, a full-screen one
+    /// without gets arrow keys, the sidebar moves its cursor.
+    fn wheel(&mut self, act: MouseAct, mods: KeyModifiers, x: u16, y: u16) -> Option<(String, Vec<u8>)> {
+        let sb = ws_ui::areas(self.screen, self.disconnected.is_some(), self.sidebar_cols()).sidebar;
+        let in_sidebar = x >= sb.x && x < sb.x + sb.width && y >= sb.y && y < sb.y + sb.height;
+        match self.hit_test(x, y) {
+            _ if in_sidebar => {
+                match act {
+                    MouseAct::WheelUp => self.move_sel(-1),
+                    MouseAct::WheelDown => self.move_sel(1),
+                    _ => {}
+                }
+                None
+            }
+            Hit::Pane { id, cell: Some((cx, cy)) } => {
+                if let Some(s) = self.mouse_screen(&id) {
+                    let bytes = keys::encode_mouse(act, mods, cx, cy, s.mouse_protocol_encoding())?;
+                    return Some((id, bytes));
+                }
+                let v = self.slots.get(&id)?.view.as_ref().filter(|v| v.ended.is_none())?;
+                let s = v.parser.screen();
+                if !s.alternate_screen() {
+                    return None;
+                }
+                let code = match act {
+                    MouseAct::WheelUp => KeyCode::Up,
+                    MouseAct::WheelDown => KeyCode::Down,
+                    _ => return None,
+                };
+                let arrow = keys::encode(KeyEvent::new(code, KeyModifiers::NONE), s.application_cursor())?;
+                Some((id, arrow.repeat(WHEEL_LINES)))
+            }
+            _ => None,
         }
     }
 
@@ -3123,5 +3382,420 @@ mod tests {
         add_project(&mut doc, "p1", "x");
         b.on_doc(doc);
         assert_eq!(b.focus, Focus::Workspace);
+    }
+
+    // ---- mouse ------------------------------------------------------------------
+
+    use crossterm::event::MouseEventKind as K;
+
+    fn ev(kind: K, x: u16, y: u16, mods: KeyModifiers) -> MouseEvent {
+        MouseEvent { kind, column: x, row: y, modifiers: mods }
+    }
+
+    fn mouse(a: &mut WsApp, kind: K, x: u16, y: u16) -> Option<(String, Vec<u8>)> {
+        a.on_mouse(ev(kind, x, y, KeyModifiers::NONE))
+    }
+
+    fn click(a: &mut WsApp, x: u16, y: u16) -> Option<(String, Vec<u8>)> {
+        let down = mouse(a, K::Down(MouseButton::Left), x, y);
+        mouse(a, K::Up(MouseButton::Left), x, y);
+        down
+    }
+
+    /// Output from a pane's program (as if it came over the stream).
+    fn feed(a: &mut WsApp, pane: &str, bytes: &str) {
+        a.on_stream(pane, hc_client::StreamMsg::Data(bytes.as_bytes().to_vec()));
+    }
+
+    /// `n-w1` (left) | `b` (right), both attached. Screen 100x30: sidebar 0..26,
+    /// panes from x=26, y=1; the border is columns 62 and 63.
+    fn side_by_side() -> WsApp {
+        let mut a = open_w1();
+        pk(&mut a, 'v');
+        commit(&mut a);
+        attach_pending(&mut a);
+        a.actions.clear();
+        a
+    }
+
+    #[test]
+    fn hit_test_finds_sidebar_rows_tabs_panes_and_borders() {
+        let mut a = side_by_side();
+        assert_eq!(a.panes_area, rect(26, 1, 74, 28));
+        // Sidebar: border at row 0, then shosha, frontend, backend, solo, main.
+        assert_eq!(a.hit_test(5, 1), Hit::Sidebar("p1".into()));
+        assert_eq!(a.hit_test(5, 2), Hit::Sidebar("w1".into()));
+        assert_eq!(a.hit_test(5, 5), Hit::Sidebar("w3".into()));
+        assert_eq!(a.hit_test(5, 6), Hit::Nothing, "below the last row");
+        assert_eq!(a.hit_test(0, 2), Hit::Nothing, "the sidebar's own border");
+        // Tabs: one blank, then " 1 shell " (name of the tab), then a blank.
+        let name = a.active().unwrap().1.name.clone();
+        let width = format!(" 1 {name} ").chars().count() as u16;
+        assert_eq!(a.hit_test(26, 0), Hit::Nothing);
+        assert_eq!(a.hit_test(27, 0), Hit::Tab(0));
+        assert_eq!(a.hit_test(26 + width, 0), Hit::Tab(0));
+        assert_eq!(a.hit_test(26 + width + 1, 0), Hit::Nothing);
+        // Panes: pane-local cell inside the border, none on it.
+        assert_eq!(a.hit_test(30, 5), Hit::Pane { id: "n-w1".into(), cell: Some((3, 3)) });
+        assert_eq!(a.hit_test(27, 2), Hit::Pane { id: "n-w1".into(), cell: Some((0, 0)) });
+        assert_eq!(a.hit_test(26, 5), Hit::Pane { id: "n-w1".into(), cell: None });
+        assert_eq!(a.hit_test(30, 1), Hit::Pane { id: "n-w1".into(), cell: None }, "the title row");
+        let right = focused(&a);
+        assert_eq!(a.hit_test(70, 5), Hit::Pane { id: right.clone(), cell: Some((6, 3)) });
+        assert_eq!(a.hit_test(99, 5), Hit::Pane { id: right, cell: None });
+        // The border is the last cell of the left pane and the first of the right.
+        for x in [62, 63] {
+            let Hit::Border(b) = a.hit_test(x, 10) else { panic!("{x}") };
+            assert_eq!((b.index, b.dir, b.at, b.path.clone()), (0, Dir::Horizontal, 63, vec![]));
+        }
+        assert!(matches!(a.hit_test(61, 10), Hit::Pane { .. }) && matches!(a.hit_test(64, 10), Hit::Pane { .. }));
+        // Outside the screen and the banner row.
+        assert_eq!(a.hit_test(200, 5), Hit::Nothing);
+        a.disconnected = Some("gone".into());
+        a.set_screen(rect(0, 0, 100, 30));
+        assert_eq!(a.hit_test(70, 0), Hit::Nothing, "the banner");
+        assert_eq!(a.hit_test(5, 1), Hit::Nothing);
+        assert_eq!(a.hit_test(5, 2), Hit::Sidebar("p1".into()), "everything moved down one row");
+        assert_eq!(a.hit_test(70, 1), Hit::Nothing);
+        assert_eq!(a.hit_test(27, 3), Hit::Pane { id: "n-w1".into(), cell: Some((0, 0)) });
+        a.disconnected = None;
+        a.set_screen(rect(0, 0, 100, 30));
+
+        // Hidden sidebar: the panes start at the left edge.
+        pk(&mut a, 'b');
+        assert_eq!(a.hit_test(5, 5), Hit::Pane { id: "n-w1".into(), cell: Some((4, 3)) });
+        assert!(matches!(a.hit_test(0, 5), Hit::Pane { cell: None, .. }));
+        assert_eq!(a.hit_test(1, 0), Hit::Tab(0));
+        let Hit::Border(b) = a.hit_test(49, 10) else { panic!() };
+        assert_eq!(b.at, 50);
+        pk(&mut a, 'b');
+
+        // Zoom: only the focused pane, no borders.
+        let f = focused(&a);
+        pk(&mut a, 'z');
+        assert_eq!(a.hit_test(63, 10), Hit::Pane { id: f, cell: Some((36, 8)) });
+        assert_eq!(a.hit_test(26, 10), Hit::Pane { id: focused(&a), cell: None });
+    }
+
+    #[test]
+    fn hit_test_finds_the_borders_of_nested_splits() {
+        let a = three_panes();
+        // n-w1 | (b over c): the vertical border, and the stacked one in the right half.
+        let Hit::Border(v) = a.hit_test(62, 3) else { panic!() };
+        assert_eq!((v.dir, v.path.clone()), (Dir::Horizontal, vec![]));
+        let rects = a.pane_rects();
+        let b = &rects[1].1;
+        let y = b.y + b.height; // first row of c
+        let Hit::Border(h) = a.hit_test(80, y) else { panic!() };
+        assert_eq!((h.dir, h.path.clone(), h.index), (Dir::Vertical, vec![1], 0));
+        let Hit::Border(h2) = a.hit_test(80, y - 1) else { panic!() };
+        assert_eq!(h, h2);
+        // The corner where both meet belongs to the inner split (the nearer one).
+        assert!(matches!(a.hit_test(63, y), Hit::Border(Border { dir: Dir::Vertical, .. })));
+        assert!(matches!(a.hit_test(63, y - 3), Hit::Border(Border { dir: Dir::Horizontal, .. })));
+    }
+
+    #[test]
+    fn clicking_the_sidebar_opens_or_folds_and_moves_the_selection() {
+        let mut a = app();
+        a.set_screen(rect(0, 0, 100, 30));
+        // frontend
+        assert_eq!(click(&mut a, 5, 2), None);
+        assert_eq!(a.open.as_deref(), Some("w1"));
+        assert_eq!((a.sel.as_str(), a.focus), ("w1", Focus::Workspace));
+        // A project folds, and the selection follows even without opening.
+        a.actions.clear();
+        click(&mut a, 5, 1);
+        assert_eq!((a.sel.as_str(), a.focus), ("p1", Focus::Sidebar));
+        assert_eq!(a.open.as_deref(), Some("w1"), "folding doesn't close the open workspace");
+        let ops = only_update(&mut a);
+        assert_eq!(ops, vec![WsOp::SetCollapsed { id: "p1".into(), collapsed: true }]);
+        // The fold takes effect when the document comes back; rows are now
+        // shosha, solo, main.
+        let mut doc = a.doc.clone();
+        apply(&mut doc, &ops[0]).unwrap();
+        a.on_doc(doc);
+        assert_eq!(ids(&a), ["p1", "p2", "w3"]);
+        click(&mut a, 5, 3);
+        assert_eq!((a.open.as_deref(), a.sel.as_str()), (Some("w3"), "w3"));
+        // The wheel moves the cursor.
+        mouse(&mut a, K::ScrollDown, 5, 4);
+        assert_eq!(a.sel, "w3");
+        mouse(&mut a, K::ScrollUp, 5, 4);
+        assert_eq!(a.sel, "p2");
+        mouse(&mut a, K::ScrollUp, 5, 4);
+        assert_eq!(a.sel, "p1");
+        mouse(&mut a, K::ScrollUp, 5, 4);
+        assert_eq!(a.sel, "p1", "stops at the top");
+        // Other buttons do nothing in the sidebar.
+        let before = a.open.clone();
+        mouse(&mut a, K::Down(MouseButton::Right), 5, 5);
+        assert_eq!((a.open, a.sel.as_str()), (before, "p1"));
+    }
+
+    #[test]
+    fn clicking_a_tab_switches_to_it() {
+        let (mut a, _) = two_tabs();
+        a.open_workspace("w1");
+        attach_pending(&mut a);
+        let cells = ws_ui::tab_cells(a.active().unwrap().0);
+        assert_eq!(cells.len(), 2);
+        a.focus = Focus::Sidebar;
+        let x = a.screen.x + a.sidebar_cols() + cells[1].0 + 1;
+        click(&mut a, x, 0);
+        assert_eq!(a.focus, Focus::Workspace);
+        let ops = only_update_after(&mut a);
+        assert_eq!(ops, vec![WsOp::SetActiveTab { workspace: "w1".into(), index: 1 }]);
+        assert_eq!(a.active().unwrap().0.active_tab, 1);
+        // The tab that is already active: nothing to write.
+        click(&mut a, x, 0);
+        assert!(a.actions.iter().all(|x| !matches!(x, Action::Update(_))));
+    }
+
+    #[test]
+    fn clicking_a_pane_focuses_it_and_sends_nothing_without_mouse_reporting() {
+        let mut a = side_by_side();
+        let right = focused(&a);
+        a.focus = Focus::Sidebar;
+        assert_eq!(click(&mut a, 30, 5), None);
+        assert_eq!(a.focus, Focus::Workspace);
+        assert_eq!(focused(&a), "n-w1");
+        assert_eq!(only_update(&mut a), vec![WsOp::SetFocus { pane: "n-w1".into() }]);
+        // Already focused: no op. A click on the border of a pane focuses it too.
+        click(&mut a, 30, 5);
+        assert!(a.actions.is_empty());
+        click(&mut a, 99, 5);
+        assert_eq!(focused(&a), right);
+        assert_eq!(only_update(&mut a), vec![WsOp::SetFocus { pane: right }]);
+    }
+
+    #[test]
+    fn mouse_reports_go_to_programs_that_asked_for_them() {
+        let mut a = side_by_side();
+        let right = focused(&a);
+        // Left pane: SGR reporting. Click at screen (30, 5): pane-local cell (3, 3).
+        feed(&mut a, "n-w1", "\x1b[?1000h\x1b[?1006h");
+        let (pane, bytes) = mouse(&mut a, K::Down(MouseButton::Left), 30, 5).unwrap();
+        assert_eq!((pane.as_str(), bytes), ("n-w1", b"\x1b[<0;4;4M".to_vec()));
+        // The click also moved the focus there.
+        assert_eq!(focused(&a), "n-w1");
+        // The release (PressRelease mode reports it).
+        let (pane, bytes) = mouse(&mut a, K::Up(MouseButton::Left), 30, 5).unwrap();
+        assert_eq!((pane.as_str(), bytes), ("n-w1", b"\x1b[<0;4;4m".to_vec()));
+        // The right pane doesn't report: its click focuses and sends nothing.
+        assert_eq!(click(&mut a, 70, 5), None);
+        assert_eq!(focused(&a), right);
+        // The border and the title are not the program's.
+        assert_eq!(click(&mut a, 30, 1), None);
+        // Modifiers and other buttons.
+        let r = a.on_mouse(ev(K::Down(MouseButton::Right), 27, 2, KeyModifiers::CONTROL | KeyModifiers::SHIFT));
+        assert_eq!(r, Some(("n-w1".into(), b"\x1b[<22;1;1M".to_vec())));
+        a.on_mouse(ev(K::Up(MouseButton::Right), 27, 2, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn mouse_encodings_follow_what_the_program_chose() {
+        let mut a = side_by_side();
+        feed(&mut a, "n-w1", "\x1b[?1000h");
+        let (_, b) = mouse(&mut a, K::Down(MouseButton::Left), 30, 5).unwrap();
+        assert_eq!(b, [0x1b, b'[', b'M', 32, 36, 36], "X10 bytes");
+        let (_, b) = mouse(&mut a, K::Up(MouseButton::Left), 30, 5).unwrap();
+        assert_eq!(b, [0x1b, b'[', b'M', 35, 36, 36], "a release has no button");
+        feed(&mut a, "n-w1", "\x1b[?1005h");
+        let (_, b) = mouse(&mut a, K::Down(MouseButton::Left), 60, 5).unwrap();
+        assert_eq!(b, [&[0x1b, b'[', b'M', 32][..], "\u{42}".as_bytes(), &[36]].concat(), "UTF-8: 1-based column 34 + 32");
+        mouse(&mut a, K::Up(MouseButton::Left), 60, 5);
+        // X10 mode `?9`: presses only, no release.
+        feed(&mut a, "n-w1", "\x1b[?1005l\x1b[?1000l\x1b[?9h");
+        let (_, b) = a.on_mouse(ev(K::Down(MouseButton::Left), 30, 5, KeyModifiers::CONTROL)).unwrap();
+        assert_eq!(b[3], 32, "X10 mode has no modifiers");
+        assert_eq!(mouse(&mut a, K::Up(MouseButton::Left), 30, 5), None);
+        // Off again: nothing goes to the program.
+        feed(&mut a, "n-w1", "\x1b[?9l");
+        assert_eq!(mouse(&mut a, K::Down(MouseButton::Left), 30, 5), None);
+    }
+
+    #[test]
+    fn a_press_is_followed_until_release_wherever_the_pointer_goes() {
+        let mut a = side_by_side();
+        let right = focused(&a);
+        feed(&mut a, "n-w1", "\x1b[?1002h\x1b[?1006h");
+        mouse(&mut a, K::Down(MouseButton::Left), 30, 5).unwrap();
+        // Dragging inside, then far into the other pane and off the screen.
+        let (p, b) = mouse(&mut a, K::Drag(MouseButton::Left), 31, 5).unwrap();
+        assert_eq!((p.as_str(), b), ("n-w1", b"\x1b[<32;5;4M".to_vec()));
+        let (p, b) = mouse(&mut a, K::Drag(MouseButton::Left), 80, 40).unwrap();
+        assert_eq!(p, "n-w1", "the right pane doesn't get it");
+        // Clamped to the last cell of the left pane: its inner size is 35 x 26.
+        let (w, h) = a.slots["n-w1"].size;
+        assert_eq!(b, format!("\x1b[<32;{w};{h}M").into_bytes());
+        let (p, b) = mouse(&mut a, K::Up(MouseButton::Left), 80, 40).unwrap();
+        assert_eq!(p, "n-w1");
+        assert_eq!(b, format!("\x1b[<0;{w};{h}m").into_bytes());
+        // After the release a drag belongs to nobody.
+        assert_eq!(mouse(&mut a, K::Drag(MouseButton::Left), 31, 5), None);
+        assert_eq!(mouse(&mut a, K::Up(MouseButton::Left), 31, 5), None);
+        assert_eq!(focused(&a), "n-w1");
+        let _ = right;
+    }
+
+    #[test]
+    fn motion_is_sent_only_in_the_modes_that_ask_for_it() {
+        let mut a = side_by_side();
+        // PressRelease: no drag events.
+        feed(&mut a, "n-w1", "\x1b[?1000h\x1b[?1006h");
+        mouse(&mut a, K::Down(MouseButton::Left), 30, 5).unwrap();
+        assert_eq!(mouse(&mut a, K::Drag(MouseButton::Left), 31, 5), None);
+        mouse(&mut a, K::Up(MouseButton::Left), 31, 5).unwrap();
+        // ButtonMotion: drags, but not a bare move.
+        feed(&mut a, "n-w1", "\x1b[?1002h");
+        mouse(&mut a, K::Down(MouseButton::Left), 30, 5).unwrap();
+        assert!(mouse(&mut a, K::Drag(MouseButton::Left), 31, 5).is_some());
+        mouse(&mut a, K::Up(MouseButton::Left), 31, 5).unwrap();
+        assert_eq!(mouse(&mut a, K::Moved, 32, 6), None);
+        // AnyMotion: bare moves, in the pane under the pointer only.
+        feed(&mut a, "n-w1", "\x1b[?1003h");
+        let (p, b) = mouse(&mut a, K::Moved, 32, 6).unwrap();
+        assert_eq!((p.as_str(), b), ("n-w1", b"\x1b[<35;6;5M".to_vec()));
+        assert_eq!(mouse(&mut a, K::Moved, 70, 6), None, "the other pane has no reporting");
+        assert_eq!(mouse(&mut a, K::Moved, 26, 6), None, "the border");
+    }
+
+    #[test]
+    fn the_wheel_goes_to_mouse_programs_else_arrows_on_the_alternate_screen() {
+        let mut a = side_by_side();
+        let right = focused(&a);
+        // Nothing: a plain shell has no scrollback to move yet.
+        assert_eq!(mouse(&mut a, K::ScrollUp, 70, 5), None);
+        // A program with reporting gets wheel events, in the pane under the pointer.
+        feed(&mut a, "n-w1", "\x1b[?1000h\x1b[?1006h");
+        let (p, b) = mouse(&mut a, K::ScrollUp, 30, 5).unwrap();
+        assert_eq!((p.as_str(), b), ("n-w1", b"\x1b[<64;4;4M".to_vec()));
+        let (_, b) = mouse(&mut a, K::ScrollDown, 30, 5).unwrap();
+        assert_eq!(b, b"\x1b[<65;4;4M");
+        assert_eq!(focused(&a), right, "the wheel doesn't move the focus");
+        // Alternate screen without reporting: three arrows.
+        feed(&mut a, &right, "\x1b[?1049h");
+        let (p, b) = mouse(&mut a, K::ScrollUp, 70, 5).unwrap();
+        assert_eq!((p, b), (right.clone(), b"\x1b[A\x1b[A\x1b[A".to_vec()));
+        let (_, b) = mouse(&mut a, K::ScrollDown, 70, 5).unwrap();
+        assert_eq!(b, b"\x1b[B\x1b[B\x1b[B");
+        // Application cursor keys.
+        feed(&mut a, &right, "\x1b[?1h");
+        let (_, b) = mouse(&mut a, K::ScrollUp, 70, 5).unwrap();
+        assert_eq!(b, b"\x1bOA\x1bOA\x1bOA");
+        // Sideways does nothing there; the border neither.
+        assert_eq!(mouse(&mut a, K::ScrollLeft, 70, 5), None);
+        assert_eq!(mouse(&mut a, K::ScrollUp, 99, 5), None);
+        // An ended program gets nothing.
+        a.on_stream(&right, hc_client::StreamMsg::Closed(None));
+        assert_eq!(mouse(&mut a, K::ScrollUp, 70, 5), None);
+    }
+
+    #[test]
+    fn dragging_a_border_resizes_locally_and_writes_once_on_release() {
+        let mut a = side_by_side();
+        let right = focused(&a);
+        let widths = |a: &WsApp| a.pane_rects().iter().map(|(_, r)| r.width).collect::<Vec<_>>();
+        assert_eq!(widths(&a), [37, 37]);
+        assert_eq!(mouse(&mut a, K::Down(MouseButton::Left), 63, 5), None);
+        assert_eq!(focused(&a), right, "grabbing a border doesn't focus anything");
+        mouse(&mut a, K::Drag(MouseButton::Left), 56, 5);
+        assert_eq!(widths(&a), [30, 44], "the border follows the pointer at once");
+        // The terminals hear about it, but the document does not, yet.
+        assert!(a.actions.iter().any(|x| matches!(x, Action::Resize { pane, cols, .. } if pane == "n-w1" && *cols == 28)));
+        assert!(a.actions.iter().all(|x| !matches!(x, Action::Update(_))));
+        assert_eq!(a.slots["n-w1"].size.0, 28);
+        mouse(&mut a, K::Drag(MouseButton::Left), 50, 9);
+        mouse(&mut a, K::Drag(MouseButton::Left), 52, 9);
+        assert_eq!(widths(&a), [26, 48]);
+        assert!(a.actions.iter().all(|x| !matches!(x, Action::Update(_))));
+        mouse(&mut a, K::Up(MouseButton::Left), 52, 9);
+        let ops = only_update_after(&mut a);
+        let tab = a.active().unwrap().1.id.clone();
+        assert_eq!(ops, vec![WsOp::SetSizes { tab, path: vec![], sizes: vec![26, 48] }]);
+        // The echo of the document keeps the sizes.
+        commit(&mut a);
+        assert_eq!(widths(&a), [26, 48]);
+        // A plain click on the border changes nothing.
+        mouse(&mut a, K::Down(MouseButton::Left), 51, 5);
+        mouse(&mut a, K::Up(MouseButton::Left), 51, 5);
+        assert!(a.actions.iter().all(|x| !matches!(x, Action::Update(_))));
+        assert_eq!(widths(&a), [26, 48]);
+    }
+
+    /// The updates among the actions, which must be exactly one batch.
+    fn only_update_after(a: &mut WsApp) -> Vec<WsOp> {
+        let updates: Vec<Vec<WsOp>> =
+            std::mem::take(&mut a.actions).into_iter().filter_map(|x| if let Action::Update(o) = x { Some(o) } else { None }).collect();
+        assert_eq!(updates.len(), 1, "{updates:?}");
+        updates.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn a_border_drag_keeps_both_sides_at_five_percent_and_grabs_without_a_jump() {
+        let mut a = side_by_side();
+        let widths = |a: &WsApp| a.pane_rects().iter().map(|(_, r)| r.width).collect::<Vec<_>>();
+        // Grab the left pane's last column (62): no jump when it starts moving.
+        mouse(&mut a, K::Down(MouseButton::Left), 62, 5);
+        mouse(&mut a, K::Drag(MouseButton::Left), 62, 5);
+        assert_eq!(widths(&a), [37, 37]);
+        mouse(&mut a, K::Drag(MouseButton::Left), 0, 5);
+        assert_eq!(widths(&a), [4, 70], "5% of 74 columns, rounded up");
+        mouse(&mut a, K::Drag(MouseButton::Left), 500, 5);
+        assert_eq!(widths(&a), [70, 4]);
+        mouse(&mut a, K::Up(MouseButton::Left), 500, 5);
+        assert_eq!(only_update_after(&mut a).len(), 1);
+    }
+
+    #[test]
+    fn a_nested_border_resizes_only_its_own_split() {
+        let mut a = three_panes();
+        let rects = a.pane_rects();
+        let (b, c) = (rects[1].1, rects[2].1);
+        assert_eq!(b.height + c.height, 28);
+        let y = c.y;
+        mouse(&mut a, K::Down(MouseButton::Left), 80, y);
+        mouse(&mut a, K::Drag(MouseButton::Left), 80, 8);
+        mouse(&mut a, K::Up(MouseButton::Left), 80, 8);
+        let ops = only_update_after(&mut a);
+        let WsOp::SetSizes { path, sizes, .. } = &ops[0] else { panic!("{ops:?}") };
+        assert_eq!(path, &vec![1]);
+        assert_eq!(sizes, &vec![7, 21]);
+        let after = a.pane_rects();
+        assert_eq!(after[0].1, rects[0].1, "the left pane is untouched");
+        assert_eq!((after[1].1.height, after[2].1.height), (7, 21));
+        assert_eq!(after[1].1.width, b.width);
+    }
+
+    #[test]
+    fn dialogs_keep_the_mouse_out_of_the_panes() {
+        let mut a = side_by_side();
+        feed(&mut a, "n-w1", "\x1b[?1003h\x1b[?1006h");
+        a.dialog = Some(Dialog::Help(0));
+        for kind in [K::Down(MouseButton::Left), K::Up(MouseButton::Left), K::Drag(MouseButton::Left), K::Moved, K::ScrollUp] {
+            assert_eq!(mouse(&mut a, kind, 30, 5), None);
+        }
+        assert_eq!(mouse(&mut a, K::Down(MouseButton::Left), 5, 2), None);
+        assert!(matches!(a.dialog, Some(Dialog::Help(_))), "a click outside closes nothing");
+        assert!(a.actions.is_empty());
+        // A drag that was underway is dropped when a dialog appears.
+        a.dialog = None;
+        mouse(&mut a, K::Down(MouseButton::Left), 30, 5).unwrap();
+        a.dialog = Some(Dialog::Menu(0));
+        assert_eq!(mouse(&mut a, K::Up(MouseButton::Left), 30, 5), None);
+        a.dialog = None;
+        assert_eq!(mouse(&mut a, K::Drag(MouseButton::Left), 31, 5), None);
+    }
+
+    #[test]
+    fn the_mouse_without_a_workspace_is_harmless() {
+        let mut a = app();
+        a.set_screen(rect(0, 0, 100, 30));
+        for kind in [K::Down(MouseButton::Left), K::Drag(MouseButton::Left), K::Up(MouseButton::Left), K::Moved, K::ScrollDown] {
+            assert_eq!(mouse(&mut a, kind, 60, 10), None);
+            assert_eq!(mouse(&mut a, kind, 30, 0), None);
+        }
+        assert!(a.actions.is_empty());
     }
 }

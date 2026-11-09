@@ -100,6 +100,24 @@ and Broadcast. A choice opens that view over the workspace. Actions inside the v
 launch a pipeline) keep you in it. `q` or `Esc` from the view returns to the workspace, with every
 pane attached again. Broadcast with no live agents just says so and stays in the workspace.
 
+Mouse (the workspace screen):
+
+| Mouse | Action |
+|---|---|
+| click a workspace in the sidebar | open it |
+| click a project | fold or unfold it |
+| click a tab | go to it |
+| click a pane | focus it |
+| drag the line between two panes | resize the split (saved when you let go) |
+| wheel over the sidebar | move the selection |
+| wheel over a pane | scroll a program that takes the mouse; arrows for a full-screen one (less, man) |
+
+If the program in a pane turned on mouse reporting (nvim with `mouse=a`, htop, tmux), clicks,
+drags and the wheel go to it, with positions relative to the pane. Other panes only get focus.
+Hold **Shift** while dragging to select text with the terminal's own selection (Ghostty, kitty,
+WezTerm, Windows Terminal, xterm and most others). Dialogs and the help ignore the mouse. Turn it
+all off with `mouse = false` under `[workspace]`.
+
 If a prefix key does not seem to work, `hiero debug keys` shows what your terminal sends.
 
 ## Workspaces in depth
@@ -147,7 +165,7 @@ when the sidebar is hidden. Changes to needs-you or done ring the bell and notif
 
 **`[workspace]` config.** `prefix` is `ctrl+<letter>` (not c, h, i, j, m) or `ctrl+space`.
 `restore = false` turns the automatic start off: panes without a terminal then say "not running"
-and `Enter` starts one.
+and `Enter` starts one. `mouse = false` leaves the mouse to your terminal.
 
 ## Agent tools
 
@@ -226,6 +244,7 @@ remember = true              # restore the open workspace, sidebar, grouping and
 [workspace]
 prefix = "ctrl+b"            # ctrl+<letter> (not c, h, i, j, m) or ctrl+space
 restore = true               # start missing terminals when a workspace opens
+mouse = true                 # clicks, wheel, border drags; Shift+drag still selects text
 
 [notify]
 bell = true
@@ -307,7 +326,7 @@ running terminals are not touched.
 |---|---|---|---|
 | 8 | Before its first report an agent shows `·`, including while Claude waits at its "trust this folder?" dialog. | A new agent in a new folder looks idle while it waits for you. | Show "starting / not reported" for young agents. |
 | 9 | Codex (`hiero hook codex`) and pi are untested; neither is installed here. Codex `notify` only reports finished turns. | Partial status for Codex; none for pi unless its hooks call `hiero report`. | Test when installed. |
-| 18 | Panes have no scrollback and no mouse support. | You can't scroll up inside a pane; use the program's own pager or `hc read`. | Keep a scrollback in the pane's parser, then add mouse. |
+| 18 | Panes have no scrollback. The mouse works (clicks, border drags, wheel for programs that take it). | The wheel does nothing over a plain shell, and you can't scroll up inside a pane; use the program's own pager or `hc read`. | Keep a scrollback in the pane's parser, then let the wheel scroll it. |
 | 19 | A restored terminal runs its command again from the start. | Unsaved state and screen history of the old program are gone. | None: herdr-core can't bring a stopped program back. |
 | 20 | The prefix menu's Broadcast only counts live terminals that report a status or were started as an agent, but the board's broadcast prompt sends to every live terminal in its list, shells included. | Broadcast from the menu can type into a plain shell. | Make the board skip terminals that are not agents. |
 | 3 | Opening an agent inside the board (`o`) resizes it to the pane. herdr-core gives the size to the last active viewer. This also applies to any second client attached to a workspace pane. | The program reflows to the smaller size. | Observe-only stream until the first key. |

@@ -46,11 +46,14 @@ pub struct WorkspaceCfg {
     /// Start the terminals of every pane that has none (or lost it to a
     /// reboot) when a workspace opens. Off: they show "not running".
     pub restore: bool,
+    /// Clicks, wheel and border drags in the workspace. Off: the terminal
+    /// keeps the mouse (plain drag selects text).
+    pub mouse: bool,
 }
 
 impl Default for WorkspaceCfg {
     fn default() -> Self {
-        WorkspaceCfg { prefix: "ctrl+b".into(), restore: true }
+        WorkspaceCfg { prefix: "ctrl+b".into(), restore: true, mouse: true }
     }
 }
 
@@ -288,6 +291,7 @@ remember = true          # restore grouping, filters and selection on start
 [workspace]
 prefix = "ctrl+b"        # reaches Hiero's controls; ctrl+<letter> (not c, h, i, j, m) or ctrl+space
 restore = true           # start missing terminals of a workspace when it opens
+mouse = true             # clicks, wheel and border drags; hold Shift to select text instead
 
 [notify]
 bell = true
@@ -386,6 +390,10 @@ mod tests {
         assert!(toml::from_str::<Config>(DEFAULT_TOML).unwrap().workspace.restore);
         let c: Config = toml::from_str("[workspace]\nrestore = false").unwrap();
         assert!(!c.workspace.restore);
+        assert!(Config::default().workspace.mouse);
+        assert!(toml::from_str::<Config>(DEFAULT_TOML).unwrap().workspace.mouse);
+        let c: Config = toml::from_str("[workspace]\nmouse = false").unwrap();
+        assert!(!c.workspace.mouse);
     }
 
     #[test]
