@@ -1,22 +1,85 @@
 //! Board state and behaviour, kept free of drawing and I/O so it can be tested.
 
+use crate::forms::{
+    self, Confirm, FormResult, InputDialog, InputPurpose, SpawnForm, TemplatesView, TextInput,
+};
 use crate::git::GitCache;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use hc_client::{AgentState, EventData, Terminal, TerminalSet, WatchMsg};
+use hc_client::{AgentState, EventData, Labels, RunParams, TemplateInfo, Terminal, TerminalSet, WatchMsg};
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::num::NonZeroU16;
+use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const LABEL_PROJECT: &str = "hiero.project";
 pub const LABEL_AGENT: &str = "hiero.agent";
+pub const LABEL_TASK: &str = "hiero.task";
+/// Display name set from Hiero (hc can't rename a terminal).
+pub const LABEL_NAME: &str = "hiero.name";
 
 const SHELLS: &[&str] = &["bash", "zsh", "sh", "fish", "nu", "dash", "ksh", "tcsh", "pwsh"];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
     Search,
     Help,
+    Spawn(Box<SpawnForm>),
+    Input(InputDialog),
+    Confirm(Confirm),
+    Templates(TemplatesView),
+    /// Typing into an agent inside the board.
+    Pane,
+}
+
+/// Work for the event loop to do (it owns the connections).
+#[derive(Debug, Clone)]
+pub enum Action {
+    Run { params: RunParams, send_after: Option<String> },
+    Send { addr: String, text: String, force: bool },
+    Interrupt(String),
+    Kill(String),
+    Remove(String),
+    Keep(String, bool),
+    Label(String, Labels),
+    AttachFull(String),
+    AttachPane(String),
+    LoadTemplates,
+    EditTemplate(PathBuf),
+    DeleteTemplate(PathBuf),
+}
+
+pub struct Flash {
+    pub msg: String,
+    pub at: Instant,
+    pub error: bool,
+}
+
+/// An agent attached inside the board.
+pub struct PaneView {
+    pub addr: String,
+    pub name: String,
+    pub parser: vt100::Parser,
+    /// Set when the stream ended; the pane stays until you leave it.
+    pub ended: Option<String>,
+}
+
+fn nz(n: u16) -> NonZeroU16 {
+    NonZeroU16::new(n.max(1)).unwrap()
+}
+
+impl PaneView {
+    pub fn new(addr: String, name: String, cols: u16, rows: u16) -> Self {
+        PaneView {
+            addr,
+            name,
+            parser: vt100::Parser::new(nz(rows), nz(cols), 0),
+            ended: None,
+        }
+    }
+
+    pub fn resize(&mut self, cols: u16, rows: u16) {
+        self.parser.set_size(nz(rows), nz(cols));
+    }
 }
 
 /// Why a terminal wants a person.
@@ -101,7 +164,17 @@ pub struct App {
     pub preview: Preview,
     pub entries: Vec<Entry>,
     pub git: GitCache,
-    pub flash: Option<(String, Instant)>,
+    pub flash: Option<Flash>,
+    /// Work queued for the event loop.
+    pub actions: Vec<Action>,
+    pub templates: Vec<TemplateInfo>,
+    /// Select this terminal as soon as it shows up (after a spawn).
+    pub want_select: Option<String>,
+    pub pane: Option<PaneView>,
+    /// Where hiero was started; the default folder for new agents.
+    pub launch_dir: String,
+    /// The terminal Hiero itself runs in, when started inside hc.
+    pub self_addr: Option<String>,
     pub tick: u64,
     pub quit: bool,
 }
@@ -129,6 +202,14 @@ impl App {
             entries: Vec::new(),
             git: GitCache::default(),
             flash: None,
+            actions: Vec::new(),
+            templates: Vec::new(),
+            want_select: None,
+            pane: None,
+            launch_dir: std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            self_addr: std::env::var("HC_TERMINAL_ID").ok().filter(|s| !s.is_empty()),
             tick: 0,
             quit: false,
         }
@@ -203,6 +284,12 @@ impl App {
         }
         let addr = self.selected.clone()?;
         self.preview.dirty = false;
+        if self.self_addr.as_deref() == Some(addr.as_str()) {
+            self.preview.addr = Some(addr);
+            self.preview.text = "(this is Hiero itself)".into();
+            self.preview.error = None;
+            return None;
+        }
         self.preview.loading = true;
         Some(addr)
     }
@@ -214,8 +301,8 @@ impl App {
         {
             self.preview.dirty = true;
         }
-        if let Some((_, at)) = &self.flash
-            && at.elapsed().as_secs() >= 3
+        if let Some(f) = &self.flash
+            && f.at.elapsed().as_secs() >= if f.error { 6 } else { 3 }
         {
             self.flash = None;
         }
@@ -224,60 +311,376 @@ impl App {
     // ---- keys ---------------------------------------------------------------
 
     pub fn on_key(&mut self, key: KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.quit = true;
-            return;
+        let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
+        if ctrl_c {
+            match self.mode {
+                Mode::Normal | Mode::Search | Mode::Help => self.quit = true,
+                Mode::Pane => {} // goes to the agent
+                _ => self.mode = Mode::Normal, // cancel the dialog
+            }
+            if !matches!(self.mode, Mode::Pane) {
+                return;
+            }
         }
-        match self.mode {
-            Mode::Help => self.mode = Mode::Normal,
-            Mode::Search => match key.code {
-                KeyCode::Esc => {
-                    self.query.clear();
-                    self.mode = Mode::Normal;
-                }
-                KeyCode::Enter => self.mode = Mode::Normal,
-                KeyCode::Backspace => {
-                    self.query.pop();
-                }
-                KeyCode::Down => self.move_by(1),
-                KeyCode::Up => self.move_by(-1),
-                KeyCode::Char(c) => self.query.push(c),
-                _ => {}
+        let mode = std::mem::replace(&mut self.mode, Mode::Normal);
+        self.mode = match mode {
+            Mode::Help => Mode::Normal,
+            // Keys go to the agent; the event loop handles them.
+            Mode::Pane => Mode::Pane,
+            Mode::Search => self.key_search(key),
+            Mode::Normal => self.key_normal(key),
+            Mode::Spawn(mut form) => match form.on_key(key) {
+                FormResult::Continue => Mode::Spawn(form),
+                FormResult::Cancel => Mode::Normal,
+                FormResult::Submit => match form.plan() {
+                    Ok(plan) => {
+                        self.actions.push(Action::Run {
+                            params: plan.params,
+                            send_after: plan.send_after,
+                        });
+                        self.flash("starting…");
+                        Mode::Normal
+                    }
+                    Err(e) => {
+                        form.error = Some(e);
+                        Mode::Spawn(form)
+                    }
+                },
             },
-            Mode::Normal => match key.code {
-                KeyCode::Char('q') => self.quit = true,
-                KeyCode::Char('?') => self.mode = Mode::Help,
-                KeyCode::Char('j') | KeyCode::Down => self.move_by(1),
-                KeyCode::Char('k') | KeyCode::Up => self.move_by(-1),
-                KeyCode::Char('g') | KeyCode::Home => self.move_to_edge(false),
-                KeyCode::Char('G') | KeyCode::End => self.move_to_edge(true),
-                KeyCode::Char('n') | KeyCode::Tab => self.next_attention(),
-                KeyCode::Char('/') => self.mode = Mode::Search,
-                KeyCode::Esc => self.query.clear(),
-                KeyCode::Char('p') => {
-                    self.group_by_project = !self.group_by_project;
-                    self.flash(if self.group_by_project { "grouped by project" } else { "one list" });
+            Mode::Input(d) => self.key_input(d, key),
+            Mode::Confirm(c) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.actions.push(c.action);
+                    Mode::Normal
                 }
-                KeyCode::Char('f') => {
-                    self.show_finished = !self.show_finished;
-                    self.flash(if self.show_finished { "showing finished" } else { "hiding finished" });
-                }
-                KeyCode::Char('x') => self.dismiss_selected(),
-                KeyCode::Char('r') => self.preview.dirty = true,
-                KeyCode::Char('J') | KeyCode::PageDown => {
-                    self.preview.scroll = self.preview.scroll.saturating_sub(10)
-                }
-                KeyCode::Char('K') | KeyCode::PageUp => {
-                    self.preview.scroll = self.preview.scroll.saturating_add(10)
-                }
-                _ => {}
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => Mode::Normal,
+                _ => Mode::Confirm(c),
             },
+            Mode::Templates(v) => self.key_templates(v, key),
+        };
+        self.rebuild();
+    }
+
+    /// Pasted text goes into whatever is being typed.
+    pub fn on_paste(&mut self, text: &str) {
+        match &mut self.mode {
+            Mode::Search => self.query.push_str(text.trim()),
+            Mode::Spawn(form) => form.paste(text),
+            Mode::Input(d) => d.input.insert_str(text),
+            _ => {}
         }
         self.rebuild();
     }
 
-    fn flash(&mut self, msg: &str) {
-        self.flash = Some((msg.to_string(), Instant::now()));
+    fn key_search(&mut self, key: KeyEvent) -> Mode {
+        match key.code {
+            KeyCode::Esc => {
+                self.query.clear();
+                Mode::Normal
+            }
+            KeyCode::Enter => Mode::Normal,
+            KeyCode::Backspace => {
+                self.query.pop();
+                Mode::Search
+            }
+            KeyCode::Down => {
+                self.move_by(1);
+                Mode::Search
+            }
+            KeyCode::Up => {
+                self.move_by(-1);
+                Mode::Search
+            }
+            KeyCode::Char(c) => {
+                self.query.push(c);
+                self.rebuild();
+                Mode::Search
+            }
+            _ => Mode::Search,
+        }
+    }
+
+    fn key_normal(&mut self, key: KeyEvent) -> Mode {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('?') => return Mode::Help,
+            KeyCode::Char('u') if ctrl => self.preview.scroll = self.preview.scroll.saturating_add(10),
+            KeyCode::Char('d') if ctrl => self.preview.scroll = self.preview.scroll.saturating_sub(10),
+            KeyCode::PageUp => self.preview.scroll = self.preview.scroll.saturating_add(10),
+            KeyCode::PageDown => self.preview.scroll = self.preview.scroll.saturating_sub(10),
+            KeyCode::Char('j') | KeyCode::Down => self.move_by(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_by(-1),
+            KeyCode::Char('g') | KeyCode::Home => self.move_to_edge(false),
+            KeyCode::Char('G') | KeyCode::End => self.move_to_edge(true),
+            KeyCode::Char('n') | KeyCode::Tab => self.next_attention(),
+            KeyCode::Char('/') => return Mode::Search,
+            KeyCode::Esc => self.query.clear(),
+            KeyCode::Char('p') => {
+                self.group_by_project = !self.group_by_project;
+                self.flash(if self.group_by_project { "grouped by project" } else { "one list" });
+            }
+            KeyCode::Char('f') => {
+                self.show_finished = !self.show_finished;
+                self.flash(if self.show_finished { "showing finished" } else { "hiding finished" });
+            }
+            KeyCode::Char('x') => self.dismiss_selected(),
+            KeyCode::Char('r') => self.preview.dirty = true,
+
+            KeyCode::Char('c') => return self.spawn_form(None),
+            KeyCode::Char('t') => {
+                self.actions.push(Action::LoadTemplates);
+                return Mode::Templates(TemplatesView {
+                    items: self.templates.clone(),
+                    selected: 0,
+                });
+            }
+            KeyCode::Char('s') => {
+                if let Some((addr, name)) = self.target(true) {
+                    return Mode::Input(InputDialog {
+                        title: format!("send to {name}"),
+                        hint: "enter send · ctrl+f force when blocked · esc cancel".into(),
+                        input: TextInput::default(),
+                        purpose: InputPurpose::Send(addr),
+                        force: false,
+                    });
+                }
+            }
+            KeyCode::Char('i') => {
+                if let Some((addr, _)) = self.target(true) {
+                    self.actions.push(Action::Interrupt(addr));
+                }
+            }
+            KeyCode::Char('K') => {
+                if let Some((addr, name)) = self.target(true) {
+                    return Mode::Confirm(Confirm {
+                        message: format!("Kill {name}? Its program ends. (y/n)"),
+                        action: Action::Kill(addr),
+                    });
+                }
+            }
+            KeyCode::Char('d') => {
+                if let Some((addr, _)) = self.target(false) {
+                    if self.set.get(&addr).is_some_and(|t| t.is_live()) {
+                        self.flash_error("still running — K kills it first");
+                    } else {
+                        self.actions.push(Action::Remove(addr));
+                    }
+                }
+            }
+            KeyCode::Char('e') => {
+                if let Some((addr, _)) = self.target(true) {
+                    let keep = self.set.get(&addr).is_some_and(|t| t.keep);
+                    self.actions.push(Action::Keep(addr, !keep));
+                }
+            }
+            KeyCode::Char('R') => {
+                if let Some((addr, name)) = self.target(false) {
+                    return Mode::Input(InputDialog {
+                        title: format!("rename {name}"),
+                        hint: "enter save · empty restores the original · esc cancel".into(),
+                        input: TextInput::new(name),
+                        purpose: InputPurpose::Rename(addr),
+                        force: false,
+                    });
+                }
+            }
+            KeyCode::Char('a') | KeyCode::Enter => {
+                if let Some((addr, _)) = self.target(true) {
+                    self.actions.push(Action::AttachFull(addr));
+                }
+            }
+            KeyCode::Char('o') => {
+                if let Some((addr, _)) = self.target(true) {
+                    self.actions.push(Action::AttachPane(addr));
+                }
+            }
+            _ => {}
+        }
+        Mode::Normal
+    }
+
+    fn key_input(&mut self, mut d: InputDialog, key: KeyEvent) -> Mode {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                if matches!(d.purpose, InputPurpose::NewTemplate) {
+                    return self.templates_view();
+                }
+                Mode::Normal
+            }
+            KeyCode::Char('f') if ctrl && matches!(d.purpose, InputPurpose::Send(_)) => {
+                d.force = !d.force;
+                Mode::Input(d)
+            }
+            KeyCode::Enter => {
+                let text = d.input.value().trim().to_string();
+                match &d.purpose {
+                    InputPurpose::Send(addr) => {
+                        if text.is_empty() {
+                            return Mode::Input(d);
+                        }
+                        self.actions.push(Action::Send {
+                            addr: addr.clone(),
+                            text,
+                            force: d.force,
+                        });
+                        Mode::Normal
+                    }
+                    InputPurpose::Rename(addr) => {
+                        // An empty value removes the label, restoring hc's name.
+                        let labels = Labels::from([(LABEL_NAME.to_string(), text)]);
+                        self.actions.push(Action::Label(addr.clone(), labels));
+                        Mode::Normal
+                    }
+                    InputPurpose::NewTemplate => {
+                        if !forms::valid_template_name(&text) {
+                            self.flash_error("use letters, digits, - and _");
+                            return Mode::Input(d);
+                        }
+                        let path = forms::template_path(&text);
+                        if path.exists() {
+                            self.flash_error("a template with that name exists");
+                            return Mode::Input(d);
+                        }
+                        self.actions.push(Action::EditTemplate(path));
+                        self.templates_view()
+                    }
+                }
+            }
+            _ => {
+                d.input.handle(key);
+                Mode::Input(d)
+            }
+        }
+    }
+
+    fn key_templates(&mut self, mut v: TemplatesView, key: KeyEvent) -> Mode {
+        let n = v.items.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down if n > 0 => v.selected = (v.selected + 1).min(n - 1),
+            KeyCode::Char('k') | KeyCode::Up => v.selected = v.selected.saturating_sub(1),
+            KeyCode::Char('n') => {
+                return Mode::Input(InputDialog {
+                    title: "new template".into(),
+                    hint: "name (letters, digits, - _) · enter opens your editor · esc back".into(),
+                    input: TextInput::default(),
+                    purpose: InputPurpose::NewTemplate,
+                    force: false,
+                });
+            }
+            KeyCode::Char('e') | KeyCode::Enter => {
+                if let Some(t) = v.current() {
+                    self.actions.push(Action::EditTemplate(forms::template_path(&t.name)));
+                }
+            }
+            KeyCode::Char('D') => {
+                if let Some(t) = v.current() {
+                    return Mode::Confirm(Confirm {
+                        message: format!("Delete template {}? (y/n)", t.name),
+                        action: Action::DeleteTemplate(forms::template_path(&t.name)),
+                    });
+                }
+            }
+            KeyCode::Char('r') | KeyCode::Char('c') => {
+                if let Some(name) = v.current().map(|t| t.name.clone()) {
+                    return self.spawn_form(Some(&name));
+                }
+            }
+            _ => {}
+        }
+        Mode::Templates(v)
+    }
+
+    fn templates_view(&self) -> Mode {
+        Mode::Templates(TemplatesView {
+            items: self.templates.clone(),
+            selected: 0,
+        })
+    }
+
+    fn spawn_form(&self, preselect: Option<&str>) -> Mode {
+        let folder = self
+            .selected_info()
+            .map(|i| i.dir.clone())
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| self.launch_dir.clone());
+        let folder = shorten_home(&folder);
+        Mode::Spawn(Box::new(SpawnForm::new(
+            forms::agent_choices(&self.templates),
+            folder,
+            preselect,
+        )))
+    }
+
+    /// The selected terminal as (address, name), if it fits.
+    fn target(&mut self, need_live: bool) -> Option<(String, String)> {
+        let Some(info) = self.selected_info() else {
+            self.flash_error("nothing selected");
+            return None;
+        };
+        let (addr, name, live) = (info.addr.clone(), info.name.clone(), info.live);
+        if need_live && self.self_addr.as_deref() == Some(addr.as_str()) {
+            self.flash_error("that's this board's own terminal");
+            return None;
+        }
+        if need_live && !live {
+            self.flash_error(&format!("{name} has finished"));
+            return None;
+        }
+        Some((addr, name))
+    }
+
+    // ---- results from the event loop ----------------------------------------
+
+    pub fn on_action_done(&mut self, result: Result<String, String>, select: Option<String>) {
+        match result {
+            Ok(msg) if !msg.is_empty() => self.flash(&msg),
+            Ok(_) => {}
+            Err(e) => self.flash_error(&e),
+        }
+        if select.is_some() {
+            self.want_select = select;
+        }
+        self.rebuild();
+    }
+
+    pub fn on_templates(&mut self, templates: Vec<TemplateInfo>) {
+        self.templates = templates;
+        if let Mode::Templates(v) = &mut self.mode {
+            v.items = self.templates.clone();
+            v.selected = v.selected.min(v.items.len().saturating_sub(1));
+        }
+    }
+
+    pub fn enter_pane(&mut self, view: PaneView) {
+        self.pane = Some(view);
+        self.mode = Mode::Pane;
+    }
+
+    pub fn leave_pane(&mut self) {
+        self.pane = None;
+        if matches!(self.mode, Mode::Pane) {
+            self.mode = Mode::Normal;
+        }
+        self.preview.dirty = true;
+    }
+
+    pub fn flash(&mut self, msg: &str) {
+        self.flash = Some(Flash {
+            msg: msg.to_string(),
+            at: Instant::now(),
+            error: false,
+        });
+    }
+
+    pub fn flash_error(&mut self, msg: &str) {
+        self.flash = Some(Flash {
+            msg: msg.to_string(),
+            at: Instant::now(),
+            error: true,
+        });
     }
 
     fn item_addrs(&self) -> Vec<&str> {
@@ -397,6 +800,13 @@ impl App {
 
         // Keep the selection on a visible row.
         let items = self.item_addrs();
+        if let Some(want) = &self.want_select
+            && items.contains(&want.as_str())
+        {
+            let want = self.want_select.take();
+            self.select(want);
+            return;
+        }
         let keep = self.selected.as_deref().is_some_and(|s| items.contains(&s));
         if !keep {
             let first = items.first().map(|s| s.to_string());
@@ -443,7 +853,12 @@ impl App {
         let end = t.finished_ms.unwrap_or(now);
         Info {
             addr: t.address.clone(),
-            name: t.display_name().to_string(),
+            name: t
+                .labels
+                .get(LABEL_NAME)
+                .filter(|n| !n.is_empty())
+                .cloned()
+                .unwrap_or_else(|| t.display_name().to_string()),
             agent: agent_name(t),
             live: t.is_live(),
             state: t.agent_state(),
@@ -557,6 +972,13 @@ fn status_msg(t: &Terminal) -> String {
         (Some(k), true) => format!("[{k}]"),
         (Some(k), false) => format!("[{k}] {}", s.msg),
         (None, _) => s.msg.clone(),
+    }
+}
+
+pub fn shorten_home(p: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() && p.starts_with(&h) => format!("~{}", &p[h.len()..]),
+        _ => p.to_string(),
     }
 }
 

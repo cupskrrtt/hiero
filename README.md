@@ -25,8 +25,8 @@ herdr-core's document store. Close Hiero, reopen it, and everything is still the
 |---|---|---|
 | 0 | Foundation: `hc-client` library | ✅ done |
 | 1 | Agent board (MVP) | ✅ done |
-| 2 | Drive agents: spawn, actions, attach | ⏳ next |
-| 3 | Status bridge for Claude Code, codex, pi | ☐ |
+| 2 | Drive agents: spawn, actions, attach | ✅ done |
+| 3 | Status bridge for Claude Code, codex, pi | ⏳ next |
 | 4 | Tasks and git worktrees | ☐ |
 | 5 | Orchestration: pipelines, broadcast, machines | ☐ |
 | 6 | Polish: usage, config, packaging | ☐ |
@@ -60,14 +60,16 @@ herdr-core's document store. Close Hiero, reopen it, and everything is still the
 
 **Done when:** you can watch 3–5 agents and the ones waiting for you stand out right away.
 
-### Phase 2: Drive agents
+### Phase 2: Drive agents ✅
 **Goal:** never need the `hc` CLI by hand.
 
-- [ ] Spawn dialog: template or agent, folder, task, name. Labels `hiero.project`, `hiero.task`, `hiero.agent`
-- [ ] Quick actions: `s` send, `i` interrupt, `k` kill, `d` remove, `K` toggle keep, `r` rename
-- [ ] Full-screen attach: Hiero hands over the terminal; Ctrl+\ comes back
-- [ ] In-pane attach: a live, typeable terminal inside the TUI (framed attach plus `vt100`, credit-based flow control, resize)
-- [ ] Template manager for `~/.config/herdr-core/templates/*.md`
+- [x] New-agent dialog (`c`): template, agent on PATH or shell; folder, task, name. Labels `hiero.project`, `hiero.task`, `hiero.agent`
+- [x] Quick actions: `s` send (`Ctrl+F` forces while blocked), `i` interrupt, `K` kill (asks first), `d` remove finished, `e` keep on/off, `R` rename (stored as label `hiero.name`; hc has no rename)
+- [x] Full-screen attach (`a` / `Enter`): Hiero hands over the terminal; `Ctrl+\` comes back
+- [x] Attach inside the board (`o`): framed attach plus `vt100`, credit-based flow control, resize, bracketed paste
+- [x] Template manager (`t`): list, new from a skeleton, edit in `$VISUAL`/`$EDITOR`, delete, start
+- [x] `hc-client::AttachStream` for framed mode; `hiero debug type` to script input
+- [x] Won't attach to, kill or preview the terminal Hiero itself runs in
 
 **Done when:** you can start, talk to, take over and clean up agents entirely inside Hiero.
 
@@ -130,6 +132,7 @@ cargo run -p hiero -- debug ls --all        # terminals
 cargo run -p hiero -- debug events          # follow live events
 cargo run -p hiero -- debug read t1 --lines 50
 cargo run -p hiero -- debug doc '{"hello":"world"}'   # write doc "hiero"; omit JSON to read
+cargo run -p hiero -- debug type t1 'ls\r'  # type raw bytes over an attach stream
 ```
 
 | Setting | Meaning |
@@ -138,6 +141,7 @@ cargo run -p hiero -- debug doc '{"hello":"world"}'   # write doc "hiero"; omit 
 | `HC_SESSION` | Use a separate hc session (default `default`) |
 | `HIERO_LOG` | Log level, for example `debug` or `hc_client=trace` |
 | `HIERO_NO_NOTIFY` | Turn off desktop notifications (the bell still rings) |
+| `VISUAL` / `EDITOR` | Editor for templates (default `vi`) |
 
 ### Board keys
 
@@ -150,8 +154,18 @@ cargo run -p hiero -- debug doc '{"hello":"world"}'   # write doc "hiero"; omit 
 | `/` | fuzzy search; `Esc` clears |
 | `p` | group by project on/off |
 | `f` | show finished terminals on/off |
-| `J` `K` / `PgDn` `PgUp` | scroll the preview |
+| `PgUp` `PgDn` / `Ctrl+U` `Ctrl+D` | scroll the preview |
 | `r` | refresh the preview |
+| `c` | new agent |
+| `s` | send a message (`Ctrl+F` in the prompt forces it while the agent is blocked) |
+| `a` / `Enter` | attach full-screen; `Ctrl+\` (or `Ctrl+]`) comes back |
+| `o` | open the agent inside the board; `Ctrl+\` comes back |
+| `i` | interrupt (esc or Ctrl+C, whichever the agent uses) |
+| `K` | kill (asks first) |
+| `d` | remove a finished terminal |
+| `e` | keep on/off (a lost program is replaced by a shell) |
+| `R` | rename |
+| `t` | templates: `r` run · `e` edit · `n` new · `D` delete |
 | `?` | help |
 | `q` / `Ctrl+C` | quit |
 
@@ -176,12 +190,16 @@ crates/
 │   ├── error.rs      typed errors
 │   ├── types.rs      Terminal, Status, RunParams, …
 │   ├── events.rs     subscribe, notifications, Watcher
+│   ├── framed.rs     framed mode: AttachStream
 │   └── state.rs      TerminalSet
 └── hiero/src/
     ├── main.rs       CLI entry
     ├── tui.rs        event loop: keys, core events, screen reads, timers
     ├── app.rs        board state and behaviour (tested, no I/O)
-    ├── ui.rs         drawing
+    ├── ui.rs         drawing (board, dialogs, attached pane)
+    ├── forms.rs      dialog state: text input, new agent, templates
+    ├── attach.rs     full-screen attach
+    ├── keys.rs       key events → terminal bytes
     ├── git.rs        repo root and branch, read from .git
     └── notify.rs     bell and desktop notifications
 integrations/         agent hook scripts (Phase 3)

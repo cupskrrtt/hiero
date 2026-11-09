@@ -1,6 +1,7 @@
 //! Drawing. Reads `App`, never changes it.
 
-use crate::app::{App, Entry, Info, Mode, fmt_dur};
+use crate::app::{App, Entry, Info, Mode, PaneView, fmt_dur, shorten_home};
+use crate::forms::{InputPurpose, SpawnField, SpawnForm, TextInput};
 use hc_client::AgentState;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -10,16 +11,26 @@ use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, 
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-pub fn draw(f: &mut Frame, app: &App) {
-    let area = f.area();
-    let banner = app.disconnected.is_some() as u16;
-    let [top, banner_area, body, bottom] = Layout::vertical([
+/// Top bar, banner, body, bottom bar.
+fn frame_layout(area: Rect, banner: bool) -> [Rect; 4] {
+    Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(banner),
+        Constraint::Length(banner as u16),
         Constraint::Min(3),
         Constraint::Length(1),
     ])
-    .areas(area);
+    .areas(area)
+}
+
+/// The cells an in-board attached agent gets, for a screen of `area`.
+pub fn pane_inner(area: Rect, banner: bool) -> Rect {
+    let [_, _, body, _] = frame_layout(area, banner);
+    Block::new().borders(Borders::ALL).inner(body)
+}
+
+pub fn draw(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let [top, banner_area, body, bottom] = frame_layout(area, app.disconnected.is_some());
 
     draw_top(f, app, top);
     if let Some(err) = &app.disconnected {
@@ -29,6 +40,12 @@ pub fn draw(f: &mut Frame, app: &App) {
             format!(" ✗ can't reach herdr-core: {err} — retrying… ")
         };
         f.render_widget(Paragraph::new(msg).style(Style::new().bg(Color::Red).fg(Color::White)), banner_area);
+    }
+
+    if let (Mode::Pane, Some(pane)) = (&app.mode, &app.pane) {
+        draw_pane(f, pane, body);
+        draw_bottom(f, app, bottom);
+        return;
     }
 
     // Side by side when wide, stacked when narrow.
@@ -43,8 +60,19 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_preview(f, app, preview_area);
     draw_bottom(f, app, bottom);
 
-    if app.mode == Mode::Help {
-        draw_help(f, area);
+    match &app.mode {
+        Mode::Help => draw_help(f, area),
+        Mode::Spawn(form) => draw_spawn(f, form, area),
+        Mode::Input(d) => {
+            let mut hint = d.hint.clone();
+            if matches!(d.purpose, InputPurpose::Send(_)) && d.force {
+                hint = format!("FORCE ON · {hint}");
+            }
+            draw_prompt(f, area, &d.title, &d.input, &hint);
+        }
+        Mode::Confirm(c) => draw_confirm(f, area, &c.message),
+        Mode::Templates(v) => draw_templates(f, area, v),
+        _ => {}
     }
 }
 
@@ -232,56 +260,287 @@ fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_bottom(f: &mut Frame, app: &App, area: Rect) {
-    let line = match app.mode {
+    if let Some(fl) = &app.flash {
+        let style = if fl.error { Style::new().fg(Color::Red).bold() } else { Style::new().fg(Color::Yellow) };
+        f.render_widget(Line::from(Span::styled(format!(" {}", fl.msg), style)), area);
+        return;
+    }
+    let line = match &app.mode {
         Mode::Search => Line::from(vec![
             Span::styled(" / ", Style::new().fg(Color::Black).bg(Color::Yellow)),
             Span::raw(format!(" {}", app.query)),
             Span::styled("█", Style::new().fg(Color::Yellow)),
             Span::styled("   enter keep · esc clear", Style::new().dim()),
         ]),
-        _ => {
-            if let Some((msg, _)) = &app.flash {
-                Line::from(Span::styled(format!(" {msg}"), Style::new().fg(Color::Yellow)))
-            } else {
-                let keys = [
-                    ("j/k", "move"),
-                    ("n", "next waiting"),
-                    ("x", "dismiss"),
-                    ("/", "search"),
-                    ("p", "group"),
-                    ("f", "finished"),
-                    ("J/K", "scroll"),
-                    ("q", "quit"),
-                ];
-                let mut spans = vec![Span::raw(" ")];
-                for (k, v) in keys {
-                    spans.push(Span::styled(k, Style::new().fg(Color::Cyan)));
-                    spans.push(Span::styled(format!(" {v}  "), Style::new().dim()));
-                }
-                Line::from(spans)
-            }
-        }
+        Mode::Pane => hints(&[("ctrl+\\", "back to board"), ("", "every other key goes to the agent")]),
+        _ => hints(&[
+            ("c", "new"),
+            ("s", "send"),
+            ("a", "attach"),
+            ("o", "open here"),
+            ("i", "interrupt"),
+            ("K", "kill"),
+            ("n", "next waiting"),
+            ("x", "dismiss"),
+            ("/", "search"),
+            ("t", "templates"),
+            ("?", "all keys"),
+            ("q", "quit"),
+        ]),
     };
     f.render_widget(line, area);
+}
+
+fn hints(keys: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    for (k, v) in keys {
+        spans.push(Span::styled(k.to_string(), Style::new().fg(Color::Cyan)));
+        spans.push(Span::styled(format!(" {v}  "), Style::new().dim()));
+    }
+    Line::from(spans)
+}
+
+/// A centered box of `w`×`h` cells, cleared.
+fn popup(f: &mut Frame, area: Rect, w: u16, h: u16, title: &str) -> Rect {
+    let w = w.min(area.width.saturating_sub(2));
+    let h = h.min(area.height.saturating_sub(2));
+    let r = Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h);
+    f.render_widget(Clear, r);
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(Span::styled(format!(" {title} "), Style::new().bold()));
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    inner
+}
+
+/// One text field; puts the cursor in it when focused.
+fn draw_input(f: &mut Frame, area: Rect, input: &TextInput, focused: bool) {
+    let style = if focused { Style::new().bg(Color::Rgb(40, 44, 52)) } else { Style::new().dim() };
+    let text = input.value();
+    // Scroll horizontally so the cursor stays visible.
+    let before: String = text.chars().take(input.cursor()).collect();
+    let before_w = Span::raw(before.as_str()).width() as u16;
+    let skip = before_w.saturating_sub(area.width.saturating_sub(1));
+    f.render_widget(Paragraph::new(text).style(style).scroll((0, skip)), area);
+    if focused {
+        f.set_cursor_position((area.x + before_w - skip, area.y));
+    }
+}
+
+fn draw_spawn(f: &mut Frame, form: &SpawnForm, area: Rect) {
+    let inner = popup(f, area, 78, 14, "new agent");
+    let rows = Layout::vertical([
+        Constraint::Length(1), // agent
+        Constraint::Length(1), // agent detail
+        Constraint::Length(1),
+        Constraint::Length(1), // folder
+        Constraint::Length(1),
+        Constraint::Length(1), // task
+        Constraint::Length(1),
+        Constraint::Length(1), // name
+        Constraint::Length(1),
+        Constraint::Length(1), // error
+        Constraint::Min(1),    // hint
+    ])
+    .split(inner);
+    let label = |f: &mut Frame, r: Rect, text: &str, focused: bool| -> Rect {
+        let [l, v] = Layout::horizontal([Constraint::Length(9), Constraint::Min(1)]).areas(r);
+        let style = if focused { Style::new().fg(Color::Cyan).bold() } else { Style::new().dim() };
+        f.render_widget(Span::styled(text.to_string(), style), l);
+        v
+    };
+
+    let focused = form.field == SpawnField::Agent;
+    let v = label(f, rows[0], "agent", focused);
+    let mut spans = Vec::new();
+    for (i, a) in form.agents.iter().enumerate() {
+        let style = if i == form.agent {
+            if focused { Style::new().fg(Color::Black).bg(Color::Cyan).bold() } else { Style::new().bold().underlined() }
+        } else {
+            Style::new().dim()
+        };
+        spans.push(Span::styled(format!(" {} ", a.label), style));
+        spans.push(Span::raw(" "));
+    }
+    f.render_widget(Line::from(spans), v);
+    if let Some(a) = form.selected_agent() {
+        let [_, d] = Layout::horizontal([Constraint::Length(9), Constraint::Min(1)]).areas(rows[1]);
+        let mut detail = a.detail.clone();
+        if focused {
+            detail.push_str("   ← → to choose");
+        }
+        f.render_widget(Span::styled(detail, Style::new().dim().italic()), d);
+    }
+
+    let v = label(f, rows[3], "folder", form.field == SpawnField::Folder);
+    draw_input(f, v, &form.folder, form.field == SpawnField::Folder);
+    let v = label(f, rows[5], "task", form.field == SpawnField::Task);
+    draw_input(f, v, &form.task, form.field == SpawnField::Task);
+    let v = label(f, rows[7], "name", form.field == SpawnField::Name);
+    draw_input(f, v, &form.name, form.field == SpawnField::Name);
+    if form.name.value().is_empty() && form.field != SpawnField::Name {
+        f.render_widget(Span::styled("optional", Style::new().dim().italic()), v);
+    }
+
+    if let Some(e) = &form.error {
+        f.render_widget(Span::styled(format!("✗ {e}"), Style::new().fg(Color::Red)), rows[9]);
+    }
+    f.render_widget(
+        Paragraph::new("tab/↓ next field · enter on name or ctrl+s start · esc cancel").dim(),
+        rows[10],
+    );
+}
+
+fn draw_prompt(f: &mut Frame, area: Rect, title: &str, input: &TextInput, hint: &str) {
+    let inner = popup(f, area, 72, 5, title);
+    let [i, _, h] = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+    draw_input(f, i, input, true);
+    f.render_widget(Paragraph::new(hint.to_string()).dim(), h);
+}
+
+fn draw_confirm(f: &mut Frame, area: Rect, message: &str) {
+    let w = (message.chars().count() as u16 + 6).max(30);
+    let inner = popup(f, area, w, 3, "confirm");
+    f.render_widget(Paragraph::new(message.to_string()).yellow(), inner);
+}
+
+fn draw_templates(f: &mut Frame, area: Rect, v: &crate::forms::TemplatesView) {
+    let h = (v.items.len() as u16 + 5).clamp(8, 24);
+    let inner = popup(f, area, 80, h, "templates");
+    let [list, path, keys] = Layout::vertical([Constraint::Min(1), Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+    if v.items.is_empty() {
+        f.render_widget(Paragraph::new("No templates yet. Press n to make one.").dim(), list);
+    } else {
+        let rows: Vec<Row> = v
+            .items
+            .iter()
+            .map(|t| {
+                Row::new(vec![
+                    Cell::from(Span::styled(t.name.clone(), Style::new().bold().fg(Color::Cyan))),
+                    Cell::from(Span::styled(t.description.clone().unwrap_or_default(), Style::new().dim())),
+                ])
+            })
+            .collect();
+        let table = Table::new(rows, [Constraint::Length(18), Constraint::Min(10)])
+            .row_highlight_style(Style::new().bg(Color::DarkGray))
+            .highlight_symbol("▌");
+        let mut state = TableState::default().with_selected(Some(v.selected));
+        f.render_stateful_widget(table, list, &mut state);
+    }
+    f.render_widget(
+        Paragraph::new(shorten_home(&crate::forms::templates_dir().display().to_string())).dim().italic(),
+        path,
+    );
+    f.render_widget(
+        hints(&[("r", "run"), ("e", "edit"), ("n", "new"), ("D", "delete"), ("esc", "back")]),
+        keys,
+    );
+}
+
+/// An agent attached inside the board, drawn from its vt100 screen.
+fn draw_pane(f: &mut Frame, pane: &PaneView, area: Rect) {
+    let mut title = vec![
+        Span::raw(" "),
+        Span::styled(pane.name.clone(), Style::new().bold()),
+        Span::styled(format!(" {} · attached ", pane.addr), Style::new().dim()),
+    ];
+    let border = if let Some(why) = &pane.ended {
+        title.push(Span::styled(format!("· ended: {why} "), Style::new().fg(Color::Red)));
+        Color::Red
+    } else {
+        Color::Green
+    };
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::new().fg(border))
+        .title(Line::from(title))
+        .title_bottom(Line::from(Span::styled(" ctrl+\\ back to board ", Style::new().dim())));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let screen = pane.parser.screen();
+    let buf = f.buffer_mut();
+    let (rows, cols) = screen.size();
+    for r in 0..rows.get().min(inner.height) {
+        for c in 0..cols.get().min(inner.width) {
+            let Some(cell) = screen.cell(r, c) else { continue };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let mut fg = vt_color(cell.fgcolor());
+            let mut bg = vt_color(cell.bgcolor());
+            if cell.inverse() {
+                std::mem::swap(&mut fg, &mut bg);
+                fg = fg.or(Some(Color::Black));
+                bg = bg.or(Some(Color::White));
+            }
+            let mut style = Style::new();
+            if let Some(c) = fg {
+                style = style.fg(c);
+            }
+            if let Some(c) = bg {
+                style = style.bg(c);
+            }
+            let mut m = Modifier::empty();
+            if cell.bold() {
+                m |= Modifier::BOLD;
+            }
+            if cell.dim() {
+                m |= Modifier::DIM;
+            }
+            if cell.italic() {
+                m |= Modifier::ITALIC;
+            }
+            if cell.underline() {
+                m |= Modifier::UNDERLINED;
+            }
+            let pos = (inner.x + c, inner.y + r);
+            if let Some(out) = buf.cell_mut(pos) {
+                let text = cell.contents();
+                out.set_symbol(if text.is_empty() { " " } else { text });
+                out.set_style(style.add_modifier(m));
+            }
+        }
+    }
+    if pane.ended.is_none() && !screen.hide_cursor() {
+        let (r, c) = screen.cursor_position();
+        if r < inner.height && c < inner.width {
+            f.set_cursor_position((inner.x + c, inner.y + r));
+        }
+    }
+}
+
+fn vt_color(c: vt100::Color) -> Option<Color> {
+    match c {
+        vt100::Color::Default => None,
+        vt100::Color::Idx(i) => Some(Color::Indexed(i)),
+        vt100::Color::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)),
+    }
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
     let text = vec![
         Line::from("Move".bold()),
-        Line::from("  j / k, ↑ / ↓     select"),
-        Line::from("  g / G            first / last"),
+        Line::from("  j / k, ↑ / ↓     select                g / G   first / last"),
         Line::from("  n, tab           next agent that needs you"),
         Line::from(""),
+        Line::from("Agents".bold()),
+        Line::from("  c                new agent             t       templates"),
+        Line::from("  s                send a message        i       interrupt"),
+        Line::from("  a, enter         attach full-screen    o       open inside the board"),
+        Line::from("  K                kill                  d       remove finished"),
+        Line::from("  e                keep on/off           R       rename"),
+        Line::from("  ctrl+\\          leave an attached agent"),
+        Line::from(""),
         Line::from("Board".bold()),
-        Line::from("  /                search (fuzzy)    esc  clear"),
-        Line::from("  p                group by project on/off"),
-        Line::from("  f                show finished on/off"),
+        Line::from("  /                search (fuzzy)        esc     clear"),
+        Line::from("  p                group by project      f       show finished"),
         Line::from("  x                dismiss from NEEDS YOU"),
-        Line::from(""),
-        Line::from("Preview".bold()),
-        Line::from("  J / K, PgDn/PgUp scroll"),
-        Line::from("  r                refresh"),
-        Line::from(""),
+        Line::from("  PgUp/PgDn, ctrl+u/d  scroll preview    r       refresh preview"),
         Line::from("  q, ctrl+c        quit"),
         Line::from(""),
         Line::from(Span::styled("status: ● working  ◐ blocked  ✓ done  ✗ error  ○ idle  · none  ■ finished", Style::new().dim())),
@@ -297,11 +556,4 @@ fn draw_help(f: &mut Frame, area: Rect) {
             .block(Block::new().borders(Borders::ALL).border_type(BorderType::Rounded).title(" keys ")),
         popup,
     );
-}
-
-fn shorten_home(p: &str) -> String {
-    match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() && p.starts_with(&h) => format!("~{}", &p[h.len()..]),
-        _ => p.to_string(),
-    }
 }

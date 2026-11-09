@@ -1,5 +1,8 @@
 mod app;
+mod attach;
+mod forms;
 mod git;
+mod keys;
 mod notify;
 mod tui;
 mod ui;
@@ -44,6 +47,9 @@ enum Debug {
         #[arg(long)]
         raw: bool,
     },
+    /// Type raw bytes into a terminal over an attach stream.
+    /// Escapes: \r \n \t \e \\ and \xNN.
+    Type { terminal: String, text: String },
     /// Read or write Hiero's document in the core.
     Doc {
         /// JSON to store; omit to read.
@@ -138,6 +144,17 @@ async fn debug(cmd: Debug) -> Result<()> {
                 }
             }
         }
+        Debug::Type { terminal, text } => {
+            let hc = Client::connect().await?;
+            let t = hc.get(&terminal).await?;
+            let params = hc_client::AttachParams::new(&terminal, t.cols, t.rows);
+            let mut stream = hc_client::AttachStream::open(&params).await?;
+            // Drain the first paint so the core sees an active viewer.
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(200), stream.recv()).await;
+            stream.input(&unescape(&text)).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            stream.close().await;
+        }
         Debug::Doc { value, name } => {
             let hc = Client::connect().await?;
             let cur = hc.doc_get(&name).await?;
@@ -152,6 +169,34 @@ async fn debug(cmd: Debug) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn unescape(s: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 1 < b.len() {
+            i += 1;
+            match b[i] {
+                b'r' => out.push(b'\r'),
+                b'n' => out.push(b'\n'),
+                b't' => out.push(b'\t'),
+                b'e' => out.push(0x1b),
+                b'x' if i + 2 < b.len() => {
+                    if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                        out.push(v);
+                    }
+                    i += 2;
+                }
+                c => out.push(c),
+            }
+        } else {
+            out.push(b[i]);
+        }
+        i += 1;
+    }
+    out
 }
 
 fn status_word(t: &hc_client::Terminal) -> String {

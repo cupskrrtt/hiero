@@ -154,6 +154,16 @@ impl Client {
             .await
     }
 
+    /// Like [`send`](Self::send); `force` types even while the agent is blocked
+    /// (it may be answering its own dialog).
+    pub async fn send_with(&self, terminal: &str, text: &str, force: bool) -> Result<SendResult> {
+        self.call(
+            "terminal.send",
+            json!({"terminal": terminal, "text": text, "force": force}),
+        )
+        .await
+    }
+
     /// Press named keys: `enter`, `esc`, `ctrl+c`, `up`, …
     pub async fn keys(&self, terminal: &str, keys: &[&str]) -> Result<KeysResult> {
         self.call("terminal.keys", json!({"terminal": terminal, "keys": keys}))

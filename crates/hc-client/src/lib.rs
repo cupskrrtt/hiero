@@ -17,11 +17,13 @@ mod client;
 pub mod endpoint;
 mod error;
 pub mod events;
+pub mod framed;
 mod state;
 mod types;
 
 pub use client::Client;
 pub use error::{Error, ErrorKind, Result, RpcError};
+pub use framed::{AttachParams, AttachStream, StreamMsg};
 pub use events::{Event, EventData, Filter, Notification, Subscription, WatchMsg, Watcher};
 pub use state::TerminalSet;
 pub use types::*;

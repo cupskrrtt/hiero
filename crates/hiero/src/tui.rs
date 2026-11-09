@@ -1,11 +1,19 @@
-//! The board's event loop: keys, core events, screen reads and timers.
+//! The board's event loop: keys, core events, screen reads, actions,
+//! attached agents and timers.
 
-use crate::app::App;
-use crate::{notify, ui};
+use crate::app::{Action, App, Mode, PaneView};
+use crate::{attach, forms, keys, notify, ui};
 use anyhow::Result;
-use crossterm::event::{Event as TermEvent, EventStream, KeyEventKind};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, EventStream, KeyEventKind,
+};
+use crossterm::{execute, terminal};
 use futures::StreamExt;
-use hc_client::{Client, Filter, WatchMsg, Watcher, endpoint};
+use hc_client::{
+    AttachParams, AttachStream, Client, ErrorKind, Filter, StreamMsg, TemplateInfo, WatchMsg, Watcher, endpoint,
+};
+use ratatui::layout::Rect;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, interval};
@@ -14,29 +22,42 @@ use tokio::time::{Instant, interval};
 const PREVIEW_HISTORY: usize = 200;
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
+/// Results coming back from spawned work.
+enum Msg {
+    Connected(Result<(Client, String), String>),
+    Preview { addr: String, result: Result<String, String>, lost: bool },
+    Done { result: Result<String, String>, select: Option<String> },
+    Templates(Vec<TemplateInfo>),
+    PaneOpened { addr: String, name: String, cols: u16, rows: u16, result: Result<Box<AttachStream>, String> },
+}
+
 pub async fn run() -> Result<()> {
     let path = endpoint::socket_path();
     let mut watch = Watcher::spawn(path.clone(), Filter::default());
-    let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, &mut watch, path).await;
+    let mut term = ratatui::init();
+    execute!(std::io::stdout(), EnableBracketedPaste)?;
+    let result = event_loop(&mut term, &mut watch, path).await;
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
 }
 
 async fn event_loop(
-    terminal: &mut ratatui::DefaultTerminal,
+    term: &mut ratatui::DefaultTerminal,
     watch: &mut mpsc::Receiver<WatchMsg>,
-    path: std::path::PathBuf,
+    path: PathBuf,
 ) -> Result<()> {
     let mut app = App::new();
     let mut keys = EventStream::new();
 
-    // A separate request connection for reads (the watcher's is events-only).
+    // A request connection (the watcher's is events-only).
     let mut client: Option<Client> = None;
     let mut connecting = false;
     let mut next_connect = Instant::now();
-    let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<Result<(Client, String), String>>();
-    let (prev_tx, mut prev_rx) = mpsc::unbounded_channel::<(String, Result<String, String>, bool)>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+
+    // The agent attached inside the board, if any.
+    let mut pane: Option<AttachStream> = None;
 
     let mut anim = interval(Duration::from_millis(120));
     let mut slow = interval(Duration::from_secs(1));
@@ -44,7 +65,7 @@ async fn event_loop(
     loop {
         if client.is_none() && !connecting && app.disconnected.is_none() && Instant::now() >= next_connect {
             connecting = true;
-            let (tx, path) = (conn_tx.clone(), path.clone());
+            let (tx, path) = (tx.clone(), path.clone());
             tokio::spawn(async move {
                 let r = async {
                     let c = Client::connect_to(&path).await?;
@@ -53,31 +74,120 @@ async fn event_loop(
                 }
                 .await
                 .map_err(|e| e.to_string());
-                let _ = tx.send(r);
+                let _ = tx.send(Msg::Connected(r));
             });
         }
         if let Some(c) = &client
+            && pane.is_none()
             && let Some(addr) = app.take_preview_request()
         {
-            let (c, tx) = (c.clone(), prev_tx.clone());
+            let (c, tx) = (c.clone(), tx.clone());
             tokio::spawn(async move {
-                let (r, lost) = match c.read(&addr, PREVIEW_HISTORY).await {
+                let (result, lost) = match c.read(&addr, PREVIEW_HISTORY).await {
                     Ok(r) => (Ok(r.text), false),
                     Err(e) => {
                         let lost = matches!(e, hc_client::Error::Disconnected | hc_client::Error::Io(_));
                         (Err(e.to_string()), lost)
                     }
                 };
-                let _ = tx.send((addr, r, lost));
+                let _ = tx.send(Msg::Preview { addr, result, lost });
             });
         }
 
-        terminal.draw(|f| ui::draw(f, &app))?;
+        // Work the keys asked for.
+        for action in std::mem::take(&mut app.actions) {
+            match action {
+                Action::AttachFull(addr) => {
+                    if let Some(p) = pane.take() {
+                        p.close().await;
+                        app.leave_pane();
+                    }
+                    drop(keys);
+                    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+                    ratatui::restore();
+                    let outcome = attach::fullscreen(&path, &addr).await;
+                    resume(term)?;
+                    keys = EventStream::new();
+                    match outcome {
+                        Ok(attach::Outcome::Detached) => app.flash("back on the board"),
+                        Ok(attach::Outcome::Ended(why)) => app.flash(&format!("{addr} ended: {why}")),
+                        Err(e) => app.flash_error(&format!("attach failed: {e}")),
+                    }
+                    app.preview.dirty = true;
+                }
+                Action::EditTemplate(file) => {
+                    drop(keys);
+                    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+                    ratatui::restore();
+                    let r = edit_file(&file);
+                    resume(term)?;
+                    keys = EventStream::new();
+                    if let Err(e) = r {
+                        app.flash_error(&e);
+                    }
+                    if let Some(c) = &client {
+                        load_templates(c.clone(), tx.clone());
+                    }
+                }
+                Action::AttachPane(addr) => {
+                    let name = app.selected_info().map(|i| i.name.clone()).unwrap_or_else(|| addr.clone());
+                    let inner = pane_size(term, app.disconnected.is_some())?;
+                    let (tx, path) = (tx.clone(), path.clone());
+                    tokio::spawn(async move {
+                        let params = AttachParams::new(addr.clone(), inner.width, inner.height);
+                        let result = AttachStream::open_at(&path, &params).await.map(Box::new).map_err(|e| e.to_string());
+                        let _ = tx.send(Msg::PaneOpened { addr, name, cols: inner.width, rows: inner.height, result });
+                    });
+                }
+                other => match &client {
+                    Some(c) => run_action(c.clone(), other, tx.clone()),
+                    None => app.flash_error("not connected to herdr-core"),
+                },
+            }
+        }
+
+        term.draw(|f| ui::draw(f, &app))?;
 
         tokio::select! {
             ev = keys.next() => match ev {
-                Some(Ok(TermEvent::Key(k))) if k.kind == KeyEventKind::Press => app.on_key(k),
-                Some(Ok(_)) => {} // resize and friends: just redraw
+                Some(Ok(TermEvent::Key(k))) if k.kind != KeyEventKind::Release => {
+                    if matches!(app.mode, Mode::Pane) {
+                        let ended = app.pane.as_ref().is_some_and(|p| p.ended.is_some());
+                        if keys::is_detach(&k) || ended {
+                            if let Some(p) = pane.take() {
+                                tokio::spawn(p.close());
+                            }
+                            app.leave_pane();
+                        } else if let (Some(p), Some(view)) = (&pane, &app.pane) {
+                            let app_cursor = view.parser.screen().application_cursor();
+                            if let Some(bytes) = keys::encode(k, app_cursor) {
+                                let _ = p.input(&bytes).await;
+                            }
+                        }
+                    } else if k.kind == KeyEventKind::Press {
+                        app.on_key(k);
+                    }
+                }
+                Some(Ok(TermEvent::Paste(text))) => {
+                    if let (Mode::Pane, Some(p), Some(view)) = (&app.mode, &pane, &app.pane) {
+                        let bytes = if view.parser.screen().bracketed_paste() {
+                            format!("\x1b[200~{text}\x1b[201~")
+                        } else {
+                            text
+                        };
+                        let _ = p.input(bytes.as_bytes()).await;
+                    } else {
+                        app.on_paste(&text);
+                    }
+                }
+                Some(Ok(TermEvent::Resize(_, _))) => {
+                    if let (Some(p), Some(view)) = (&pane, &mut app.pane) {
+                        let inner = pane_size(term, app.disconnected.is_some())?;
+                        view.resize(inner.width, inner.height);
+                        let _ = p.resize(inner.width, inner.height).await;
+                    }
+                }
+                Some(Ok(_)) => {}
                 Some(Err(e)) => return Err(e.into()),
                 None => break,
             },
@@ -90,27 +200,55 @@ async fn event_loop(
                     notify::alert(&a.title, &a.body);
                 }
             }
-            Some(r) = conn_rx.recv() => {
-                connecting = false;
-                match r {
-                    Ok((c, name)) => {
-                        client = Some(c);
-                        app.core_name = name;
-                        app.preview.dirty = true;
-                    }
-                    Err(e) => {
-                        tracing::debug!("request connection failed: {e}");
-                        next_connect = Instant::now() + RECONNECT_DELAY;
+            msg = pane_recv(&mut pane) => {
+                if let Some(view) = &mut app.pane {
+                    match msg {
+                        StreamMsg::Data(bytes) => view.parser.process(&bytes),
+                        StreamMsg::Resize { .. } => {}
+                        StreamMsg::Closed(reason) => {
+                            view.ended = Some(attach::describe_close(reason.as_ref()));
+                            pane = None;
+                        }
                     }
                 }
             }
-            Some((addr, r, lost)) = prev_rx.recv() => {
-                if lost {
-                    client = None; // likely dead; reconnect on the next pass
+            Some(msg) = rx.recv() => match msg {
+                Msg::Connected(Ok((c, name))) => {
+                    connecting = false;
+                    load_templates(c.clone(), tx.clone());
+                    client = Some(c);
+                    app.core_name = name;
+                    app.preview.dirty = true;
+                }
+                Msg::Connected(Err(e)) => {
+                    connecting = false;
+                    tracing::debug!("request connection failed: {e}");
                     next_connect = Instant::now() + RECONNECT_DELAY;
                 }
-                app.on_preview(addr, r);
-            }
+                Msg::Preview { addr, result, lost } => {
+                    if lost {
+                        client = None;
+                        next_connect = Instant::now() + RECONNECT_DELAY;
+                    }
+                    app.on_preview(addr, result);
+                }
+                Msg::Done { result, select } => {
+                    let reload = result.as_ref().is_ok_and(|m| m.starts_with("deleted template"));
+                    app.on_action_done(result, select);
+                    if reload && let Some(c) = &client {
+                        load_templates(c.clone(), tx.clone());
+                    }
+                }
+                Msg::Templates(t) => app.on_templates(t),
+                Msg::PaneOpened { addr, name, cols, rows, result } => match result {
+                    Ok(stream) => {
+                        app.enter_pane(PaneView::new(addr, name, cols, rows));
+                        let _ = stream.focus(true).await;
+                        pane = Some(*stream);
+                    }
+                    Err(e) => app.flash_error(&format!("attach failed: {e}")),
+                },
+            },
             _ = anim.tick() => app.tick = app.tick.wrapping_add(1),
             _ = slow.tick() => {
                 app.on_slow_tick();
@@ -121,5 +259,153 @@ async fn event_loop(
             break;
         }
     }
+    if let Some(p) = pane.take() {
+        p.close().await;
+    }
     Ok(())
+}
+
+async fn pane_recv(pane: &mut Option<AttachStream>) -> StreamMsg {
+    match pane {
+        Some(p) => p.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn pane_size(term: &ratatui::DefaultTerminal, banner: bool) -> Result<Rect> {
+    let size = term.size()?;
+    let inner = ui::pane_inner(Rect::new(0, 0, size.width, size.height), banner);
+    Ok(Rect::new(0, 0, inner.width.max(1), inner.height.max(1)))
+}
+
+/// Come back to the board after handing the terminal to something else.
+///
+/// Uses a fresh terminal handle instead of `Terminal::clear`, which asks the
+/// terminal for the cursor position and fails if that reply gets lost.
+fn resume(term: &mut ratatui::DefaultTerminal) -> Result<()> {
+    terminal::enable_raw_mode()?;
+    execute!(
+        std::io::stdout(),
+        terminal::EnterAlternateScreen,
+        EnableBracketedPaste,
+        terminal::Clear(terminal::ClearType::All)
+    )?;
+    *term = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
+    Ok(())
+}
+
+/// Open a template in the person's editor, creating it from a skeleton first.
+fn edit_file(file: &Path) -> Result<(), String> {
+    if !file.exists() {
+        let name = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("can't make {}: {e}", dir.display()))?;
+        }
+        std::fs::write(file, forms::template_skeleton(&name)).map_err(|e| format!("can't write template: {e}"))?;
+    }
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".into());
+    let mut argv = shell_words::split(&editor).map_err(|e| format!("bad $EDITOR: {e}"))?;
+    if argv.is_empty() {
+        argv.push("vi".into());
+    }
+    let status = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .arg(file)
+        .status()
+        .map_err(|e| format!("can't start {}: {e}", argv[0]))?;
+    if !status.success() {
+        return Err(format!("{} exited with {status}", argv[0]));
+    }
+    Ok(())
+}
+
+fn load_templates(c: Client, tx: mpsc::UnboundedSender<Msg>) {
+    tokio::spawn(async move {
+        match c.templates().await {
+            Ok(t) => {
+                let _ = tx.send(Msg::Templates(t.templates));
+            }
+            Err(e) => tracing::debug!("templates: {e}"),
+        }
+    });
+}
+
+/// Run one request-style action and report back.
+fn run_action(c: Client, action: Action, tx: mpsc::UnboundedSender<Msg>) {
+    if matches!(action, Action::LoadTemplates) {
+        load_templates(c, tx);
+        return;
+    }
+    tokio::spawn(async move {
+        let mut select = None;
+        let result: Result<String, String> = async {
+            let msg = match action {
+                Action::Run { params, send_after } => {
+                    let t = c.run(&params).await?;
+                    if let Some(text) = send_after {
+                        c.send(&t.address, &text).await?;
+                    }
+                    select = Some(t.address.clone());
+                    format!("started {} ({})", t.display_name(), t.address)
+                }
+                Action::Send { addr, text, force } => {
+                    c.send_with(&addr, &text, force).await?;
+                    format!("sent to {addr}")
+                }
+                Action::Interrupt(addr) => {
+                    let r = c.interrupt(&addr).await?;
+                    format!("interrupt ({}): {}", r.key, r.outcome)
+                }
+                Action::Kill(addr) => {
+                    c.kill(&addr).await?;
+                    format!("killed {addr}")
+                }
+                Action::Remove(addr) => {
+                    c.rm(&addr).await?;
+                    format!("removed {addr}")
+                }
+                Action::Keep(addr, keep) => {
+                    c.keep(&addr, keep).await?;
+                    format!("keep {} for {addr}", if keep { "on" } else { "off" })
+                }
+                Action::Label(addr, labels) => {
+                    c.label(&addr, &labels).await?;
+                    "saved".to_string()
+                }
+                Action::DeleteTemplate(file) => {
+                    std::fs::remove_file(&file).map_err(|e| Explain(format!("can't delete: {e}")))?;
+                    format!(
+                        "deleted template {}",
+                        file.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default()
+                    )
+                }
+                Action::LoadTemplates
+                | Action::AttachFull(_)
+                | Action::AttachPane(_)
+                | Action::EditTemplate(_) => String::new(),
+            };
+            Ok::<_, Explain>(msg)
+        }
+        .await
+        .map_err(|e| e.0);
+        let _ = tx.send(Msg::Done { result, select });
+    });
+}
+
+/// An error worded for the person.
+struct Explain(String);
+
+impl From<hc_client::Error> for Explain {
+    fn from(e: hc_client::Error) -> Self {
+        let msg = match e.kind() {
+            Some(ErrorKind::Blocked) => {
+                "the agent is blocked waiting for you — attach (a) to answer, or ctrl+f in send to force".to_string()
+            }
+            Some(ErrorKind::NameTaken) => "that name is taken — pick another".to_string(),
+            _ => e.to_string(),
+        };
+        Explain(msg)
+    }
 }
