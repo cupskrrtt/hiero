@@ -1,18 +1,18 @@
 # Builds Hiero from the checkout this file sits in:
 #   cd packaging/arch && makepkg -si
 #
-# To publish on the AUR, set url to the real repository and replace the
-# _root lines with a release tarball:
+# To publish on the AUR: push a tag (git tag v0.2.0), then replace the _root
+# line with the release tarball and fill in its checksum:
 #   source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-#   b2sums=('...')        # updpkgsums
+#   b2sums=('SKIP')       # then run: updpkgsums
 #   _root="$srcdir/$pkgname-$pkgver"
 
 pkgname=hiero
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
-pkgdesc='TUI agent manager on top of herdr-core: board, attach, tasks in git worktrees, pipelines'
+pkgdesc='Terminal workspace on top of herdr-core: projects, tabs and splits of terminals, plus an agent board'
 arch=('x86_64' 'aarch64')
-url='https://github.com/CHANGE-ME/hiero'
+url='https://github.com/cupskrrtt/hiero'
 license=('Apache-2.0')
 depends=('gcc-libs' 'git' 'herdr-core')
 makedepends=('cargo')

@@ -1,311 +1,29 @@
 # hiero
 
-A TUI agent manager on top of [herdr-core](https://github.com/herdrdev/herdr-core) (`hc`).
+A terminal workspace on top of [herdr-core](https://github.com/herdrdev/herdr-core) (`hc`).
 
-herdr-core keeps terminals and coding agents alive in the background and exposes them over a
-JSON-RPC socket, but draws nothing. Hiero is the cockpit: see every agent at a glance, know
-which ones need you, start, drive and take over agents, and run parallel tasks safely in
-git worktrees.
+Hiero shows projects and named workspaces in a sidebar. Each workspace is a set of tabs and
+splits, and every pane is a terminal (nvim, Claude Code, a shell) that herdr-core keeps running
+in the background. Quit Hiero, come back later, and the layout and the programs are still there.
 
 ```
-hiero (one binary)
-├── hc-client     JSON-RPC over the Unix socket; plain mode for calls and events, framed for attach
-├── state         live picture of all terminals (snapshot + events)
-├── store         Hiero's data (tasks, projects) in hc doc "hiero"; survives restarts
-├── ui            ratatui: board · preview · in-pane terminal · dialogs
-└── integrate     status bridge: agent hooks → OSC 7501 (hiero hook / report)
+┌ projects ──────────┐  1 editor   2 agents   3 shell
+│▾ shosha            │┌ nvim . t4 ──────────────────┐┌ claude t5 ─────────────────┐
+│  ▶ ● frontend      ││                             ││ ◐ approve Write: src/a.rs  │
+│    ◐ backend       ││  fn main() {                ││                            │
+│    ✓ docs          ││                             │└────────────────────────────┘
+│▸ solo ·            ││                             │┏ shell t6 ━━━━━━━━━━━━━━━━━━┓
+│                    ││                             │┃ $ cargo test               ┃
+└────────────────────┘└─────────────────────────────┘┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+ ctrl+b then  t tab · v s split · hjkl move · z zoom · m menu · ? help · q quit
 ```
 
-Hiero keeps no database of its own: terminals live in herdr-core, and Hiero's data lives in
-herdr-core's document store. Close Hiero, reopen it, and everything is still there.
+Hiero keeps no database of its own. Terminals live in herdr-core, and Hiero's data (projects,
+workspaces, layouts, tasks) lives in herdr-core's document store.
 
-## Status
-
-| Phase | What | State |
-|---|---|---|
-| 0 | Foundation: `hc-client` library | ✅ done |
-| 1 | Agent board (MVP) | ✅ done |
-| 2 | Drive agents: spawn, actions, attach | ✅ done |
-| 3 | Status bridge for Claude Code, codex, pi | ✅ done |
-| 4 | Tasks and git worktrees | ✅ done |
-| 5 | Orchestration: pipelines, broadcast, machines | ✅ done |
-| 6 | Polish: usage, config, packaging | ✅ done |
-
-## Redesign: workspace
-
-Hiero is becoming a terminal workspace. A sidebar lists projects, each with named workspaces you
-create and sort by hand. A workspace has a folder and shows its terminals in tabs and splits
-(nvim, Claude Code, shells). Every pane is an hc terminal, so it keeps running in the background.
-The layout is remembered, and each pane stores its command so a missing terminal can be started again.
-
-| Phase | What | State |
-|---|---|---|
-| W1 | Workspace data model in hc doc `hiero-ws`, plus `hiero ws` CLI | ✅ done |
-| W2 | Sidebar and one live pane | ✅ done |
-| W3 | Tabs and splits | ✅ done |
-| W4 | Restore terminals, and a menu with the old views (board, tasks, pipelines) | ✅ done |
-| W5 | Polish | planned |
-
-**W2 ✅** `hiero` now opens the workspace screen: a sidebar of projects and workspaces, the open
-workspace's terminal in the middle, and a one-line bar at the bottom. The old agent board is still
-there as `hiero board`.
-
-- Every pane is an hc terminal. Opening a workspace attaches to its terminal if it still runs, or
-  starts a shell in the workspace folder (labels `hiero.ws`, `hiero.pane`, `hiero.project`) and saves
-  its address in the doc. Switching workspaces or quitting Hiero leaves programs running.
-- W2 showed only one pane. W3 shows tabs and splits.
-- Hiero's own keys sit behind a prefix key (default `ctrl+b`, like tmux), so nvim and Claude get
-  every other key. Change it with `[workspace] prefix = "ctrl+a"` (`ctrl+<letter>` or `ctrl+space`).
-  `hiero debug keys` shows what your terminal sends, if a prefix doesn't seem to work.
-- The sidebar shows a dot per workspace (● working, ◐ needs you, ✓ done) and a dot on a collapsed
-  project. The bottom bar names a workspace that needs you. Changes to attention or done ring the
-  bell and notify, using the `[notify]` rules.
-- `hiero ws …` edits show up live. The open workspace is remembered (`remember = true`).
-- When a pane's program ends, the title says so and `Enter` starts a fresh shell there.
-- Deleting a workspace or project asks what to do with its terminals (W4).
-
-**W3 ✅** The workspace area has a tabs bar and shows every pane of the active tab at once.
-
-- Tabs bar on top: the tab names in order, the active one highlighted. No status dots here; the
-  sidebar has them.
-- Each pane has its own border and title (its command or `shell`, and its terminal address, plus
-  `ended: …` when its program exited). The focused pane has a thick green border and the cursor.
-  Keys and paste go to the focused pane only.
-- Every pane keeps its own attach stream. Opening a tab attaches each pane's terminal if it still
-  runs, or starts it (its command, in its folder) and saves the address. Switching tabs or
-  workspaces closes the old streams, and the programs keep running. Coming back attaches the same
-  terminals again.
-- Every terminal resize, split, or border move resizes the streams to the pane's inner size.
-- `T`, `V`, `S` ask for a command first (for example `nvim .` or `claude`). The command is saved on
-  the pane, so a missing terminal can be started again.
-- Closing a pane or tab asks first, then kills and removes its terminals.
-- Zoom (`z`) is only a view: it is not saved. Moving the focus, splitting, or switching tab ends it.
-
-**W4 ✅** Layouts come back by themselves, and the old features sit behind a menu.
-
-- **Restore.** When a workspace opens, every pane of every tab gets a running terminal, not only
-  the visible tab. Missing ones start in the background (the pane's command or a shell, in its
-  folder) and the new address is saved. Only the visible tab's panes get attach streams; the other
-  tabs are just kept running. Nothing starts twice, and nothing starts before Hiero has seen the
-  list of terminals.
-- **Restart rule.** A pane's terminal starts again by itself when it is gone from hc, or when it
-  finished because the system went down (`server_stop`, `host_shutdown`, `holder_lost`,
-  `stopped_by_restart`: a reboot or a core restart). If it ended on its own (`exited`) or you
-  killed it, the pane stays as `ended: …` in every tab, and `Enter` starts it again.
-- `[workspace] restore = false` turns the automatic start off. Panes without a terminal then say
-  "not running", and `Enter` starts one.
-- **Delete.** `D` on a workspace or project asks: `y` ends its terminals and deletes, `k` deletes
-  and leaves the terminals running, `n` or `Esc` cancels.
-- **Menu.** `prefix` then `m` lists Agents board, Tasks, Pipelines, Usage, Templates and
-  Broadcast (`j` `k` `Enter`, `Esc` closes). A choice hands the screen to the old board, opened on
-  that view. Closing the view (`q`, or `Esc` for the broadcast prompt) brings the workspace back
-  as it was: the panes attach to the same terminals again. Programs keep running meanwhile.
-- **Worktrees are opt-in.** The switch in the new-agent form (`c` on the board) now starts off.
-- The help (`?`) scrolls (`j` `k`) when the terminal is short.
-
-### Workspace keys
-
-After the prefix (`ctrl+b`), the bar shows `prefix` until the next key:
-
-| Key | Action |
-|---|---|
-| `t` | new tab with a shell |
-| `T` | new tab, asks for a command first |
-| `v` / `s` | split the pane side by side / stacked (new shell, same folder, gets focus) |
-| `V` / `S` | same, but ask for a command first |
-| `h` `j` `k` `l` or arrows | move focus to the neighbouring pane |
-| `H` `J` `K` `L` | narrower / taller / shorter / wider (5% a press) |
-| `1` … `9` | go to tab N |
-| `[` / `]` | previous / next tab |
-| `r` | rename the tab |
-| `x` | close the pane (asks; its program ends) |
-| `X` | close the tab (asks; all its programs end) |
-| `z` | zoom the pane to the whole area, again to undo |
-| `w` | switch between sidebar and workspace |
-| `n` / `N` | new workspace in this project / new project |
-| `m` | menu of the old views (see W4) |
-| `?` | help |
-| `q` | quit Hiero (terminals keep running) |
-| prefix again | send the prefix key itself to the program |
-| `Esc` | cancel |
-
-The last pane of a tab closes the tab. The last tab of a workspace can't be closed; delete the
-workspace instead.
-
-In the sidebar (no prefix needed):
-
-| Key | Action |
-|---|---|
-| `j` `k` / `↑` `↓`, `g` `G` | move |
-| `Enter` | open a workspace; on a project, fold or unfold it |
-| `a` / `A` | add workspace under this project / add project (name and folder) |
-| `r` | rename |
-| `D` | delete (asks: `y` end its terminals · `k` keep them running · `n` cancel) |
-| `J` / `K` | move down / up |
-| `z` | fold or unfold the project |
-| `Esc`, `l`, `Tab` | back to the workspace |
-| `q` | quit |
-
-## Development phases
-
-### Phase 0: Foundation ✅
-**Goal:** talk to herdr-core from Rust.
-
-- [x] Cargo workspace: `crates/hc-client` (library, no UI) and `crates/hiero` (app)
-- [x] Find the socket the way hc does (`HC_SOCKET`, `$XDG_RUNTIME_DIR/herdr-core/<session>.sock`, …)
-- [x] JSON-RPC client: calls can run at once, replies matched by id, clean failure when the core goes away
-- [x] Typed errors for every error kind (`not_found`, `conflict`, `unavailable`, …)
-- [x] Typed wrappers: `hello`, `server.status`, `terminal.run/list/get/read/send/keys/interrupt/kill/rm/label/keep`, `templates.list`, `doc.get/set`
-- [x] `events.subscribe` with every event type decoded
-- [x] `Watcher`: reconnects with backoff, heartbeat timeout, fresh snapshot after reconnect or `missed`
-- [x] `TerminalSet`: applies events to a snapshot to keep an up-to-date list of terminals
-- [x] `hiero debug status | ls | read | events | doc`
-
-**Done when:** `hiero debug events` prints live events while you use `hc` in another shell.
-
-### Phase 1: Agent board (MVP) ✅
-**Goal:** see every agent and what state it's in, at a glance.
-
-- [x] Full-screen ratatui board: name, agent, status (● working / ◐ blocked / ✓ done / ✗ error / – none), cwd, branch, runtime, title
-- [x] **Needs-you** section at the top: blocked, done or errored agents, sorted by how long they've waited
-- [x] Preview pane: the selected agent's last ~50 lines, refreshed on change
-- [x] Group or filter by project (cwd or the `hiero.project` label); fuzzy search with `/`
-- [x] Desktop notification and terminal bell when an agent moves into blocked or done
-- [x] Banner when disconnected from the core, with automatic recovery
-
-**Done when:** you can watch 3–5 agents and the ones waiting for you stand out right away.
-
-### Phase 2: Drive agents ✅
-**Goal:** never need the `hc` CLI by hand.
-
-- [x] New-agent dialog (`c`): template, agent on PATH or shell; folder, task, name. Labels `hiero.project`, `hiero.task`, `hiero.agent`
-- [x] Quick actions: `s` send (`Ctrl+F` forces while blocked), `i` interrupt, `K` kill (asks first), `d` remove finished, `e` keep on/off, `R` rename (stored as label `hiero.name`; hc has no rename)
-- [x] Full-screen attach (`a` / `Enter`): Hiero hands over the terminal; `Ctrl+\` comes back
-- [x] Attach inside the board (`o`): framed attach plus `vt100`, credit-based flow control, resize, bracketed paste
-- [x] Template manager (`t`): list, new from a skeleton, edit in `$VISUAL`/`$EDITOR`, delete, start
-- [x] `hc-client::AttachStream` for framed mode; `hiero debug type` to script input
-- [x] Won't attach to, kill or preview the terminal Hiero itself runs in
-
-**Done when:** you can start, talk to, take over and clean up agents entirely inside Hiero.
-
-### Phase 3: Status bridge ✅
-**Goal:** real status for agents that don't report it themselves.
-
-herdr-core only knows a status the program reports through OSC 7501. Testing with a real session
-showed that **Claude Code 2.1.319 already reports natively** (`app=claude-code`): working with a
-message, `blocked:permission` with `approve Write: …`, and done. The board shows it with no setup.
-So the bridge covers older Claude versions and other agents:
-
-- [x] `hiero hook claude <Event>`: Claude Code hooks → OSC 7501 on the agent's terminal
-  (`UserPromptSubmit`/tool use → working, `PermissionRequest`/permission notification → blocked,
-  `Stop` → done). It stays quiet when Claude reports natively, so the two never fight
-- [x] `hiero integrate claude [--uninstall] [--status] [--settings F] [--force]`: merges the hooks
-  into `~/.claude/settings.json`, keeps other hooks (such as herdr's), backs the file up first.
-  It declines on Claude Code 2.1.319+ unless `--force`
-- [x] `hiero hook codex`: Codex `notify` (turn complete → done, with the last message);
-  `hiero integrate codex` prints the `config.toml` line
-- [x] `hiero report <state> [--kind] [--msg]`: report from any agent's hooks or a script
-- [x] Fallback when there's no controlling terminal: `hiero.status*` labels the board reads
-- [x] Board shows `claude-code` as `claude`
-
-**Done when:** Claude agents show accurate working, blocked and done states on the board. ✅
-(verified with real Claude Code 2.1.319 sessions)
-
-### Phase 4: Tasks and git worktrees ✅
-**Goal:** run parallel agents on one repo without them colliding.
-
-A [git worktree](https://git-scm.com/docs/git-worktree) is a second working folder for the
-same repo with its own branch checked out, so each agent gets its own copy of the code but
-everything shares one history.
-
-- [x] New-agent form has a **worktree** switch (off by default; turn it on with space): Hiero makes
-  `../<repo>.hiero/<slug>` on branch `hiero/<slug>` from the repo's HEAD and starts the agent there
-  (`slug-2`, `slug-3`… when taken; the worktree is removed again if the agent fails to start)
-- [x] Task records in herdr-core doc `hiero`: title, prompt, agent, repo, base branch/commit, branch,
-  worktree, terminal, status, timeline, PR URL. Retries on conflicting writes; unknown keys kept
-- [x] Timeline: turn ends (`turn 2 ended: done`), blocked / error / exited, and every decision
-- [x] **Review** (`v` on an agent, or `Enter` in the task list): files changed since the fork point,
-  including uncommitted edits and new files; coloured diff; commits ahead; uncommitted marker
-- [x] **Merge** (`m`): stops the agent, commits leftovers (`hiero: <title>`), `merge --no-ff` into the
-  base branch, removes worktree, branch and the empty `<repo>.hiero/`. Refuses if the main tree is
-  on another branch or has uncommitted changes; aborts cleanly on conflicts
-- [x] **Pull request** (`P`): commits leftovers, pushes, `gh pr create`; keeps the worktree
-- [x] **Keep** (`K`) and **discard** (`D`: stops the agent, deletes worktree and branch)
-- [x] Task list (`T`): status, branch, agent, age; `g` jumps to the agent; `D` forgets finished tasks
-
-**Done when:** you can start 3 tasks on one repo, review each diff, and merge or discard them. ✅
-(tested from the board with shell agents and a real Claude agent: create → review → merge, discard,
-PR error path, task list)
-
-### Phase 5: Orchestration ✅
-**Goal:** agents working together.
-
-- [x] **Pipelines** (`w`): TOML files of stages in `~/.config/hiero/pipelines/`, plus a built-in
-  `plan-build-review`. A stage is an agent with a prompt or a plain `command`; `count = N` runs
-  N members side by side; `worktree = true` makes each member a Phase 4 task on its own branch.
-  Hiero starts the next stage when every member's turn has ended or it has exited; a command
-  that exits non-zero fails the run. Prompts can use `{task}` `{n}` `{count}` `{branches}`
-  `{dirs}` `{folder}` `{run}` to hand work from one stage to the next
-- [x] Runs are stored in the `hiero` doc with every stage's members; one board drives each run
-  (`A` adopts a run whose board went away); `S` stops, `D` forgets; `e` edits a pipeline
-  (the built-in is copied to a file first)
-- [x] **Tree view**: `p` cycles project → tree → flat. Pipeline members are hc children of the
-  run's first agent, with notes into the parent turned off and outliving it
-- [x] **Broadcast**: `B` sends one message to every live agent shown (search narrows it);
-  `hiero broadcast [--label k=v]… [--force] <text>` from the shell
-- [x] **Remote machines**: a machine row in the new-agent form when hc knows other machines;
-  remote agents show as `box/t3` with `box:` in the project column; attach works through the
-  relay. Worktrees stay local only
-- [x] Clean exits of pipeline members don't land in NEEDS YOU; failures do
-
-**Done when:** tested from the board: a 3-stage pipeline (command → 2 parallel worktree members →
-command) ran to the end and handed plan, branches and folders along; tree view; broadcast from
-the board and the CLI; a shell on a second machine (`hc machine add --via`) started, attached
-and typed into from the board.
-
-### Phase 6: Polish ✅
-- [x] **Usage panel** (`u`): Claude tokens per agent (messages, input, output, cache write, cache
-  read) from its transcript in `~/.claude/projects`, counted once per message. Tokens only, no
-  prices: plans bill differently, and a wrong price is worse than none
-- [x] **Config** `~/.config/hiero/config.toml` (`hiero config init | path | show`): board defaults,
-  which changes alert and how (bell / desktop), per-agent launch settings (`command`, and
-  `task = arg | send | none`), key remapping under `[keys]`. Checked on start; a broken file is
-  reported on the board and ignored
-- [x] **Remembers** grouping, show-finished, search and the selected agent between runs
-  (`~/.local/state/hiero/ui.json`; `remember = false` turns it off)
-- [x] **Log file** `~/.local/state/hiero/hiero.log` for the board (it used to write to stderr,
-  over the screen); rotated past 5 MB
-- [x] **Packaging**: release profile (thin LTO, stripped), Apache-2.0 `LICENSE`, Arch
-  `packaging/arch/PKGBUILD` (builds and tests the checkout; notes for publishing on the AUR)
-- [ ] Release binaries for other distros (needs a hosted repository and CI)
-- [ ] Themes (colours are fixed for now)
-
-## Known issues
-
-Tracked here until fixed. ✅ = fixed.
-
-| # | Issue | Impact | Plan |
-|---|---|---|---|
-| 8 | Before its first report an agent shows `·`, including while Claude waits at its "trust this folder?" dialog, which comes before any hook or native report. | A new agent in a new folder looks idle while it actually waits for you. | Show "starting / not reported" for young agents, and hint to attach. |
-| 9 | Codex (`hiero hook codex`) and pi are untested; neither is installed here. Codex `notify` only reports finished turns, so Codex shows done but never working or blocked. | Partial status for Codex; none for pi unless its hooks call `hiero report`. | Test when installed; check whether they speak OSC 7501 natively. |
-| 3 | Opening an agent inside the board (`o`) resizes the agent to the pane. herdr-core gives the size to the last active viewer. | The agent reflows to a smaller size; full-screen attach (`a`) sizes it back. | Could use an observe-only stream for viewing and become a viewer only on the first keypress. |
-| 4 | The board redraws timers and the spinner every second, so its screen never goes quiet. | When Hiero itself runs inside an hc terminal, `hc send` / `hc keys` into it fail with "output has not settled". Normal use is unaffected. | Redraw only when something visible changes, and tick wait timers less often. |
-| 6 | The Windows toast (WSL) is sent with exit code 0, but nobody has confirmed it actually appears. | Desktop notifications may be silent on WSL; the bell still rings. | Confirm on a real desktop; fall back to `wsl-notify-send` if needed. |
-| 7 | Rename is stored as a `hiero.name` label because hc has no rename. | `hc ls` and other tools still show the original name. | Use a real rename if herdr-core adds one. |
-| 10 | Pull requests (`P`) are only tested up to the push failing cleanly (no remote here); `gh pr create` itself is untested. | The PR step may need fixes on first real use. | Test against a real GitHub repo. |
-| 11 | Merge needs the main working tree on the task's base branch with no uncommitted changes, and stops at conflicts (it undoes the merge and says so). | You resolve conflicts by hand: attach to the agent or work in the worktree, then merge again. | A "rebase onto base" action, and letting the agent resolve conflicts. |
-| 12 | Every running Hiero writes timeline notes, so two boards open at once record each note twice. | Duplicate timeline lines. | Let only one Hiero write notes (a lease in the doc). |
-| 13 | New files show in review only up to 500 lines; binary files show as "(binary file)". | Large generated files are cut short in the diff view. | Fine for review; open the worktree for the rest. |
-| 14 | A pipeline only moves forward while the board that drives it is open. | Close Hiero and the run pauses; reopen and press `A` on the run (the old board id is gone). | Adopt runs automatically when their driver has been silent for a while. |
-| 15 | The built-in `plan-build-review` (Claude) is untested end to end to save tokens; only the command/`sh -c` smoke pipeline ran. Agents that never report status (plain shells) never finish a stage. | A real Claude pipeline may need prompt tuning. | Run it on a real task; let shell members finish on exit only. |
-| 16 | Agents on other machines show no git branch and can't use worktrees. | Less information for remote agents. | Read git facts through `hc exec --on`. |
-| 17 | No release binaries or AUR entry yet: the PKGBUILD builds a local checkout, and its `url` is a placeholder. | Install from source (below). | Push the repository, tag a release, point the PKGBUILD at the tarball. |
-| ✅ | Agents on PATH always got the task as the last argument. | — | Phase 6: `[agents.<name>] task = "send"` types it in instead (or `"none"`). |
-| ✅ | The board logged to stderr, which drew over the screen. | — | Phase 6: the board logs to `~/.local/state/hiero/hiero.log`. |
-| ✅ | Real coding agents showed `·` (no status). | — | Phase 3: Claude Code 2.1.319 reports natively (verified); hooks cover older versions; `hiero report` for others. |
-| ✅ | Only tested with shells and fake agents. | — | Phase 3: verified with real Claude Code sessions (working, blocked:permission, done). |
-| ✅ | Coming back from full-screen attach quit the board: ratatui's `clear()` asks for the cursor position and the reply was lost. | — | Fixed in Phase 2: clear the screen directly and build a fresh terminal handle. |
-| ✅ | The board could attach to its own terminal (endless loop). | — | Fixed in Phase 2: attach, open, kill and preview skip the terminal Hiero runs in. |
+Hiero's own keys sit behind a prefix key (default `ctrl+b`), so nvim and Claude get every other
+key. The older agent tools (board, tasks in git worktrees, pipelines, broadcast, usage,
+templates) are one menu away (`ctrl+b m`), or run `hiero board`.
 
 ## Install
 
@@ -315,76 +33,240 @@ Needs [herdr-core](https://github.com/herdrdev/herdr-core) running (`hc server s
 # Arch: build and install a package from this checkout
 cd packaging/arch && makepkg -si
 
-# anywhere with Rust
+# from GitHub, with Rust
+cargo install --locked --git https://github.com/cupskrrtt/hiero hiero
+
+# from a checkout, with Rust
 cargo install --path crates/hiero
 ```
 
-Then run `hiero` (the workspace screen) or `hiero board` (the agent board). Optional: `hiero config init` writes a commented settings file.
+## Quick start
+
+1. Run `hiero`. The sidebar is empty.
+2. `A` adds a project: a name and a folder.
+3. `a` adds a workspace under it. `Enter` opens it. A shell starts in the folder.
+4. `ctrl+b v` splits the pane side by side, `ctrl+b s` stacks one. `ctrl+b V` and `S` ask for a
+   command first: type `nvim .` or `claude`. `ctrl+b t` opens a new tab, `T` asks for a command.
+5. `ctrl+b h j k l` moves between panes. `ctrl+b ?` shows every key.
+6. `ctrl+b q` quits Hiero. The programs keep running.
+7. Run `hiero` again. The same workspace opens and every pane attaches to its running terminal.
+
+## Keys
+
+After the prefix (`ctrl+b`) the bottom bar shows `prefix` until the next key.
+
+| Key | Action |
+|---|---|
+| `t` / `T` | new tab with a shell / ask for a command first |
+| `v` / `s` | split side by side / stacked (new shell, same folder, gets focus) |
+| `V` / `S` | same, but ask for a command first |
+| `h` `j` `k` `l` or arrows | move focus to the neighbouring pane |
+| `H` `J` `K` `L` | narrower / taller / shorter / wider (5% a press) |
+| `1` … `9` | go to tab N |
+| `[` / `]` | previous / next tab |
+| `r` | rename the tab |
+| `x` / `X` | close the pane / the tab (asks; its programs end) |
+| `z` | zoom the pane to the whole area, again to undo (a view only, not saved) |
+| `w` | switch between sidebar and workspace (shows a hidden sidebar) |
+| `b` | hide or show the sidebar |
+| `<` / `>` | narrower / wider sidebar (4 columns a step, 16 to 60) |
+| `n` / `N` | new workspace in this project / new project |
+| `m` | menu of the agent tools |
+| `?` | help |
+| `q` | quit Hiero (terminals keep running) |
+| prefix again | send the prefix key itself to the program |
+| `Esc` | cancel |
+
+The last pane of a tab closes the tab. The last tab of a workspace can't be closed; delete the
+workspace instead. Sidebar width and hidden state are remembered.
+
+In the sidebar (no prefix needed):
+
+| Key | Action |
+|---|---|
+| `j` `k` / `↑` `↓`, `g` `G` | move |
+| `Enter` | open a workspace; on a project, fold or unfold it |
+| `a` / `A` | add workspace under this project / add project |
+| `r` | rename |
+| `D` | delete (asks: `y` end its terminals · `k` keep them running · `n` cancel) |
+| `J` / `K` | move down / up |
+| `z` | fold or unfold the project |
+| `Esc`, `l`, `Tab` | back to the workspace |
+| `q` | quit |
+
+The menu (`prefix m`, then `j` `k` `Enter`) lists Agents board, Tasks, Pipelines, Usage, Templates
+and Broadcast. A choice opens that view over the workspace. Actions inside the view (forget a task,
+launch a pipeline) keep you in it. `q` or `Esc` from the view returns to the workspace, with every
+pane attached again. Broadcast with no live agents just says so and stays in the workspace.
+
+If a prefix key does not seem to work, `hiero debug keys` shows what your terminal sends.
+
+## Workspaces in depth
+
+**Projects and workspaces.** A project has a root folder. A workspace has its own folder (the
+project's root by default). Names are unique among siblings. Both can be renamed, reordered and
+deleted from the sidebar, or with `hiero ws …`; changes from the CLI show up live.
+
+**Panes.** Every pane is an hc terminal with labels `hiero.ws`, `hiero.pane` and `hiero.project`.
+The focused pane has a thick border and the cursor. Keys and paste go to it only. A pane that was
+started with a command stores it, so it can be started again.
+
+**Layouts.** Tabs, splits and sizes are stored in herdr-core's document `hiero-ws`, so they
+survive closing Hiero, a core restart and a reboot. The open workspace is remembered.
+
+**Restore rule.** When a workspace opens, every pane of every tab gets a running terminal, not only
+the visible tab. Missing ones start in the background (the pane's command or a shell, in its
+folder). A pane's terminal starts again by itself when it is gone from hc, or when it finished
+because the system went down (`server_stop`, `host_shutdown`, `holder_lost`,
+`stopped_by_restart`). If its program exited or you killed it, the pane stays as `ended: …` and
+`Enter` starts a fresh one. Nothing starts twice, and nothing starts before Hiero has seen the
+terminal list.
+
+**Core restart while Hiero is open.** The pane area shows a red banner while the core is away.
+When it is back, Hiero checks every pane with the same rule: missing terminals start again, a
+stream that was only lost attaches again, and programs you ended stay ended. The bar says
+`core restarted — restored 3 panes`. Restored programs start from their command; what was on their
+screen is gone.
+
+**Delete.** `D` on a workspace or project asks what to do with its terminals: `y` ends them and
+deletes, `k` deletes and leaves them running, `n` or `Esc` cancels.
+
+**Status dots.** The sidebar shows `●` working, `◐` needs you, `✓` done, `○` idle, `·` no terminal,
+per workspace and on a collapsed project. The bottom bar names a workspace that needs you, also
+when the sidebar is hidden. Changes to needs-you or done ring the bell and notify, following the
+`[notify]` rules.
+
+**`[workspace]` config.** `prefix` is `ctrl+<letter>` (not c, h, i, j, m) or `ctrl+space`.
+`restore = false` turns the automatic start off: panes without a terminal then say "not running"
+and `Enter` starts one.
+
+## Agent tools
+
+These came first and are still there. Open them from the menu (`ctrl+b m`), or run `hiero board`
+for the board on its own screen.
+
+- **Board.** Every terminal at a glance: name, agent, status, folder, branch, runtime, title. A
+  NEEDS YOU section on top lists blocked, done or failed agents. Preview of the selected agent,
+  fuzzy search (`/`), grouping by project or as a tree. Start (`c`), send (`s`), interrupt, kill,
+  rename, attach full-screen (`a`) or inside the board (`o`).
+- **Tasks and worktrees (opt-in).** The new-agent form has a worktree switch (off by default).
+  When on, Hiero makes `../<repo>.hiero/<slug>` on branch `hiero/<slug>` and starts the agent
+  there. Review the diff (`v`), merge (`m`), open a pull request (`P`), keep or discard. The task
+  list is `T`.
+- **Pipelines** (`w`). TOML files of stages in `~/.config/hiero/pipelines/`, plus a built-in
+  `plan-build-review`. A stage is an agent with a prompt or a plain command; `count = N` runs N
+  members side by side; `worktree = true` gives each its own branch. The next stage starts when
+  every member's turn has ended.
+- **Broadcast** (`B`). One message to every live agent shown. From a shell:
+  `hiero broadcast [--label k=v]… [--force] <text>`.
+- **Usage** (`u`). Claude tokens per agent, read from its transcript in `~/.claude/projects`.
+  Tokens only, no prices.
+- **Templates** (`t`). herdr-core templates: list, new, edit in `$VISUAL`/`$EDITOR`, delete, run.
+- **Status bridge.** herdr-core only knows a status that a program reports through OSC 7501.
+  Claude Code 2.1.319 and later reports natively. For older versions and other agents:
+  `hiero integrate claude` installs hooks in `~/.claude/settings.json` (it declines on versions
+  that report natively unless `--force`), `hiero integrate codex` prints the Codex `notify` line,
+  and `hiero report <state> [--kind] [--msg]` reports from any script or hook.
+
+### Board keys
+
+| Key | Action |
+|---|---|
+| `j` `k` / `↑` `↓`, `g` `G` | select, first / last |
+| `n` / `Tab` | next agent that needs you |
+| `x` | dismiss from NEEDS YOU (comes back on its next status change) |
+| `/` | fuzzy search; `Esc` clears |
+| `p` | grouping: project → tree → flat |
+| `f` | show finished terminals on/off |
+| `PgUp` `PgDn` / `Ctrl+U` `Ctrl+D` | scroll the preview |
+| `r` | refresh the preview |
+| `c` | new agent |
+| `s` | send a message (`Ctrl+F` forces it while the agent is blocked) |
+| `a` / `Enter` | attach full-screen; `Ctrl+\` (or `Ctrl+]`) comes back |
+| `o` | open the agent inside the board; `Ctrl+\` comes back |
+| `i` | interrupt |
+| `K` | kill (asks first) |
+| `d` | remove a finished terminal |
+| `e` | keep on/off (a lost program is replaced by a shell) |
+| `R` | rename |
+| `t` | templates: `r` run · `e` edit · `n` new · `D` delete |
+| `v` | review this agent's task: `j`/`k` file · `m` merge · `P` pull request · `K` keep · `D` discard |
+| `T` | task list: `Enter` review · `g` go to agent · `D` forget a finished task |
+| `w` | pipelines: `Enter` launch / go to run · `e` edit · `S` stop run · `A` adopt run · `D` forget run |
+| `B` | broadcast to every live agent shown |
+| `u` | Claude token usage per agent |
+| `?` | help |
+| `q` / `Ctrl+C` | quit |
+
+Status symbols: `●` working · `◐` blocked · `✓` done · `✗` error · `○` idle · `·` no status ·
+`■` finished.
 
 ## Configuration
 
-`~/.config/hiero/config.toml` — every setting has a default, so the file can stay short:
+`~/.config/hiero/config.toml`. Every setting has a default, so the file can stay short.
+`hiero config init` writes a commented starting file, `hiero config show` checks it and prints what
+is in effect. A broken file is reported and ignored.
 
 ```toml
 [board]
-grouping = "tree"            # project, tree or flat
+grouping = "project"         # project, tree or flat (p cycles)
+show_finished = true         # f toggles
+preview_history = 200        # lines above the screen in the preview
+remember = true              # restore the open workspace, sidebar, grouping and selection
 
 [workspace]
-prefix = "ctrl+b"            # or ctrl+<letter> (not c, h, i, j, m) or ctrl+space
+prefix = "ctrl+b"            # ctrl+<letter> (not c, h, i, j, m) or ctrl+space
 restore = true               # start missing terminals when a workspace opens
 
 [notify]
-bell = false
-on = ["blocked", "error", "pipeline"]
+bell = true
+desktop = true               # notify-send, or a Windows toast on WSL
+on = ["blocked", "error", "done", "failed", "pipeline"]   # also: exited
 
 [agents.claude]
 command = "claude --model opus"
 
 [agents.pi]
-task = "send"                # type the task in after start, instead of passing it as an argument
+task = "send"                # type the task in after start; default "arg" passes it as the last argument
 
-[keys]
+[keys]                       # remap board keys: action = "key"
 kill = "X"                   # the old key (K) stops working
 ```
 
-`hiero config show` checks the file and prints what's in effect.
-
-## Getting started
-
-Requires a running herdr-core (`hc server status`) and a Rust toolchain.
+## CLI reference
 
 ```sh
-cargo build
-cargo test
-cargo run -p hiero                          # the workspace screen
-cargo run -p hiero -- board                 # the agent board
+hiero                                  # the workspace
+hiero board                            # the agent board on its own screen
 
-cargo run -p hiero -- debug status          # handshake and core info
-cargo run -p hiero -- debug ls --all        # terminals
-cargo run -p hiero -- debug events          # follow live events
-cargo run -p hiero -- debug read t1 --lines 50
-cargo run -p hiero -- debug doc '{"hello":"world"}'   # write doc "hiero"; omit JSON to read
-cargo run -p hiero -- debug type t1 'ls\r'  # type raw bytes over an attach stream
-
-cargo run -p hiero -- integrate claude --status   # is the Claude bridge installed?
-cargo run -p hiero -- integrate claude            # install (declines on Claude Code 2.1.319+, which reports natively)
-cargo run -p hiero -- integrate codex             # prints the Codex notify line
-hiero report blocked --kind question --msg "pick a database"   # from inside an hc terminal
-hiero broadcast --label hiero.project=shosha "please rebase on main"
-
-# workspaces (stored in hc doc "hiero-ws"; the same edits are in the UI)
-hiero ws add-project shosha --root ~/code/shosha   # root defaults to the current folder
+# workspaces (the same edits are in the UI)
+hiero ws add-project shosha --root ~/code/shosha     # root defaults to the current folder
 hiero ws add shosha frontend --folder ~/code/shosha/web   # folder defaults to the project root
-hiero ws list                                       # projects > workspaces > tabs > panes
-hiero ws rename shosha frontend web                 # or: rename shosha shosha-app
-hiero ws move shosha web up                         # or: move shosha down
-hiero ws rm shosha web                              # or: rm shosha
+hiero ws list                          # projects > workspaces > tabs > panes
+hiero ws rename shosha frontend web    # or: rename shosha shosha-app
+hiero ws move shosha web up            # or: move shosha down
+hiero ws rm shosha web                 # or: rm shosha
+
+hiero broadcast --label hiero.project=shosha "please rebase on main"
+hiero report blocked --kind question --msg "pick a database"   # from inside an hc terminal
+hiero integrate claude [--status | --uninstall | --force]
+hiero integrate codex                  # prints the Codex notify line
+hiero config [path | init | show]
+
+hiero debug status                     # handshake and core info
+hiero debug ls --all                   # terminals
+hiero debug events                     # follow live events
+hiero debug read t1 --lines 50         # a terminal's screen
+hiero debug keys                       # what your terminal sends (to check a prefix key)
+hiero debug type t1 'ls\r'             # type raw bytes over an attach stream (\r \n \t \e \xNN)
+hiero debug doc [JSON] [--name hiero-ws]   # read or write a document
 ```
 
-Projects and workspaces are named exactly on the command line. Names must not be empty and must
-be unique among siblings. Folders must exist. Reset with `hiero debug doc null --name hiero-ws`.
+Projects and workspaces are named exactly on the command line. Folders must exist.
 
-| Setting | Meaning |
+## Environment variables
+
+| Variable | Meaning |
 |---|---|
 | `HC_SOCKET` | Use this core socket |
 | `HC_SESSION` | Use a separate hc session (default `default`) |
@@ -394,55 +276,93 @@ be unique among siblings. Folders must exist. Reset with `hiero debug doc null -
 | `XDG_CONFIG_HOME` | Where `hiero/config.toml` and `hiero/pipelines/` live (default `~/.config`) |
 | `XDG_STATE_HOME` | Where `hiero/hiero.log` and `hiero/ui.json` live (default `~/.local/state`) |
 
-### Board keys
+## Files
 
-These are for `hiero board`.
-
-| Key | Action |
+| Path | What |
 |---|---|
-| `j` `k` / `↑` `↓` | select |
-| `g` `G` | first / last |
-| `n` / `Tab` | next agent that needs you |
-| `x` | dismiss from NEEDS YOU (comes back on its next status change) |
-| `/` | fuzzy search; `Esc` clears |
-| `p` | grouping: project → tree (children under parents) → flat |
-| `f` | show finished terminals on/off |
-| `PgUp` `PgDn` / `Ctrl+U` `Ctrl+D` | scroll the preview |
-| `r` | refresh the preview |
-| `c` | new agent |
-| `s` | send a message (`Ctrl+F` in the prompt forces it while the agent is blocked) |
-| `a` / `Enter` | attach full-screen; `Ctrl+\` (or `Ctrl+]`) comes back |
-| `o` | open the agent inside the board; `Ctrl+\` comes back |
-| `i` | interrupt (esc or Ctrl+C, whichever the agent uses) |
-| `K` | kill (asks first) |
-| `d` | remove a finished terminal |
-| `e` | keep on/off (a lost program is replaced by a shell) |
-| `R` | rename |
-| `t` | templates: `r` run · `e` edit · `n` new · `D` delete |
-| `v` | review this agent's task: `j`/`k` file · `PgUp`/`PgDn` scroll · `m` merge · `P` pull request · `K` keep · `D` discard · `r` refresh |
-| `T` | task list: `Enter` review · `g` go to agent · `D` forget a finished task |
-| `w` | pipelines: `Enter` launch / go to run · `e` edit · `S` stop run · `A` adopt run · `D` forget run |
-| `B` | broadcast a message to every live agent shown |
-| `u` | Claude token usage per agent |
-| `?` | help |
-| `q` / `Ctrl+C` | quit |
+| `~/.config/hiero/config.toml` | settings |
+| `~/.config/hiero/pipelines/*.toml` | pipeline definitions |
+| `~/.local/state/hiero/ui.json` | remembered: open workspace, sidebar width and state, board filters |
+| `~/.local/state/hiero/hiero.log` | log of the UI (rotated past 5 MB) |
+| herdr-core doc `hiero-ws` | projects, workspaces, tabs, splits, pane commands and terminals |
+| herdr-core doc `hiero` | tasks and pipeline runs |
 
-Status symbols: `●` working · `◐` blocked · `✓` done · `✗` error · `○` idle · `·` no status · `■` finished.
-Notifications use `notify-send` when present, otherwise a Windows toast on WSL.
+Reset the workspaces with `hiero debug doc null --name hiero-ws`. This forgets every layout;
+running terminals are not touched.
 
-Try it with fake agents that report status (OSC 7501):
+## Known issues
+
+| # | Issue | Impact | Plan |
+|---|---|---|---|
+| 8 | Before its first report an agent shows `·`, including while Claude waits at its "trust this folder?" dialog. | A new agent in a new folder looks idle while it waits for you. | Show "starting / not reported" for young agents. |
+| 9 | Codex (`hiero hook codex`) and pi are untested; neither is installed here. Codex `notify` only reports finished turns. | Partial status for Codex; none for pi unless its hooks call `hiero report`. | Test when installed. |
+| 18 | Panes have no scrollback and no mouse support. | You can't scroll up inside a pane; use the program's own pager or `hc read`. | Keep a scrollback in the pane's parser, then add mouse. |
+| 19 | A restored terminal runs its command again from the start. | Unsaved state and screen history of the old program are gone. | None: herdr-core can't bring a stopped program back. |
+| 20 | The prefix menu's Broadcast only counts live terminals that report a status or were started as an agent, but the board's broadcast prompt sends to every live terminal in its list, shells included. | Broadcast from the menu can type into a plain shell. | Make the board skip terminals that are not agents. |
+| 3 | Opening an agent inside the board (`o`) resizes it to the pane. herdr-core gives the size to the last active viewer. This also applies to any second client attached to a workspace pane. | The program reflows to the smaller size. | Observe-only stream until the first key. |
+| 4 | The board redraws timers and the spinner every second. | When the board runs inside an hc terminal, `hc send` into it fails with "output has not settled". The workspace screen is not affected. | Redraw only when something visible changes. |
+| 6 | The Windows toast (WSL) is sent with exit code 0, but nobody has confirmed it appears. | Desktop notifications may be silent on WSL; the bell still rings. | Confirm on a real desktop. |
+| 7 | Rename on the board is stored as a `hiero.name` label because hc has no rename. | `hc ls` still shows the original name. | Use a real rename if herdr-core adds one. |
+| 10 | Pull requests (`P`) are only tested up to the push failing cleanly; `gh pr create` is untested. | The PR step may need fixes on first use. | Test against a real GitHub repo. |
+| 11 | Merge needs the main tree on the task's base branch with no uncommitted changes, and stops at conflicts. | You resolve conflicts by hand, then merge again. | A "rebase onto base" action. |
+| 12 | Every running Hiero board writes timeline notes, so two boards open at once record each note twice. | Duplicate timeline lines. | A lease in the doc. |
+| 13 | New files show in review only up to 500 lines; binary files show as "(binary file)". | Large generated files are cut short. | Open the worktree for the rest. |
+| 14 | A pipeline only moves forward while the board that drives it is open. | Close it and the run pauses; reopen and press `A` on the run. | Adopt runs automatically. |
+| 15 | The built-in `plan-build-review` (Claude) is untested end to end; only a command pipeline ran. Agents that never report status (plain shells) never finish a stage. | A real Claude pipeline may need prompt tuning. | Run it on a real task. |
+| 16 | Agents on other machines show no git branch and can't use worktrees. | Less information for remote agents. | Read git facts through `hc exec --on`. |
+| 17 | No release binaries and no AUR entry. The PKGBUILD builds the local checkout. | Install from source. | Tag `v0.2.0`, point the PKGBUILD at the tarball. |
+
+Fixed:
+
+- ✅ After a core restart, panes stayed `ended` until Enter or a tab switch (W5: they restore by themselves).
+- ✅ Actions inside a menu view (forget a task, launch a pipeline) closed the view (W5).
+- ✅ Opening Broadcast from the menu said "no live agents" even when agents ran (W5: the board's list is built before the view opens).
+- ✅ Agents on PATH always got the task as the last argument (Phase 6: `task = "send"`).
+- ✅ The board logged to stderr, which drew over the screen (Phase 6: log file).
+- ✅ Real coding agents showed `·` (Phase 3: Claude reports natively; hooks and `hiero report` cover the rest).
+- ✅ Coming back from full-screen attach quit the board (Phase 2).
+- ✅ The board could attach to its own terminal (Phase 2).
+
+## Development
 
 ```sh
-hc run --bg --name worker sh -c "printf '\033]7501;state=working\033\\\\'; sleep 600"
-hc run --bg --name asker  sh -c "sleep 3; printf '\033]7501;state=blocked:kind=permission\033\\\\'; sleep 600"
+cargo build
+cargo test
+cargo clippy --all-targets
+cargo run -p hiero                     # the workspace
 ```
 
+The test setup that doesn't touch your own core: start a separate session with
+`HC_SESSION=test hc server start`, and prefix every `hc` and `hiero` command with `HC_SESSION=test`.
 
-## Layout
+### Development history
+
+The per-phase checklists are in [docs/HISTORY.md](docs/HISTORY.md).
+
+| Phase | What |
+|---|---|
+| 0 | Foundation: `hc-client` library (JSON-RPC, events, reconnecting watcher) |
+| 1 | Agent board: status, NEEDS YOU, preview, search, notifications |
+| 2 | Drive agents: spawn, quick actions, attach, templates |
+| 3 | Status bridge for Claude Code, codex, pi (`hiero report`, `hiero integrate`) |
+| 4 | Tasks and git worktrees: review, merge, pull request |
+| 5 | Pipelines, broadcast, remote machines |
+| 6 | Usage panel, config file, remembered state, log file, Arch package |
+| W1 | Workspace data model in doc `hiero-ws`, `hiero ws` CLI |
+| W2 | Workspace screen: sidebar, prefix key, one live pane |
+| W3 | Tabs and splits |
+| W4 | Restore on open, delete with terminals, menu of the old views |
+| W5 | Core-restart recovery, menu views as overlays, sidebar hide and resize, README, 0.2.0 |
+
+Still open: release binaries for other distros (needs hosted releases and CI), themes (colours
+are fixed).
+
+## Source layout
 
 ```
 crates/
 ├── hc-client/src/
+│   ├── lib.rs        exports
 │   ├── endpoint.rs   find the socket
 │   ├── client.rs     JSON-RPC calls
 │   ├── error.rs      typed errors
@@ -453,8 +373,9 @@ crates/
 └── hiero/src/
     ├── main.rs       CLI entry
     ├── ws_tui.rs     workspace screen: event loop, starts and attaches terminals
-    ├── ws_app.rs     workspace screen state: sidebar, prefix key, dialogs (tested, no I/O)
+    ├── ws_app.rs     workspace screen state: sidebar, prefix key, dialogs, restore (tested, no I/O)
     ├── ws_ui.rs      workspace screen drawing
+    ├── workspace.rs  projects, workspaces, tabs, split layouts in doc "hiero-ws"
     ├── tui.rs        board event loop: keys, core events, screen reads, timers
     ├── app.rs        board state and behaviour (tested, no I/O)
     ├── ui.rs         drawing (board, dialogs, attached pane)
@@ -463,7 +384,6 @@ crates/
     ├── keys.rs       key events → terminal bytes
     ├── integrate.rs  status bridge: hooks, report, installers
     ├── tasks.rs      task records in doc "hiero"
-    ├── workspace.rs  projects, workspaces, tabs, split layouts in doc "hiero-ws"
     ├── worktree.rs   git worktrees: create, review, merge, PR, remove
     ├── pipeline.rs   pipeline specs, runs and the stage driver
     ├── config.rs     config.toml, key remaps, remembered UI state
@@ -471,6 +391,7 @@ crates/
     ├── git.rs        repo root and branch, read from .git
     └── notify.rs     bell and desktop notifications
 packaging/arch/       PKGBUILD
+docs/HISTORY.md       per-phase checklists
 ```
 
 ## License
