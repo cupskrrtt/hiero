@@ -128,6 +128,14 @@ stream that was only lost attaches again, and programs you ended stay ended. The
 `core restarted — restored 3 panes`. Restored programs start from their command; what was on their
 screen is gone.
 
+**Nesting.** Every pane's environment has `HIERO_PANE` and `HIERO_WS`. Running `hiero` inside one
+of its own panes stops with a message (*You're already inside Hiero (shosha › backend)…*) instead of
+opening a second workspace screen; use the prefix then `w` to switch. `hiero --nested` opens it
+anyway. Even then Hiero never attaches the terminal it runs in: that pane shows
+`ended: this is Hiero itself` rather than a picture of itself drawing itself. Older panes without
+the variables are recognised by their `hiero.pane` label. Commands like `hiero ws`, `hiero board`
+and `hiero report` work normally inside panes.
+
 **Delete.** `D` on a workspace or project asks what to do with its terminals: `y` ends them and
 deletes, `k` deletes and leaves them running, `n` or `Esc` cancels.
 
@@ -237,6 +245,7 @@ kill = "X"                   # the old key (K) stops working
 
 ```sh
 hiero                                  # the workspace
+hiero --nested                         # the workspace, even from inside a Hiero pane
 hiero board                            # the agent board on its own screen
 
 # workspaces (the same edits are in the UI)
@@ -275,6 +284,7 @@ Projects and workspaces are named exactly on the command line. Folders must exis
 | `VISUAL` / `EDITOR` | Editor for templates and pipelines (default `vi`) |
 | `XDG_CONFIG_HOME` | Where `hiero/config.toml` and `hiero/pipelines/` live (default `~/.config`) |
 | `XDG_STATE_HOME` | Where `hiero/hiero.log` and `hiero/ui.json` live (default `~/.local/state`) |
+| `HIERO_PANE` / `HIERO_WS` | Set by Hiero inside its panes (pane and workspace id); used to refuse nesting |
 
 ## Files
 

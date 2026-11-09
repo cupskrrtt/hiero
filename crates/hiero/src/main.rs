@@ -36,6 +36,9 @@ use hc_client::{AgentState, Client, Filter, TerminalSet, WatchMsg, Watcher, endp
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+    /// Open the workspace even from inside one of Hiero's own panes.
+    #[arg(long)]
+    nested: bool,
 }
 
 #[derive(Subcommand)]
@@ -197,7 +200,18 @@ async fn main() -> Result<()> {
         Err(e) => Some(e),
     };
     match cli.command {
-        None => ws_tui::run(config_error).await,
+        None => {
+            if !cli.nested
+                && let Some(place) = inside_hiero().await
+            {
+                eprintln!(
+                    "You're already inside Hiero ({place}). Use the prefix key then w to switch \
+                     workspaces, or run `hiero --nested` to open it here anyway."
+                );
+                std::process::exit(2);
+            }
+            ws_tui::run(config_error).await
+        }
         Some(Command::Board) => tui::run(config_error).await,
         Some(Command::Config { action }) => config_cmd(action, config_error),
         Some(Command::Debug(d)) => debug(d).await,
@@ -350,6 +364,30 @@ fn find_ws(p: &workspace::Project, name: &str) -> Result<String> {
     p.workspace_by_name(name)
         .map(|w| w.id.clone())
         .ok_or_else(|| anyhow::anyhow!("project \"{}\" has no workspace named \"{name}\"", p.name))
+}
+
+/// Where this process runs if it is inside one of Hiero's own panes:
+/// "project › workspace", or a generic name when the doc can't say.
+async fn inside_hiero() -> Option<String> {
+    let hc = tokio::time::timeout(std::time::Duration::from_secs(2), Client::connect()).await.ok().and_then(Result::ok);
+    let mut pane = std::env::var(ws_app::ENV_PANE).ok().filter(|s| !s.is_empty());
+    if pane.is_none() {
+        // Panes started before HIERO_PANE existed carry only the label.
+        let me = std::env::var("HC_TERMINAL_ID").ok().filter(|s| !s.is_empty())?;
+        pane = hc.as_ref()?.get(&me).await.ok()?.labels.get(ws_app::LABEL_PANE).cloned();
+    }
+    let pane = pane?;
+    let name = async {
+        let doc = workspace::load(hc.as_ref()?).await.ok()?;
+        doc.projects.iter().find_map(|p| {
+            p.workspaces
+                .iter()
+                .find(|w| w.panes().iter().any(|x| x.id == pane))
+                .map(|w| format!("{} › {}", p.name, w.name))
+        })
+    }
+    .await;
+    Some(name.unwrap_or_else(|| "a Hiero pane".into()))
 }
 
 async fn broadcast(text: &str, labels: &[String], force: bool) -> Result<()> {

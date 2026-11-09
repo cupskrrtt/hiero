@@ -16,6 +16,10 @@ use std::time::{Duration, Instant};
 
 pub const LABEL_WS: &str = "hiero.ws";
 pub const LABEL_PANE: &str = "hiero.pane";
+/// Set in every pane's environment, so a `hiero` started inside a pane can
+/// tell it would be nesting.
+pub const ENV_PANE: &str = "HIERO_PANE";
+pub const ENV_WS: &str = "HIERO_WS";
 pub const LABEL_PROJECT: &str = "hiero.project";
 
 /// How much one `H` `J` `K` `L` press moves a border, in percent of the split.
@@ -135,6 +139,8 @@ pub fn plan(doc: &WsDoc, set: &TerminalSet, ws_id: &str, pane_id: &str, fresh: b
     params.labels.insert(LABEL_WS.into(), w.id.clone());
     params.labels.insert(LABEL_PANE.into(), pane.id.clone());
     params.labels.insert(LABEL_PROJECT.into(), project.name.clone());
+    params.env.insert(ENV_PANE.into(), pane.id.clone());
+    params.env.insert(ENV_WS.into(), w.id.clone());
     Some(Plan::Start { pane: pane.id.clone(), params })
 }
 
@@ -292,6 +298,8 @@ pub struct WsApp {
     /// Sidebar width in columns, and whether it is hidden (prefix `b`).
     pub sidebar_w: u16,
     pub sidebar_hidden: bool,
+    /// The terminal this Hiero runs in (`HC_TERMINAL_ID`), never attached.
+    pub self_addr: Option<String>,
     /// A new snapshot came after a lost connection and the panes have not
     /// been checked yet (that waits until requests work again).
     reconnected: bool,
@@ -335,6 +343,7 @@ impl WsApp {
             screen: Rect::new(0, 0, 100, 30),
             sidebar_w: ws_ui::SIDEBAR_W,
             sidebar_hidden: false,
+            self_addr: None,
             reconnected: false,
             client_up: false,
             actions: Vec::new(),
@@ -802,6 +811,14 @@ impl WsApp {
                 Some(p) => p,
                 None => return,
             },
+        };
+        // Never show Hiero inside itself: that pane would draw this screen
+        // drawing itself. Enter still gives the pane a fresh terminal.
+        let p = match p {
+            Plan::Attach { pane, addr } if self.self_addr.as_deref() == Some(addr.as_str()) => {
+                Plan::Ended { pane, addr, why: "this is Hiero itself".into() }
+            }
+            p => p,
         };
         self.failed.remove(pane);
         let (cols, rows) = self.size_of(pane);
@@ -1810,6 +1827,9 @@ mod tests {
         assert_eq!(params.labels[LABEL_WS], "w1");
         assert_eq!(params.labels[LABEL_PANE], "n-w1");
         assert_eq!(params.labels[LABEL_PROJECT], "shosha");
+        // The pane can tell it is inside Hiero.
+        assert_eq!(params.env[ENV_PANE], "n-w1");
+        assert_eq!(params.env[ENV_WS], "w1");
 
         // Finished on its own: shown as ended, not started again...
         a.set.terminals.insert("t9".into(), finished("t9", "exited", Some(0)));
@@ -1829,6 +1849,33 @@ mod tests {
         let Some(Plan::Start { params, .. }) = plan(&a.doc, &a.set, "w2", "n-w2", false) else { panic!() };
         assert_eq!(params.line.as_deref(), Some("nvim ."));
         assert!(plan(&a.doc, &a.set, "nope", "n-w1", false).is_none());
+    }
+
+    #[test]
+    fn hiero_never_attaches_to_its_own_terminal() {
+        let mut a = app();
+        let mut doc = a.doc.clone();
+        apply(&mut doc, &WsOp::SetTerminal { pane: "n-w1".into(), terminal: Some("t9".into()) }).unwrap();
+        a.doc = doc;
+        a.set.terminals.insert("t9".into(), terminal("t9", true));
+        a.self_addr = Some("t9".into());
+
+        a.sel = "w1".into();
+        a.on_key(code(KeyCode::Enter));
+        assert_eq!(a.open.as_deref(), Some("w1"));
+        assert!(!a.actions.iter().any(|x| matches!(x, Action::Open { .. })), "no attach to itself");
+        let ended = a.slots["n-w1"].view.as_ref().and_then(|v| v.ended.clone());
+        assert_eq!(ended.as_deref(), Some("this is Hiero itself"));
+
+        // Another Hiero's terminal is fine to attach.
+        a.self_addr = Some("t1".into());
+        a.sel = "w2".into();
+        a.focus = Focus::Sidebar;
+        a.on_key(code(KeyCode::Enter));
+        a.sel = "w1".into();
+        a.focus = Focus::Sidebar;
+        a.on_key(code(KeyCode::Enter));
+        assert!(a.actions.iter().any(|x| matches!(x, Action::Open { plan: Plan::Attach { addr, .. }, .. } if addr == "t9")));
     }
 
     #[test]

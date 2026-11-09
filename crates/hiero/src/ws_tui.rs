@@ -99,6 +99,7 @@ async fn event_loop(
     let mut app = WsApp::new(config::get().prefix(), saved.workspace);
     app.set_sidebar(saved.sidebar_width, saved.sidebar_hidden);
     app.auto_restore = config::get().workspace.restore;
+    app.self_addr = std::env::var("HC_TERMINAL_ID").ok().filter(|s| !s.is_empty());
     if let Some(e) = config_error {
         tracing::warn!("{e}");
         app.flash_error(&format!("config ignored: {e}"));
