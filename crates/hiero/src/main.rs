@@ -5,8 +5,10 @@ mod git;
 mod integrate;
 mod keys;
 mod notify;
+mod tasks;
 mod tui;
 mod ui;
+mod worktree;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

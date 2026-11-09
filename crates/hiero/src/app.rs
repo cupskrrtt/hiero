@@ -4,6 +4,8 @@ use crate::forms::{
     self, Confirm, FormResult, InputDialog, InputPurpose, SpawnForm, TemplatesView, TextInput,
 };
 use crate::git::GitCache;
+use crate::tasks::{self, Task, TaskOp, TaskStatus};
+use crate::worktree;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hc_client::{AgentState, EventData, Labels, RunParams, TemplateInfo, Terminal, TerminalSet, WatchMsg};
 use std::collections::{BTreeMap, HashMap};
@@ -19,6 +21,7 @@ pub const LABEL_NAME: &str = "hiero.name";
 
 const SHELLS: &[&str] = &["bash", "zsh", "sh", "fish", "nu", "dash", "ksh", "tcsh", "pwsh"];
 
+#[allow(clippy::large_enum_variant)] // one Mode lives at a time
 pub enum Mode {
     Normal,
     Search,
@@ -27,8 +30,23 @@ pub enum Mode {
     Input(InputDialog),
     Confirm(Confirm),
     Templates(TemplatesView),
+    Tasks(TasksView),
+    Review(Box<ReviewView>),
     /// Typing into an agent inside the board.
     Pane,
+}
+
+pub struct TasksView {
+    pub selected: usize,
+}
+
+pub struct ReviewView {
+    pub task_id: String,
+    pub data: Option<worktree::Review>,
+    pub error: Option<String>,
+    pub loading: bool,
+    pub file: usize,
+    pub scroll: u16,
 }
 
 /// Work for the event loop to do (it owns the connections).
@@ -46,6 +64,15 @@ pub enum Action {
     LoadTemplates,
     EditTemplate(PathBuf),
     DeleteTemplate(PathBuf),
+    /// Start an agent in a new worktree and record the task.
+    RunTask { params: RunParams, send_after: Option<String>, spec: forms::TaskSpec },
+    LoadDoc,
+    TaskOps(Vec<TaskOp>),
+    LoadReview(Box<Task>),
+    TaskMerge(Box<Task>),
+    TaskPr(Box<Task>),
+    TaskKeep(Box<Task>),
+    TaskDiscard(Box<Task>),
 }
 
 pub struct Flash {
@@ -123,6 +150,8 @@ pub struct Info {
     pub wait_ms: Option<u64>,
     pub title: String,
     pub turn: u64,
+    /// The task this agent works on.
+    pub task: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +204,8 @@ pub struct App {
     pub launch_dir: String,
     /// The terminal Hiero itself runs in, when started inside hc.
     pub self_addr: Option<String>,
+    /// Task records (doc `hiero`).
+    pub tasks: tasks::Doc,
     pub tick: u64,
     pub quit: bool,
 }
@@ -210,6 +241,7 @@ impl App {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             self_addr: std::env::var("HC_TERMINAL_ID").ok().filter(|s| !s.is_empty()),
+            tasks: tasks::Doc::default(),
             tick: 0,
             quit: false,
         }
@@ -233,6 +265,11 @@ impl App {
                 self.disconnected = Some(error.clone());
             }
             WatchMsg::Event(e) => {
+                if let EventData::Doc { name, .. } = &e.data
+                    && name == tasks::DOC_NAME
+                {
+                    self.actions.push(Action::LoadDoc);
+                }
                 let addr = e.terminal.clone();
                 let before = addr.as_deref().and_then(|a| self.set.get(a)).and_then(attention);
                 self.set.apply(e);
@@ -246,6 +283,13 @@ impl App {
                             && Some(now) != before
                         {
                             alerts.push(alert_for(t, now));
+                            // "done" is already in the turn note.
+                            if now != Attention::Done {
+                                self.task_note(a, now.word().to_string());
+                            }
+                        }
+                        if let EventData::Turn { turn, state } = &e.data {
+                            self.task_note(a, format!("turn {turn} ended: {state}"));
                         }
                     }
                     let affects_screen = !matches!(
@@ -338,11 +382,23 @@ impl App {
                 FormResult::Cancel => Mode::Normal,
                 FormResult::Submit => match form.plan() {
                     Ok(plan) => {
-                        self.actions.push(Action::Run {
-                            params: plan.params,
-                            send_after: plan.send_after,
-                        });
-                        self.flash("starting…");
+                        match plan.task {
+                            Some(spec) => {
+                                self.flash(&format!("making worktree hiero/{}…", spec.slug));
+                                self.actions.push(Action::RunTask {
+                                    params: plan.params,
+                                    send_after: plan.send_after,
+                                    spec,
+                                });
+                            }
+                            None => {
+                                self.flash("starting…");
+                                self.actions.push(Action::Run {
+                                    params: plan.params,
+                                    send_after: plan.send_after,
+                                });
+                            }
+                        }
                         Mode::Normal
                     }
                     Err(e) => {
@@ -361,7 +417,163 @@ impl App {
                 _ => Mode::Confirm(c),
             },
             Mode::Templates(v) => self.key_templates(v, key),
+            Mode::Tasks(v) => self.key_tasks(v, key),
+            Mode::Review(v) => self.key_review(v, key),
         };
+        self.rebuild();
+    }
+
+    /// Tasks newest first.
+    pub fn task_list(&self) -> Vec<&Task> {
+        let mut list: Vec<&Task> = self.tasks.tasks.values().collect();
+        list.sort_by_key(|t| std::cmp::Reverse(t.created_ms));
+        list
+    }
+
+    fn task_note(&mut self, terminal: &str, what: String) {
+        if let Some(t) = self.tasks.by_terminal(terminal)
+            && t.status == TaskStatus::Running
+        {
+            let id = t.id.clone();
+            self.actions.push(Action::TaskOps(vec![TaskOp::Note { id, what }]));
+        }
+    }
+
+    fn open_review(&mut self, task: &Task) -> Mode {
+        if !task.status.has_worktree() {
+            self.flash_error(&format!("{} was {} — nothing left to review", task.title, task.status.word()));
+            return Mode::Normal;
+        }
+        self.actions.push(Action::LoadReview(Box::new(task.clone())));
+        Mode::Review(Box::new(ReviewView {
+            task_id: task.id.clone(),
+            data: None,
+            error: None,
+            loading: true,
+            file: 0,
+            scroll: 0,
+        }))
+    }
+
+    fn key_tasks(&mut self, mut v: TasksView, key: KeyEvent) -> Mode {
+        let list: Vec<Task> = self.task_list().into_iter().cloned().collect();
+        let n = list.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('T') => return Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down if n > 0 => v.selected = (v.selected + 1).min(n - 1),
+            KeyCode::Char('k') | KeyCode::Up => v.selected = v.selected.saturating_sub(1),
+            KeyCode::Enter | KeyCode::Char('v') => {
+                if let Some(t) = list.get(v.selected) {
+                    return self.open_review(t);
+                }
+            }
+            KeyCode::Char('g') => {
+                // Jump to the task's agent on the board.
+                if let Some(addr) = list.get(v.selected).and_then(|t| t.terminal.clone())
+                    && self.set.get(&addr).is_some()
+                {
+                    self.want_select = Some(addr);
+                    return Mode::Normal;
+                }
+                self.flash_error("its agent is gone");
+            }
+            KeyCode::Char('D') => {
+                if let Some(t) = list.get(v.selected) {
+                    if t.status.has_worktree() {
+                        self.flash_error("open it (enter) and merge or discard first");
+                    } else {
+                        return Mode::Confirm(Confirm {
+                            message: format!("Forget task {} from the list? (y/n)", t.title),
+                            action: Action::TaskOps(vec![TaskOp::Forget(t.id.clone())]),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        Mode::Tasks(v)
+    }
+
+    fn key_review(&mut self, mut v: Box<ReviewView>, key: KeyEvent) -> Mode {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(task) = self.tasks.tasks.get(&v.task_id).cloned() else {
+            return Mode::Normal;
+        };
+        let nfiles = v.data.as_ref().map(|d| d.files.len()).unwrap_or(0);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab if nfiles > 0 => {
+                v.file = (v.file + 1).min(nfiles - 1);
+                v.scroll = 0;
+            }
+            KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => {
+                v.file = v.file.saturating_sub(1);
+                v.scroll = 0;
+            }
+            KeyCode::PageDown | KeyCode::Char(' ') => v.scroll = v.scroll.saturating_add(20),
+            KeyCode::Char('d') if ctrl => v.scroll = v.scroll.saturating_add(20),
+            KeyCode::PageUp => v.scroll = v.scroll.saturating_sub(20),
+            KeyCode::Char('u') if ctrl => v.scroll = v.scroll.saturating_sub(20),
+            KeyCode::Char('r') => {
+                v.loading = true;
+                self.actions.push(Action::LoadReview(Box::new(task)));
+            }
+            KeyCode::Char('m') => {
+                let live = task.terminal.as_deref().and_then(|a| self.set.get(a)).is_some_and(|t| t.is_live());
+                let stop = if live { " The agent is stopped first." } else { "" };
+                return Mode::Confirm(Confirm {
+                    message: format!(
+                        "Merge {} into {}? Uncommitted work is committed, then the worktree and branch are removed.{stop} (y/n)",
+                        task.branch, task.base_branch
+                    ),
+                    action: Action::TaskMerge(Box::new(task)),
+                });
+            }
+            KeyCode::Char('P') => {
+                return Mode::Confirm(Confirm {
+                    message: format!(
+                        "Push {} and open a pull request into {}? Uncommitted work is committed first. (y/n)",
+                        task.branch, task.base_branch
+                    ),
+                    action: Action::TaskPr(Box::new(task)),
+                });
+            }
+            KeyCode::Char('K') => {
+                self.actions.push(Action::TaskKeep(Box::new(task)));
+                return Mode::Normal;
+            }
+            KeyCode::Char('D') => {
+                return Mode::Confirm(Confirm {
+                    message: format!(
+                        "Discard {}? The agent is stopped and its worktree and branch are deleted. (y/n)",
+                        task.title
+                    ),
+                    action: Action::TaskDiscard(Box::new(task)),
+                });
+            }
+            _ => {}
+        }
+        Mode::Review(v)
+    }
+
+    pub fn on_review(&mut self, task_id: &str, result: Result<worktree::Review, String>) {
+        if let Mode::Review(v) = &mut self.mode
+            && v.task_id == task_id
+        {
+            v.loading = false;
+            match result {
+                Ok(r) => {
+                    v.file = v.file.min(r.files.len().saturating_sub(1));
+                    v.data = Some(r);
+                    v.error = None;
+                }
+                Err(e) => v.error = Some(e),
+            }
+        }
+    }
+
+    pub fn on_doc(&mut self, doc: tasks::Doc) {
+        self.tasks = doc;
         self.rebuild();
     }
 
@@ -432,6 +644,17 @@ impl App {
             KeyCode::Char('r') => self.preview.dirty = true,
 
             KeyCode::Char('c') => return self.spawn_form(None),
+            KeyCode::Char('T') => {
+                self.actions.push(Action::LoadDoc);
+                return Mode::Tasks(TasksView { selected: 0 });
+            }
+            KeyCode::Char('v') => {
+                let task = self.selected.as_deref().and_then(|a| self.tasks.by_terminal(a)).cloned();
+                match task {
+                    Some(t) => return self.open_review(&t),
+                    None => self.flash_error("no task here — start one with c and worktree on, or see T"),
+                }
+            }
             KeyCode::Char('t') => {
                 self.actions.push(Action::LoadTemplates);
                 return Mode::Templates(TemplatesView {
@@ -876,6 +1099,7 @@ impl App {
             wait_ms,
             title: t.title.clone(),
             turn: t.turn,
+            task: self.tasks.by_terminal(&t.address).map(|k| k.title.clone()),
         }
     }
 }

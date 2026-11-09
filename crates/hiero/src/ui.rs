@@ -72,6 +72,8 @@ pub fn draw(f: &mut Frame, app: &App) {
         }
         Mode::Confirm(c) => draw_confirm(f, area, &c.message),
         Mode::Templates(v) => draw_templates(f, area, v),
+        Mode::Tasks(v) => draw_tasks(f, app, area, v.selected),
+        Mode::Review(v) => draw_review(f, app, area, v),
         _ => {}
     }
 }
@@ -216,6 +218,9 @@ fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
     if let Some(b) = &info.branch {
         title.push(Span::styled(format!(" ·  {b}"), Style::new().fg(Color::Green)));
     }
+    if let Some(task) = &info.task {
+        title.push(Span::styled(format!(" · task: {task}"), Style::new().fg(Color::Magenta)));
+    }
     title.push(Span::raw(" "));
     let mut bottom = format!(" {} · turn {} ", shorten_home(&info.dir), info.turn);
     if app.preview.scroll > 0 {
@@ -283,7 +288,8 @@ fn draw_bottom(f: &mut Frame, app: &App, area: Rect) {
             ("n", "next waiting"),
             ("x", "dismiss"),
             ("/", "search"),
-            ("t", "templates"),
+            ("v", "review"),
+            ("T", "tasks"),
             ("?", "all keys"),
             ("q", "quit"),
         ]),
@@ -331,12 +337,13 @@ fn draw_input(f: &mut Frame, area: Rect, input: &TextInput, focused: bool) {
 }
 
 fn draw_spawn(f: &mut Frame, form: &SpawnForm, area: Rect) {
-    let inner = popup(f, area, 78, 14, "new agent");
+    let inner = popup(f, area, 78, 16, "new agent");
     let rows = Layout::vertical([
         Constraint::Length(1), // agent
         Constraint::Length(1), // agent detail
         Constraint::Length(1),
         Constraint::Length(1), // folder
+        Constraint::Length(1), // worktree
         Constraint::Length(1),
         Constraint::Length(1), // task
         Constraint::Length(1),
@@ -377,20 +384,34 @@ fn draw_spawn(f: &mut Frame, form: &SpawnForm, area: Rect) {
 
     let v = label(f, rows[3], "folder", form.field == SpawnField::Folder);
     draw_input(f, v, &form.folder, form.field == SpawnField::Folder);
-    let v = label(f, rows[5], "task", form.field == SpawnField::Task);
+    let wt_focused = form.field == SpawnField::Worktree;
+    let v = label(f, rows[4], "worktree", wt_focused);
+    let (mark, text) = if form.worktree {
+        ("[x]", format!(" new branch hiero/{} in its own folder", form.slug()))
+    } else {
+        ("[ ]", " run in the folder itself".to_string())
+    };
+    let mark_style = if wt_focused { Style::new().fg(Color::Black).bg(Color::Cyan).bold() } else { Style::new().bold() };
+    let mut spans = vec![Span::styled(mark, mark_style), Span::styled(text, Style::new().dim())];
+    if wt_focused {
+        spans.push(Span::styled("   space toggles", Style::new().dim().italic()));
+    }
+    f.render_widget(Line::from(spans), v);
+
+    let v = label(f, rows[6], "task", form.field == SpawnField::Task);
     draw_input(f, v, &form.task, form.field == SpawnField::Task);
-    let v = label(f, rows[7], "name", form.field == SpawnField::Name);
+    let v = label(f, rows[8], "name", form.field == SpawnField::Name);
     draw_input(f, v, &form.name, form.field == SpawnField::Name);
     if form.name.value().is_empty() && form.field != SpawnField::Name {
         f.render_widget(Span::styled("optional", Style::new().dim().italic()), v);
     }
 
     if let Some(e) = &form.error {
-        f.render_widget(Span::styled(format!("✗ {e}"), Style::new().fg(Color::Red)), rows[9]);
+        f.render_widget(Span::styled(format!("✗ {e}"), Style::new().fg(Color::Red)), rows[10]);
     }
     f.render_widget(
         Paragraph::new("tab/↓ next field · enter on name or ctrl+s start · esc cancel").dim(),
-        rows[10],
+        rows[11],
     );
 }
 
@@ -438,6 +459,203 @@ fn draw_templates(f: &mut Frame, area: Rect, v: &crate::forms::TemplatesView) {
         hints(&[("r", "run"), ("e", "edit"), ("n", "new"), ("D", "delete"), ("esc", "back")]),
         keys,
     );
+}
+
+fn task_style(status: crate::tasks::TaskStatus) -> (&'static str, Style) {
+    use crate::tasks::TaskStatus::*;
+    match status {
+        Running => ("●", Style::new().fg(Color::Yellow)),
+        Merged => ("✓", Style::new().fg(Color::Green)),
+        Pr => ("⇡", Style::new().fg(Color::Cyan)),
+        Kept => ("■", Style::new().fg(Color::Blue)),
+        Discarded => ("✗", Style::new().dim()),
+    }
+}
+
+fn draw_tasks(f: &mut Frame, app: &App, area: Rect, selected: usize) {
+    let list = app.task_list();
+    let h = (list.len() as u16 + 5).clamp(8, area.height.saturating_sub(4));
+    let inner = popup(f, area, 110, h, "tasks");
+    let [body, keys] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    if list.is_empty() {
+        f.render_widget(
+            Paragraph::new("No tasks yet. Press c on the board, keep worktree on, and give it a task.").dim(),
+            body,
+        );
+    } else {
+        let now = crate::app::now_ms();
+        let rows: Vec<Row> = list
+            .iter()
+            .map(|t| {
+                let (sym, style) = task_style(t.status);
+                let agent = match t.terminal.as_deref().and_then(|a| app.set.get(a)) {
+                    Some(term) if term.is_live() => format!("{} {}", t.agent, term.address),
+                    Some(_) => format!("{} (exited)", t.agent),
+                    None => t.agent.clone(),
+                };
+                Row::new(vec![
+                    Cell::from(Span::styled(sym, style)),
+                    Cell::from(Span::styled(t.title.clone(), Style::new().bold())),
+                    Cell::from(Span::styled(t.status.word(), style)),
+                    Cell::from(Span::styled(t.branch.clone(), Style::new().fg(Color::Green))),
+                    Cell::from(Span::styled(agent, Style::new().fg(Color::Cyan))),
+                    Cell::from(Span::styled(fmt_dur(now.saturating_sub(t.created_ms)), Style::new().dim())),
+                ])
+            })
+            .collect();
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(1),
+                Constraint::Min(20),
+                Constraint::Length(10),
+                Constraint::Length(26),
+                Constraint::Length(16),
+                Constraint::Length(6),
+            ],
+        )
+        .header(Row::new(["", "TASK", "STATUS", "BRANCH", "AGENT", "AGE"]).style(Style::new().dim()))
+        .column_spacing(1)
+        .row_highlight_style(Style::new().bg(Color::DarkGray))
+        .highlight_symbol("▌");
+        let mut state = TableState::default().with_selected(Some(selected.min(list.len() - 1)));
+        f.render_stateful_widget(table, body, &mut state);
+    }
+    f.render_widget(
+        hints(&[("enter", "review"), ("g", "go to agent"), ("D", "forget finished"), ("esc", "back")]),
+        keys,
+    );
+}
+
+fn draw_review(f: &mut Frame, app: &App, area: Rect, v: &crate::app::ReviewView) {
+    let Some(task) = app.tasks.tasks.get(&v.task_id) else { return };
+    let w = area.width.saturating_sub(4);
+    let h = area.height.saturating_sub(2);
+    let inner = popup(f, area, w, h, &format!("review · {}", task.title));
+    let [head, body, keys] =
+        Layout::vertical([Constraint::Length(3), Constraint::Min(3), Constraint::Length(1)]).areas(inner);
+
+    // Header: branch, status, numbers, timeline tail.
+    let (sym, style) = task_style(task.status);
+    let mut line1 = vec![
+        Span::styled(format!("{sym} {} ", task.status.word()), style),
+        Span::styled(format!(" {} ", task.branch), Style::new().fg(Color::Green).bold()),
+        Span::styled(format!("→ {}", task.base_branch), Style::new().dim()),
+        Span::styled(format!("   {}", shorten_home(&task.worktree)), Style::new().dim()),
+    ];
+    if let Some(url) = &task.pr_url {
+        line1.push(Span::styled(format!("   {url}"), Style::new().fg(Color::Cyan)));
+    }
+    let line2 = match (&v.data, &v.error, v.loading) {
+        (_, Some(e), _) => Line::from(Span::styled(format!("✗ {e}"), Style::new().fg(Color::Red))),
+        (None, None, _) | (_, None, true) if v.data.is_none() => Line::from(Span::styled("reading changes…", Style::new().dim())),
+        (Some(d), None, _) => {
+            let (add, del) = d.files.iter().fold((0, 0), |(a, r), f| (a + f.added.unwrap_or(0), r + f.removed.unwrap_or(0)));
+            let mut sp = vec![
+                Span::raw(format!("{} file{} ", d.files.len(), if d.files.len() == 1 { "" } else { "s" })),
+                Span::styled(format!("+{add} "), Style::new().fg(Color::Green)),
+                Span::styled(format!("-{del}"), Style::new().fg(Color::Red)),
+                Span::styled(
+                    format!(
+                        "   {} commit{} ahead of {}",
+                        d.commits_ahead,
+                        if d.commits_ahead == 1 { "" } else { "s" },
+                        &d.base[..d.base.len().min(7)]
+                    ),
+                    Style::new().dim(),
+                ),
+            ];
+            if d.dirty {
+                sp.push(Span::styled("   uncommitted changes", Style::new().fg(Color::Yellow)));
+            }
+            if v.loading {
+                sp.push(Span::styled("   refreshing…", Style::new().dim()));
+            }
+            Line::from(sp)
+        }
+        _ => Line::default(),
+    };
+    let last = task
+        .timeline
+        .iter()
+        .rev()
+        .take(4)
+        .map(|e| e.what.clone())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("  ›  ");
+    let line3 = Line::from(Span::styled(format!("timeline: {last}"), Style::new().dim()));
+    f.render_widget(Paragraph::new(vec![Line::from(line1), line2, line3]), head);
+
+    let [files_area, diff_area] = Layout::horizontal([Constraint::Percentage(28), Constraint::Percentage(72)]).areas(body);
+    let files_block = Block::new().borders(Borders::ALL).border_type(BorderType::Rounded).title(" files ");
+    let diff_block = Block::new().borders(Borders::ALL).border_type(BorderType::Rounded);
+    let Some(d) = &v.data else {
+        f.render_widget(files_block, files_area);
+        f.render_widget(diff_block, diff_area);
+        f.render_widget(hints(&[("r", "refresh"), ("esc", "back")]), keys);
+        return;
+    };
+    if d.files.is_empty() {
+        f.render_widget(Paragraph::new("no changes yet").dim().block(files_block), files_area);
+    } else {
+        let rows: Vec<Row> = d
+            .files
+            .iter()
+            .map(|fc| {
+                let st = match fc.status {
+                    'A' | '?' => Style::new().fg(Color::Green),
+                    'D' => Style::new().fg(Color::Red),
+                    _ => Style::new().fg(Color::Yellow),
+                };
+                let nums = match (fc.added, fc.removed) {
+                    (Some(a), Some(r)) => format!("+{a} -{r}"),
+                    _ => "bin".into(),
+                };
+                Row::new(vec![
+                    Cell::from(Span::styled(if fc.status == '?' { "N".to_string() } else { fc.status.to_string() }, st)),
+                    Cell::from(fc.path.clone()),
+                    Cell::from(Span::styled(nums, Style::new().dim())),
+                ])
+            })
+            .collect();
+        let table = Table::new(rows, [Constraint::Length(1), Constraint::Min(8), Constraint::Length(9)])
+            .block(files_block)
+            .row_highlight_style(Style::new().bg(Color::DarkGray))
+            .highlight_symbol("▌");
+        let mut state = TableState::default().with_selected(Some(v.file));
+        f.render_stateful_widget(table, files_area, &mut state);
+    }
+
+    let path = d.files.get(v.file).map(|f| f.path.as_str()).unwrap_or("");
+    let text = d.diff_for(path);
+    let lines: Vec<Line> = text
+        .lines()
+        .skip(v.scroll as usize)
+        .map(|l| {
+            let style = if l.starts_with("+++") || l.starts_with("---") || l.starts_with("diff ") || l.starts_with("index ") || l.starts_with("new file") {
+                Style::new().dim()
+            } else if l.starts_with('+') {
+                Style::new().fg(Color::Green)
+            } else if l.starts_with('-') {
+                Style::new().fg(Color::Red)
+            } else if l.starts_with("@@") {
+                Style::new().fg(Color::Cyan)
+            } else {
+                Style::new()
+            };
+            Line::from(Span::styled(l.to_string(), style))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines).block(diff_block.title(format!(" {path} "))), diff_area);
+
+    let mut k = vec![("j/k", "file"), ("PgUp/PgDn", "scroll"), ("m", "merge"), ("P", "pull request"), ("K", "keep"), ("D", "discard"), ("r", "refresh"), ("esc", "back")];
+    if task.status != crate::tasks::TaskStatus::Running && task.status != crate::tasks::TaskStatus::Kept {
+        k.retain(|(key, _)| *key != "K");
+    }
+    f.render_widget(hints(&k), keys);
 }
 
 /// An agent attached inside the board, drawn from its vt100 screen.
@@ -534,6 +752,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  a, enter         attach full-screen    o       open inside the board"),
         Line::from("  K                kill                  d       remove finished"),
         Line::from("  e                keep on/off           R       rename"),
+        Line::from("  T                tasks                 v       review this agent's task"),
         Line::from("  ctrl+\\          leave an attached agent"),
         Line::from(""),
         Line::from("Board".bold()),

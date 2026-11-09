@@ -676,6 +676,7 @@ dependencies = [
  "hc-client",
  "libc",
  "ratatui",
+ "serde",
  "serde_json",
  "shell-words",
  "tokio",

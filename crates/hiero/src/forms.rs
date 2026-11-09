@@ -157,11 +157,13 @@ fn on_path(cmd: &str) -> bool {
 pub enum SpawnField {
     Agent,
     Folder,
+    Worktree,
     Task,
     Name,
 }
 
-const FIELDS: [SpawnField; 4] = [SpawnField::Agent, SpawnField::Folder, SpawnField::Task, SpawnField::Name];
+const FIELDS: [SpawnField; 5] =
+    [SpawnField::Agent, SpawnField::Folder, SpawnField::Worktree, SpawnField::Task, SpawnField::Name];
 
 pub struct SpawnForm {
     pub field: SpawnField,
@@ -170,7 +172,20 @@ pub struct SpawnForm {
     pub folder: TextInput,
     pub task: TextInput,
     pub name: TextInput,
+    /// Run in a new git worktree on its own branch (a task).
+    pub worktree: bool,
     pub error: Option<String>,
+}
+
+/// A task to create around the agent: worktree, branch and record.
+#[derive(Debug, Clone)]
+pub struct TaskSpec {
+    pub slug: String,
+    pub title: String,
+    pub prompt: String,
+    pub agent: String,
+    /// Where the person pointed the form; the worktree comes from its repo.
+    pub folder: PathBuf,
 }
 
 /// What to do once the form is valid.
@@ -178,6 +193,7 @@ pub struct SpawnPlan {
     pub params: RunParams,
     /// Typed into the terminal after it starts (shell tasks).
     pub send_after: Option<String>,
+    pub task: Option<TaskSpec>,
 }
 
 impl SpawnForm {
@@ -190,6 +206,7 @@ impl SpawnForm {
             field: if preselect.is_some() { SpawnField::Task } else { SpawnField::Agent },
             agents,
             agent,
+            worktree: git::probe(&expand_home(&folder)).is_some(),
             folder: TextInput::new(folder),
             task: TextInput::default(),
             name: TextInput::default(),
@@ -224,6 +241,14 @@ impl SpawnForm {
                     SpawnField::Folder => {
                         self.folder.handle(key);
                     }
+                    SpawnField::Worktree => {
+                        if matches!(
+                            key.code,
+                            KeyCode::Char(' ') | KeyCode::Char('x') | KeyCode::Left | KeyCode::Right
+                        ) {
+                            self.worktree = !self.worktree;
+                        }
+                    }
                     SpawnField::Task => {
                         self.task.handle(key);
                     }
@@ -238,7 +263,7 @@ impl SpawnForm {
 
     pub fn paste(&mut self, text: &str) {
         match self.field {
-            SpawnField::Agent => {}
+            SpawnField::Agent | SpawnField::Worktree => {}
             SpawnField::Folder => self.folder.insert_str(text.trim()),
             SpawnField::Task => self.task.insert_str(text),
             SpawnField::Name => self.name.insert_str(text.trim()),
@@ -247,6 +272,20 @@ impl SpawnForm {
 
     pub fn selected_agent(&self) -> Option<&AgentChoice> {
         self.agents.get(self.agent)
+    }
+
+    /// The branch slug a task would get (before de-duplication).
+    pub fn slug(&self) -> String {
+        let name = self.name.value().trim();
+        let task = self.task.value().trim();
+        let agent = self.selected_agent().map(|a| a.label.as_str()).unwrap_or("agent");
+        crate::worktree::slugify(if !name.is_empty() {
+            name
+        } else if !task.is_empty() {
+            task
+        } else {
+            agent
+        })
     }
 
     /// Validate and turn the form into a run request.
@@ -293,7 +332,29 @@ impl SpawnForm {
         if !task.is_empty() {
             params = params.label(LABEL_TASK, task.chars().take(200).collect::<String>());
         }
-        Ok(SpawnPlan { params, send_after })
+        let task_spec = if self.worktree {
+            if git::probe(&folder).is_none() {
+                return Err("not a git repo — turn worktree off (space on that line)".into());
+            }
+            let title = if !name.is_empty() {
+                name.to_string()
+            } else if !task.is_empty() {
+                let t: String = task.chars().take(60).collect();
+                if task.chars().count() > 60 { format!("{t}…") } else { t }
+            } else {
+                format!("{} session", agent.label)
+            };
+            Some(TaskSpec {
+                slug: self.slug(),
+                title,
+                prompt: task.clone(),
+                agent: agent.label.clone(),
+                folder: folder.clone(),
+            })
+        } else {
+            None
+        };
+        Ok(SpawnPlan { params, send_after, task: task_spec })
     }
 }
 
@@ -396,6 +457,7 @@ mod tests {
         let agents = vec![AgentChoice { label: "x".into(), detail: String::new(), kind }];
         let mut f = SpawnForm::new(agents, env!("CARGO_MANIFEST_DIR").into(), None);
         f.task = TextInput::new("fix the bug");
+        f.worktree = false;
         f
     }
 
@@ -413,6 +475,17 @@ mod tests {
         let p = form(AgentKind::Shell).plan().unwrap();
         assert!(p.params.argv.is_empty());
         assert_eq!(p.send_after.as_deref(), Some("fix the bug"));
+    }
+
+    #[test]
+    fn plans_a_task() {
+        let mut f = form(AgentKind::Command("claude".into()));
+        f.worktree = true;
+        let p = f.plan().unwrap();
+        let t = p.task.unwrap();
+        assert_eq!((t.slug.as_str(), t.title.as_str(), t.prompt.as_str()), ("fix-the-bug", "fix the bug", "fix the bug"));
+        f.name = TextInput::new("Login Fix");
+        assert_eq!(f.plan().unwrap().task.unwrap().slug, "login-fix");
     }
 
     #[test]

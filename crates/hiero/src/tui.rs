@@ -2,7 +2,8 @@
 //! attached agents and timers.
 
 use crate::app::{Action, App, Mode, PaneView};
-use crate::{attach, forms, keys, notify, ui};
+use crate::tasks::{self, TaskOp, TaskStatus};
+use crate::{attach, forms, keys, notify, ui, worktree};
 use anyhow::Result;
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, EventStream, KeyEventKind,
@@ -28,6 +29,8 @@ enum Msg {
     Preview { addr: String, result: Result<String, String>, lost: bool },
     Done { result: Result<String, String>, select: Option<String> },
     Templates(Vec<TemplateInfo>),
+    Doc(tasks::Doc),
+    Review { id: String, result: Result<worktree::Review, String> },
     PaneOpened { addr: String, name: String, cols: u16, rows: u16, result: Result<Box<AttachStream>, String> },
 }
 
@@ -216,6 +219,7 @@ async fn event_loop(
                 Msg::Connected(Ok((c, name))) => {
                     connecting = false;
                     load_templates(c.clone(), tx.clone());
+                    load_doc(c.clone(), tx.clone());
                     client = Some(c);
                     app.core_name = name;
                     app.preview.dirty = true;
@@ -240,6 +244,8 @@ async fn event_loop(
                     }
                 }
                 Msg::Templates(t) => app.on_templates(t),
+                Msg::Doc(doc) => app.on_doc(doc),
+                Msg::Review { id, result } => app.on_review(&id, result),
                 Msg::PaneOpened { addr, name, cols, rows, result } => match result {
                     Ok(stream) => {
                         app.enter_pane(PaneView::new(addr, name, cols, rows));
@@ -332,11 +338,180 @@ fn load_templates(c: Client, tx: mpsc::UnboundedSender<Msg>) {
     });
 }
 
+fn load_doc(c: Client, tx: mpsc::UnboundedSender<Msg>) {
+    tokio::spawn(async move {
+        match tasks::load(&c).await {
+            Ok(doc) => {
+                let _ = tx.send(Msg::Doc(doc));
+            }
+            Err(e) => tracing::debug!("doc: {e}"),
+        }
+    });
+}
+
+/// Run blocking git work off the async threads.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
+    tokio::task::spawn_blocking(f).await.map_err(|e| format!("git task failed: {e}"))?
+}
+
+/// Task actions: worktrees, records, merge / PR / keep / discard.
+async fn run_task_action(c: Client, action: Action, tx: mpsc::UnboundedSender<Msg>) {
+    let mut select = None;
+    let result: Result<String, String> = async {
+        match action {
+            Action::RunTask { mut params, send_after, spec } => {
+                let folder = spec.folder.clone();
+                let slug = spec.slug.clone();
+                let made = blocking(move || worktree::create(&folder, &slug)).await?;
+                let now = crate::app::now_ms();
+                let id = tasks::new_id(&made.slug, now);
+                params.cwd = Some(made.path.to_string_lossy().into_owned());
+                params.labels.insert(crate::app::LABEL_PROJECT.into(), worktree_project(&made.repo));
+                params.labels.insert("hiero.task_id".into(), id.clone());
+                if params.name.is_none() {
+                    params.name = Some(made.slug.clone());
+                }
+                let started = async {
+                    let t = c.run(&params).await.map_err(explain)?;
+                    if let Some(text) = &send_after {
+                        c.send(&t.address, text).await.map_err(explain)?;
+                    }
+                    Ok::<_, String>(t)
+                }
+                .await;
+                let t = match started {
+                    Ok(t) => t,
+                    Err(e) => {
+                        // Don't leave an empty worktree behind.
+                        let (repo, path, branch) = (made.repo.clone(), made.path.clone(), made.branch.clone());
+                        let _ = blocking(move || worktree::remove(&repo, &path, &branch)).await;
+                        return Err(e);
+                    }
+                };
+                let task = tasks::Task {
+                    id,
+                    title: spec.title,
+                    prompt: spec.prompt,
+                    agent: spec.agent,
+                    repo: made.repo.to_string_lossy().into_owned(),
+                    base_branch: made.base_branch,
+                    base_commit: made.base_commit,
+                    branch: made.branch.clone(),
+                    worktree: made.path.to_string_lossy().into_owned(),
+                    terminal: Some(t.address.clone()),
+                    created_ms: now,
+                    status: TaskStatus::Running,
+                    timeline: vec![],
+                    pr_url: None,
+                };
+                let doc = tasks::update(&c, &[TaskOp::Insert(Box::new(task))]).await?;
+                let _ = tx.send(Msg::Doc(doc));
+                select = Some(t.address.clone());
+                Ok(format!("started {} on {} in {}", t.display_name(), made.branch, crate::app::shorten_home(&made.path.to_string_lossy())))
+            }
+            Action::TaskOps(ops) => {
+                let doc = tasks::update(&c, &ops).await?;
+                let _ = tx.send(Msg::Doc(doc));
+                Ok(String::new())
+            }
+            Action::LoadReview(task) => {
+                let (wt, base) = (task.worktree.clone(), task.base_branch.clone());
+                let result = blocking(move || worktree::review(std::path::Path::new(&wt), &base)).await;
+                let _ = tx.send(Msg::Review { id: task.id.clone(), result });
+                Ok(String::new())
+            }
+            Action::TaskKeep(task) => {
+                let doc = tasks::update(&c, &[TaskOp::Status { id: task.id.clone(), status: TaskStatus::Kept, note: String::new() }]).await?;
+                let _ = tx.send(Msg::Doc(doc));
+                Ok(format!("kept {} in {}", task.branch, crate::app::shorten_home(&task.worktree)))
+            }
+            Action::TaskMerge(task) => {
+                stop_agent(&c, &task).await;
+                let t = task.clone();
+                blocking(move || {
+                    let (wt, repo) = (std::path::Path::new(&t.worktree), std::path::Path::new(&t.repo));
+                    worktree::commit_all(wt, &format!("hiero: {}", t.title))?;
+                    worktree::merge(repo, &t.base_branch, &t.branch, &format!("Merge task: {}", t.title))?;
+                    worktree::remove(repo, wt, &t.branch)
+                })
+                .await?;
+                let note = format!("merged into {}", task.base_branch);
+                let doc = tasks::update(&c, &[TaskOp::Status { id: task.id.clone(), status: TaskStatus::Merged, note }]).await?;
+                let _ = tx.send(Msg::Doc(doc));
+                Ok(format!("merged {} into {} and cleaned up", task.branch, task.base_branch))
+            }
+            Action::TaskPr(task) => {
+                let t = task.clone();
+                let url = blocking(move || {
+                    let (wt, repo) = (std::path::Path::new(&t.worktree), std::path::Path::new(&t.repo));
+                    worktree::commit_all(wt, &format!("hiero: {}", t.title))?;
+                    let body = if t.prompt.is_empty() { "Opened from Hiero.".to_string() } else { t.prompt.clone() };
+                    worktree::open_pr(wt, repo, &t.base_branch, &t.branch, &t.title, &body)
+                })
+                .await?;
+                let doc = tasks::update(
+                    &c,
+                    &[
+                        TaskOp::SetPr { id: task.id.clone(), url: url.clone() },
+                        TaskOp::Status { id: task.id.clone(), status: TaskStatus::Pr, note: format!("pull request {url}") },
+                    ],
+                )
+                .await?;
+                let _ = tx.send(Msg::Doc(doc));
+                Ok(format!("pull request: {url}"))
+            }
+            Action::TaskDiscard(task) => {
+                stop_agent(&c, &task).await;
+                let t = task.clone();
+                blocking(move || worktree::remove(std::path::Path::new(&t.repo), std::path::Path::new(&t.worktree), &t.branch)).await?;
+                let doc = tasks::update(&c, &[TaskOp::Status { id: task.id.clone(), status: TaskStatus::Discarded, note: String::new() }]).await?;
+                let _ = tx.send(Msg::Doc(doc));
+                Ok(format!("discarded {}", task.title))
+            }
+            _ => Ok(String::new()),
+        }
+    }
+    .await;
+    if result.as_ref().is_ok_and(|m| m.is_empty()) && select.is_none() {
+        return;
+    }
+    let _ = tx.send(Msg::Done { result, select });
+}
+
+/// Kill the task's agent (if it still runs) and remove its finished record.
+async fn stop_agent(c: &Client, task: &tasks::Task) {
+    if let Some(addr) = &task.terminal {
+        if c.get(addr).await.is_ok_and(|t| t.is_live()) {
+            let _ = c.kill(addr).await;
+        }
+        let _ = c.rm(addr).await;
+    }
+}
+
+fn worktree_project(repo: &Path) -> String {
+    repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+fn explain(e: hc_client::Error) -> String {
+    Explain::from(e).0
+}
+
 /// Run one request-style action and report back.
 fn run_action(c: Client, action: Action, tx: mpsc::UnboundedSender<Msg>) {
-    if matches!(action, Action::LoadTemplates) {
-        load_templates(c, tx);
-        return;
+    match action {
+        Action::LoadTemplates => return load_templates(c, tx),
+        Action::LoadDoc => return load_doc(c, tx),
+        Action::RunTask { .. }
+        | Action::TaskOps(_)
+        | Action::LoadReview(_)
+        | Action::TaskMerge(_)
+        | Action::TaskPr(_)
+        | Action::TaskKeep(_)
+        | Action::TaskDiscard(_) => {
+            tokio::spawn(run_task_action(c, action, tx));
+            return;
+        }
+        _ => {}
     }
     tokio::spawn(async move {
         let mut select = None;
@@ -381,10 +556,7 @@ fn run_action(c: Client, action: Action, tx: mpsc::UnboundedSender<Msg>) {
                         file.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default()
                     )
                 }
-                Action::LoadTemplates
-                | Action::AttachFull(_)
-                | Action::AttachPane(_)
-                | Action::EditTemplate(_) => String::new(),
+                _ => String::new(),
             };
             Ok::<_, Explain>(msg)
         }

@@ -27,8 +27,8 @@ herdr-core's document store. Close Hiero, reopen it, and everything is still the
 | 1 | Agent board (MVP) | ✅ done |
 | 2 | Drive agents: spawn, actions, attach | ✅ done |
 | 3 | Status bridge for Claude Code, codex, pi | ✅ done |
-| 4 | Tasks and git worktrees | ⏳ next |
-| 5 | Orchestration: pipelines, broadcast, machines | ☐ |
+| 4 | Tasks and git worktrees | ✅ done |
+| 5 | Orchestration: pipelines, broadcast, machines | ⏳ next |
 | 6 | Polish: usage, config, packaging | ☐ |
 
 ## Development phases
@@ -96,20 +96,31 @@ So the bridge covers older Claude versions and other agents:
 **Done when:** Claude agents show accurate working, blocked and done states on the board. ✅
 (verified with real Claude Code 2.1.319 sessions)
 
-### Phase 4: Tasks and git worktrees
+### Phase 4: Tasks and git worktrees ✅
 **Goal:** run parallel agents on one repo without them colliding.
 
 A [git worktree](https://git-scm.com/docs/git-worktree) is a second working folder for the
 same repo with its own branch checked out, so each agent gets its own copy of the code but
 everything shares one history.
 
-- [ ] Task record saved in doc `hiero`: title, prompt, agent, repo, branch, worktree, status timeline, outcome
-- [ ] New task creates `../<repo>.hiero/<task>` on its own branch and starts the agent there
-- [ ] Review view: diff stat and file diff of the task branch
-- [ ] Merge, open a PR (`gh pr create`), keep or discard (removes the worktree and branch)
-- [ ] Turn history from `turn` events
+- [x] New-agent form has a **worktree** switch (on by default inside a git repo): Hiero makes
+  `../<repo>.hiero/<slug>` on branch `hiero/<slug>` from the repo's HEAD and starts the agent there
+  (`slug-2`, `slug-3`… when taken; the worktree is removed again if the agent fails to start)
+- [x] Task records in herdr-core doc `hiero`: title, prompt, agent, repo, base branch/commit, branch,
+  worktree, terminal, status, timeline, PR URL. Retries on conflicting writes; unknown keys kept
+- [x] Timeline: turn ends (`turn 2 ended: done`), blocked / error / exited, and every decision
+- [x] **Review** (`v` on an agent, or `Enter` in the task list): files changed since the fork point,
+  including uncommitted edits and new files; coloured diff; commits ahead; uncommitted marker
+- [x] **Merge** (`m`): stops the agent, commits leftovers (`hiero: <title>`), `merge --no-ff` into the
+  base branch, removes worktree, branch and the empty `<repo>.hiero/`. Refuses if the main tree is
+  on another branch or has uncommitted changes; aborts cleanly on conflicts
+- [x] **Pull request** (`P`): commits leftovers, pushes, `gh pr create`; keeps the worktree
+- [x] **Keep** (`K`) and **discard** (`D`: stops the agent, deletes worktree and branch)
+- [x] Task list (`T`): status, branch, agent, age; `g` jumps to the agent; `D` forgets finished tasks
 
-**Done when:** you can start 3 tasks on one repo, review each diff, and merge or discard them.
+**Done when:** you can start 3 tasks on one repo, review each diff, and merge or discard them. ✅
+(tested from the board with shell agents and a real Claude agent: create → review → merge, discard,
+PR error path, task list)
 
 ### Phase 5: Orchestration
 **Goal:** agents working together.
@@ -138,6 +149,10 @@ Tracked here until fixed. ✅ = fixed.
 | 5 | For agents on PATH the task goes in as the last argument (`claude "<task>"`). | Agents that take their prompt differently start without the task. | Use a template for those; later, per-agent launch settings in Hiero's config. |
 | 6 | The Windows toast (WSL) is sent with exit code 0, but nobody has confirmed it actually appears. | Desktop notifications may be silent on WSL; the bell still rings. | Confirm on a real desktop; fall back to `wsl-notify-send` if needed. |
 | 7 | Rename is stored as a `hiero.name` label because hc has no rename. | `hc ls` and other tools still show the original name. | Use a real rename if herdr-core adds one. |
+| 10 | Pull requests (`P`) are only tested up to the push failing cleanly (no remote here); `gh pr create` itself is untested. | The PR step may need fixes on first real use. | Test against a real GitHub repo. |
+| 11 | Merge needs the main working tree on the task's base branch with no uncommitted changes, and stops at conflicts (it undoes the merge and says so). | You resolve conflicts by hand: attach to the agent or work in the worktree, then merge again. | A "rebase onto base" action, and letting the agent resolve conflicts. |
+| 12 | Every running Hiero writes timeline notes, so two boards open at once record each note twice. | Duplicate timeline lines. | Let only one Hiero write notes (a lease in the doc). |
+| 13 | New files show in review only up to 500 lines; binary files show as "(binary file)". | Large generated files are cut short in the diff view. | Fine for review; open the worktree for the rest. |
 | ✅ | Real coding agents showed `·` (no status). | — | Phase 3: Claude Code 2.1.319 reports natively (verified); hooks cover older versions; `hiero report` for others. |
 | ✅ | Only tested with shells and fake agents. | — | Phase 3: verified with real Claude Code sessions (working, blocked:permission, done). |
 | ✅ | Coming back from full-screen attach quit the board: ratatui's `clear()` asks for the cursor position and the reply was lost. | — | Fixed in Phase 2: clear the screen directly and build a fresh terminal handle. |
@@ -196,6 +211,8 @@ hiero report blocked --kind question --msg "pick a database"   # from inside an 
 | `e` | keep on/off (a lost program is replaced by a shell) |
 | `R` | rename |
 | `t` | templates: `r` run · `e` edit · `n` new · `D` delete |
+| `v` | review this agent's task: `j`/`k` file · `PgUp`/`PgDn` scroll · `m` merge · `P` pull request · `K` keep · `D` discard · `r` refresh |
+| `T` | task list: `Enter` review · `g` go to agent · `D` forget a finished task |
 | `?` | help |
 | `q` / `Ctrl+C` | quit |
 
@@ -231,6 +248,8 @@ crates/
     ├── attach.rs     full-screen attach
     ├── keys.rs       key events → terminal bytes
     ├── integrate.rs  status bridge: hooks, report, installers
+    ├── tasks.rs      task records in doc "hiero"
+    ├── worktree.rs   git worktrees: create, review, merge, PR, remove
     ├── git.rs        repo root and branch, read from .git
     └── notify.rs     bell and desktop notifications
 ```
