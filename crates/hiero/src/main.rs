@@ -118,11 +118,12 @@ enum Debug {
     /// Type raw bytes into a terminal over an attach stream.
     /// Escapes: \r \n \t \e \\ and \xNN.
     Type { terminal: String, text: String },
-    /// Read or write Hiero's document in the core.
+    /// Read or write a document in the core (the workspaces are `hiero-ws`).
     Doc {
         /// JSON to store; omit to read.
         value: Option<String>,
-        #[arg(long, default_value = "hiero")]
+        /// Which document; no default, so a write never lands on the wrong one.
+        #[arg(long)]
         name: String,
     },
 }

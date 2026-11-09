@@ -203,7 +203,7 @@ hiero debug events                     # follow live events
 hiero debug read t1 --lines 50         # a terminal's screen
 hiero debug keys                       # what your terminal sends (to check a prefix key)
 hiero debug type t1 'ls\r'             # type raw bytes over an attach stream (\r \n \t \e \xNN)
-hiero debug doc [JSON] [--name hiero]   # read or write a document
+hiero debug doc --name hiero-ws [JSON]  # read or write a document (the name is required)
 ```
 
 Projects and workspaces are named exactly on the command line. Folders must exist.
