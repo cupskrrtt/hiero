@@ -24,8 +24,8 @@ herdr-core's document store. Close Hiero, reopen it, and everything is still the
 | Phase | What | State |
 |---|---|---|
 | 0 | Foundation: `hc-client` library | ✅ done |
-| 1 | Agent board (MVP) | ⏳ next |
-| 2 | Drive agents: spawn, actions, attach | ☐ |
+| 1 | Agent board (MVP) | ✅ done |
+| 2 | Drive agents: spawn, actions, attach | ⏳ next |
 | 3 | Status bridge for Claude Code, codex, pi | ☐ |
 | 4 | Tasks and git worktrees | ☐ |
 | 5 | Orchestration: pipelines, broadcast, machines | ☐ |
@@ -48,15 +48,15 @@ herdr-core's document store. Close Hiero, reopen it, and everything is still the
 
 **Done when:** `hiero debug events` prints live events while you use `hc` in another shell.
 
-### Phase 1: Agent board (MVP)
+### Phase 1: Agent board (MVP) ✅
 **Goal:** see every agent and what state it's in, at a glance.
 
-- [ ] Full-screen ratatui board: name, agent, status (● working / ◐ blocked / ✓ done / ✗ error / – none), cwd, branch, runtime, title
-- [ ] **Needs-you** section at the top: blocked, done or errored agents, sorted by how long they've waited
-- [ ] Preview pane: the selected agent's last ~50 lines, refreshed on change
-- [ ] Group or filter by project (cwd or the `hiero.project` label); fuzzy search with `/`
-- [ ] Desktop notification and terminal bell when an agent moves into blocked or done
-- [ ] Banner when disconnected from the core, with automatic recovery
+- [x] Full-screen ratatui board: name, agent, status (● working / ◐ blocked / ✓ done / ✗ error / – none), cwd, branch, runtime, title
+- [x] **Needs-you** section at the top: blocked, done or errored agents, sorted by how long they've waited
+- [x] Preview pane: the selected agent's last ~50 lines, refreshed on change
+- [x] Group or filter by project (cwd or the `hiero.project` label); fuzzy search with `/`
+- [x] Desktop notification and terminal bell when an agent moves into blocked or done
+- [x] Banner when disconnected from the core, with automatic recovery
 
 **Done when:** you can watch 3–5 agents and the ones waiting for you stand out right away.
 
@@ -123,6 +123,7 @@ Requires a running herdr-core (`hc server status`) and a Rust toolchain.
 ```sh
 cargo build
 cargo test
+cargo run -p hiero                          # the board
 
 cargo run -p hiero -- debug status          # handshake and core info
 cargo run -p hiero -- debug ls --all        # terminals
@@ -136,6 +137,34 @@ cargo run -p hiero -- debug doc '{"hello":"world"}'   # write doc "hiero"; omit 
 | `HC_SOCKET` | Use this core socket |
 | `HC_SESSION` | Use a separate hc session (default `default`) |
 | `HIERO_LOG` | Log level, for example `debug` or `hc_client=trace` |
+| `HIERO_NO_NOTIFY` | Turn off desktop notifications (the bell still rings) |
+
+### Board keys
+
+| Key | Action |
+|---|---|
+| `j` `k` / `↑` `↓` | select |
+| `g` `G` | first / last |
+| `n` / `Tab` | next agent that needs you |
+| `x` | dismiss from NEEDS YOU (comes back on its next status change) |
+| `/` | fuzzy search; `Esc` clears |
+| `p` | group by project on/off |
+| `f` | show finished terminals on/off |
+| `J` `K` / `PgDn` `PgUp` | scroll the preview |
+| `r` | refresh the preview |
+| `?` | help |
+| `q` / `Ctrl+C` | quit |
+
+Status symbols: `●` working · `◐` blocked · `✓` done · `✗` error · `○` idle · `·` no status · `■` finished.
+Notifications use `notify-send` when present, otherwise a Windows toast on WSL.
+
+Try it with fake agents that report status (OSC 7501):
+
+```sh
+hc run --bg --name worker sh -c "printf '\033]7501;state=working\033\\\\'; sleep 600"
+hc run --bg --name asker  sh -c "sleep 3; printf '\033]7501;state=blocked:kind=permission\033\\\\'; sleep 600"
+```
+
 
 ## Layout
 
@@ -149,7 +178,12 @@ crates/
 │   ├── events.rs     subscribe, notifications, Watcher
 │   └── state.rs      TerminalSet
 └── hiero/src/
-    └── main.rs       CLI (board UI from Phase 1)
+    ├── main.rs       CLI entry
+    ├── tui.rs        event loop: keys, core events, screen reads, timers
+    ├── app.rs        board state and behaviour (tested, no I/O)
+    ├── ui.rs         drawing
+    ├── git.rs        repo root and branch, read from .git
+    └── notify.rs     bell and desktop notifications
 integrations/         agent hook scripts (Phase 3)
 ```
 

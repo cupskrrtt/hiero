@@ -1,3 +1,9 @@
+mod app;
+mod git;
+mod notify;
+mod tui;
+mod ui;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use hc_client::{AgentState, Client, Filter, TerminalSet, WatchMsg, Watcher, endpoint};
@@ -59,10 +65,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        None => {
-            eprintln!("The board UI arrives in Phase 1. For now try `hiero debug --help`.");
-            Ok(())
-        }
+        None => tui::run().await,
         Some(Command::Debug(d)) => debug(d).await,
     }
 }
