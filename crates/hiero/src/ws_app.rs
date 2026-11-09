@@ -3,9 +3,9 @@
 //! loop (`ws_tui`) carries out the [`Action`]s this asks for, so all of it
 //! can be tested.
 
-use crate::app::{Alert, BoardStart, LABEL_AGENT, PaneView, status_from_labels};
+use crate::notify::Alert;
+use crate::widgets::{PaneView, TextInput, expand_home};
 use crate::config::Prefix;
-use crate::forms::{TextInput, expand_home};
 use crate::keys::{self, MouseAct};
 use crate::workspace::{self, Border, Dir, Move, Tab, Workspace, WsDoc, WsOp, WsStatus, new_id};
 use crate::ws_ui;
@@ -93,8 +93,6 @@ pub enum Action {
     Kill(Vec<String>),
     /// Start a pane's terminal in the background (no attach) and record it.
     Start { pane: String, params: RunParams },
-    /// Hand the screen to the old board, opened on this view.
-    Board(BoardStart),
 }
 
 /// What a pane's terminal needs.
@@ -232,19 +230,7 @@ pub enum Dialog {
     Help(usize),
     Form(Form),
     Confirm { kind: ConfirmKind, message: String },
-    /// The menu of the old views; the index is the cursor.
-    Menu(usize),
 }
-
-/// The menu entries, in order.
-pub const MENU: [(&str, BoardStart); 6] = [
-    ("Agents board", BoardStart::Board),
-    ("Tasks", BoardStart::Tasks),
-    ("Pipelines", BoardStart::Pipelines),
-    ("Usage", BoardStart::Usage),
-    ("Templates", BoardStart::Templates),
-    ("Broadcast", BoardStart::Broadcast),
-];
 
 /// What a key press means for the program in the pane.
 #[derive(Debug, PartialEq)]
@@ -519,7 +505,6 @@ impl WsApp {
                 // were missed), so what the panes show may be out of date.
                 let again = self.connected_once;
                 self.set.apply_watch(msg);
-                self.set.terminals.values_mut().for_each(status_from_labels);
                 self.disconnected = None;
                 self.connected_once = true;
                 // A fresh snapshot is a new baseline, not a change.
@@ -548,9 +533,6 @@ impl WsApp {
                     self.actions.push(Action::LoadDoc);
                 }
                 self.set.apply(e);
-                if let Some(t) = e.terminal.as_deref().and_then(|a| self.set.terminals.get_mut(a)) {
-                    status_from_labels(t);
-                }
                 self.status_alerts()
             }
         }
@@ -629,13 +611,6 @@ impl WsApp {
     fn size_of(&self, pane: &str) -> (u16, u16) {
         let r = self.pane_rects().into_iter().find(|(id, _)| id == pane).map(|(_, r)| r);
         Self::inner(r.unwrap_or(self.panes_area))
-    }
-
-    /// The screen goes to the board for a while: drop every pane's stream
-    /// state. `sync` opens them again (attaching to the same terminals).
-    pub fn suspend(&mut self) {
-        self.slots.clear();
-        self.zoom = None;
     }
 
     /// The screen changed size (or the banner came or went).
@@ -864,7 +839,7 @@ impl WsApp {
         let mut slot = Slot { attempt, view: None, error: None, idle: false, size: (cols, rows), lost: false };
         match &p {
             Plan::Ended { addr, why, .. } => {
-                let mut view = PaneView::new(addr.clone(), addr.clone(), cols, rows);
+                let mut view = PaneView::new(addr.clone(), cols, rows);
                 view.ended = Some(why.clone());
                 slot.view = Some(view);
                 self.slots.insert(pane.to_string(), slot);
@@ -915,7 +890,7 @@ impl WsApp {
         let ok = result.is_ok();
         match result {
             Ok((addr, cols, rows)) => {
-                slot.view = Some(PaneView::new(addr.clone(), addr, cols, rows));
+                slot.view = Some(PaneView::new(addr.clone(), cols, rows));
                 slot.size = (cols, rows);
                 slot.error = None;
             }
@@ -934,7 +909,7 @@ impl WsApp {
             StreamMsg::Data(bytes) => view.parser.process(&bytes),
             StreamMsg::Resize { .. } => {}
             StreamMsg::Closed(reason) => {
-                view.ended = Some(crate::attach::describe_close(reason.as_ref()));
+                view.ended = Some(crate::widgets::describe_close(reason.as_ref()));
                 if let Some(slot) = self.slots.get_mut(pane) {
                     slot.lost = true;
                 }
@@ -1282,7 +1257,6 @@ impl WsApp {
             KeyCode::Char('>') => self.resize_sidebar(true),
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.dialog = Some(Dialog::Help(0)),
-            KeyCode::Char('m') => self.dialog = Some(Dialog::Menu(0)),
             KeyCode::Char('n') => self.add_workspace_form(),
             KeyCode::Char('N') => self.add_project_form(),
             KeyCode::Char('t') => self.new_tab(None),
@@ -1681,23 +1655,6 @@ impl WsApp {
                 KeyCode::Char('n' | 'N') | KeyCode::Esc => self.dialog = None,
                 _ => {}
             },
-            Some(Dialog::Menu(i)) => match k.code {
-                KeyCode::Char('j') | KeyCode::Down => *i = (*i + 1).min(MENU.len() - 1),
-                KeyCode::Char('k') | KeyCode::Up => *i = i.saturating_sub(1),
-                KeyCode::Enter => {
-                    let start = MENU[*i].1;
-                    self.dialog = None;
-                    // The prompt would have no one to send to: say so here
-                    // instead of opening the board for nothing.
-                    if start == BoardStart::Broadcast && live_agents(&self.set) == 0 {
-                        self.flash_info("no live agents to broadcast to");
-                    } else {
-                        self.actions.push(Action::Board(start));
-                    }
-                }
-                KeyCode::Esc | KeyCode::Char('q') => self.dialog = None,
-                _ => {}
-            },
             Some(Dialog::Form(f)) => match k.code {
                 KeyCode::Esc => self.dialog = None,
                 KeyCode::Tab | KeyCode::Down => f.focus = (f.focus + 1) % f.fields.len(),
@@ -1820,16 +1777,6 @@ impl WsApp {
             FormKind::NewSplit { pane, dir } => (self.split_ops(pane, *dir, command(&form.fields[0].input)), None, None),
         })
     }
-}
-
-/// What was typed into a command prompt; empty means the shell.
-/// Live terminals that look like agents: they report a status or were
-/// started as one. Plain shells and editors are not.
-pub fn live_agents(set: &TerminalSet) -> usize {
-    set.terminals
-        .values()
-        .filter(|t| t.is_live() && (t.status.is_some() || t.labels.contains_key(LABEL_AGENT) || t.template.is_some()))
-        .count()
 }
 
 fn command(input: &TextInput) -> Option<String> {
@@ -2891,69 +2838,6 @@ mod tests {
     }
 
     #[test]
-    fn menu_moves_and_picks_a_view() {
-        let mut a = app();
-        a.focus = Focus::Workspace;
-        a.on_key(ctrl_space());
-        a.on_key(key('m'));
-        assert!(matches!(a.dialog, Some(Dialog::Menu(0))));
-        a.on_key(key('j'));
-        a.on_key(code(KeyCode::Down));
-        assert!(matches!(a.dialog, Some(Dialog::Menu(2))));
-        a.on_key(key('k'));
-        a.on_key(code(KeyCode::Enter));
-        assert!(a.dialog.is_none());
-        assert!(matches!(&a.actions[..], [Action::Board(BoardStart::Tasks)]));
-        a.actions.clear();
-        // The list stops at both ends, and the last entry is Broadcast.
-        a.on_key(ctrl_space());
-        a.on_key(key('m'));
-        for _ in 0..10 {
-            a.on_key(key('j'));
-        }
-        a.on_key(code(KeyCode::Enter));
-        assert!(a.actions.is_empty(), "no agents: no board");
-        assert!(a.current_flash().is_some_and(|(m, e)| !e && m == "no live agents to broadcast to"));
-        // A shell is not an agent; one that reports a status is.
-        a.set.terminals.insert("sh".into(), terminal("sh", true));
-        assert_eq!(live_agents(&a.set), 0);
-        let mut agent = terminal("ag", true);
-        agent.status = serde_json::from_value(serde_json::json!({"state": "working", "app": "claude-code"})).unwrap();
-        a.set.terminals.insert("ag".into(), agent);
-        let mut ended = finished("old", "exited", Some(0));
-        ended.status = a.set.terminals["ag"].status.clone();
-        a.set.terminals.insert("old".into(), ended);
-        assert_eq!(live_agents(&a.set), 1);
-        a.on_key(ctrl_space());
-        a.on_key(key('m'));
-        for _ in 0..10 {
-            a.on_key(key('j'));
-        }
-        a.on_key(code(KeyCode::Enter));
-        assert!(matches!(&a.actions[..], [Action::Board(BoardStart::Broadcast)]));
-        a.actions.clear();
-        // Esc closes without a board.
-        a.on_key(ctrl_space());
-        a.on_key(key('m'));
-        a.on_key(code(KeyCode::Esc));
-        assert!(a.dialog.is_none() && a.actions.is_empty());
-    }
-
-    #[test]
-    fn suspend_drops_the_streams_and_sync_reattaches_the_same_terminals() {
-        let (mut a, _) = two_tabs();
-        a.set.terminals.insert("t-n-w1".into(), terminal("t-n-w1", true));
-        a.slots.clear();
-        a.sync();
-        attach_pending(&mut a);
-        a.suspend();
-        assert!(a.slots.is_empty());
-        a.sync();
-        let o = opens(&mut a);
-        assert!(matches!(&o[..], [Plan::Attach { addr, .. }] if addr == "t-n-w1"));
-    }
-
-    #[test]
     fn help_scrolls_and_any_other_key_closes() {
         let mut a = app();
         a.set_screen(Rect::new(0, 0, 80, 24));
@@ -3782,7 +3666,7 @@ mod tests {
         // A drag that was underway is dropped when a dialog appears.
         a.dialog = None;
         mouse(&mut a, K::Down(MouseButton::Left), 30, 5).unwrap();
-        a.dialog = Some(Dialog::Menu(0));
+        a.dialog = Some(Dialog::Help(0));
         assert_eq!(mouse(&mut a, K::Up(MouseButton::Left), 30, 5), None);
         a.dialog = None;
         assert_eq!(mouse(&mut a, K::Drag(MouseButton::Left), 31, 5), None);

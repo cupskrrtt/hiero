@@ -1,8 +1,7 @@
 //! The workspace model: projects hold named workspaces, a workspace holds
 //! tabs, a tab holds a tree of split panes, and each pane is one hc terminal.
 //!
-//! Stored in its own herdr-core document `hiero-ws`, apart from the task
-//! document, so the two can change without touching each other. Every change
+//! Stored in its own herdr-core document `hiero-ws`. Every change
 //! is a [`WsOp`] applied by the pure [`apply`], which keeps it easy to test;
 //! [`update`] does the read-modify-write against the core.
 

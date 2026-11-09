@@ -1,9 +1,8 @@
 //! The workspace screen's event loop: keys, core events, the attached panes.
-//! Same shape as the board's loop (`tui`), without the board's state.
 
 use crate::workspace::{self, WsDoc, WsOp};
 use crate::ws_app::{Action, Out, Plan, WsApp};
-use crate::{config, keys, notify, tui, ws_ui};
+use crate::{config, keys, notify, ws_ui};
 use anyhow::Result;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event as TermEvent, EventStream, KeyEventKind,
@@ -106,8 +105,7 @@ async fn event_loop(
     path: PathBuf,
     config_error: Option<String>,
 ) -> Result<()> {
-    let remember = config::get().board.remember;
-    let saved = if remember { config::load_ui_state() } else { config::UiState::default() };
+    let saved = config::load_ui_state();
     let mut app = WsApp::new(config::get().prefix(), saved.workspace);
     app.set_sidebar(saved.sidebar_width, saved.sidebar_hidden);
     app.auto_restore = config::get().workspace.restore;
@@ -115,6 +113,9 @@ async fn event_loop(
     if let Some(e) = config_error {
         tracing::warn!("{e}");
         app.flash_error(&format!("config ignored: {e}"));
+    } else if let Some(w) = config::get().ignored_warning() {
+        tracing::warn!("{w}");
+        app.flash_info(&w);
     }
     let mut keys = EventStream::new();
 
@@ -194,30 +195,6 @@ async fn event_loop(
                     }
                     None => app.on_started(&pane, Err("not connected to herdr-core".into())),
                 },
-                Action::Board(start) => {
-                    // Let go of the screen and the streams (the programs keep
-                    // running), run the board here, then take everything back.
-                    for (_, h) in handles.drain() {
-                        let _ = h.cmd.send(PaneCmd::Close);
-                    }
-                    last_focus = None;
-                    app.suspend();
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    drop(keys);
-                    let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
-                    ratatui::restore();
-                    let r = tui::run_board(start, None).await;
-                    tui::resume(term)?;
-                    if config::get().workspace.mouse {
-                        execute!(std::io::stdout(), EnableMouseCapture)?;
-                    }
-                    keys = EventStream::new();
-                    // Events from before were not read; a new snapshot is a clean baseline.
-                    *watch = Watcher::spawn(path.clone(), Filter::default());
-                    if let Err(e) = r {
-                        app.flash_error(&format!("board: {e}"));
-                    }
-                }
                 Action::Open { plan, attempt, cols, rows } => match &client {
                     Some(c) => {
                         tokio::spawn(open_pane(c.clone(), path.clone(), plan, attempt, (cols, rows), tx.clone()));
@@ -341,13 +318,11 @@ async fn event_loop(
             break;
         }
     }
-    if remember {
-        let mut state = config::load_ui_state();
-        state.workspace = app.open.clone();
-        state.sidebar_width = Some(app.sidebar_w);
-        state.sidebar_hidden = app.sidebar_hidden;
-        config::save_ui_state(&state);
-    }
+    let mut state = config::load_ui_state();
+    state.workspace = app.open.clone();
+    state.sidebar_width = Some(app.sidebar_w);
+    state.sidebar_hidden = app.sidebar_hidden;
+    config::save_ui_state(&state);
     // Detach every stream cleanly; the programs keep running.
     for (_, h) in handles.drain() {
         let _ = h.cmd.send(PaneCmd::Close);

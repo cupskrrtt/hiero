@@ -1,8 +1,8 @@
 //! Drawing the workspace screen: sidebar, pane area, bottom bar, dialogs.
 
-use crate::ui::{draw_input, draw_vt, popup};
+use crate::widgets::{draw_input, draw_vt, popup};
 use crate::workspace::{Workspace, WsStatus};
-use crate::ws_app::{Dialog, Focus, Form, MENU, Row, WsApp};
+use crate::ws_app::{Dialog, Focus, Form, Row, WsApp};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -94,7 +94,6 @@ pub fn draw(f: &mut Frame, app: &WsApp) {
     draw_bottom(f, app, a.bottom);
     match &app.dialog {
         Some(Dialog::Help(top)) => draw_help(f, f.area(), &app.prefix.label(), *top),
-        Some(Dialog::Menu(i)) => draw_menu(f, f.area(), *i),
         Some(Dialog::Form(form)) => draw_form(f, form, f.area()),
         Some(Dialog::Confirm { message, .. }) => {
             let w = (message.chars().count() as u16 + 4).min(f.area().width.saturating_sub(4)).max(30);
@@ -262,19 +261,19 @@ fn draw_bottom(f: &mut Frame, app: &WsApp, area: Rect) {
     if app.armed {
         spans.push(Span::styled(" prefix ", Style::new().bg(Color::Yellow).fg(Color::Black).bold()));
         spans.push(Span::raw(
-            " t/T tab · v/s split (V/S ask) · hjkl move · HJKL size · 1-9 [ ] tab · r/R rename tab/pane · x/X close · z zoom · w sidebar · b hide · < > size · m menu · ? help",
+            " t/T tab · v/s split (V/S ask) · hjkl move · HJKL size · 1-9 [ ] tab · r/R rename tab/pane · x/X close · z zoom · w sidebar · b hide · < > size · ? help",
         ));
     } else if let Some((msg, error)) = app.current_flash() {
         let style = if error { Style::new().fg(Color::Red) } else { Style::new().fg(Color::Green) };
         spans.push(Span::styled(format!(" {msg}"), style));
     } else if app.focus == Focus::Sidebar {
         spans.push(Span::styled(
-            format!(" j/k move · enter open · a add · A project · r rename · D delete · J/K reorder · esc back · {label} m menu"),
+            format!(" j/k move · enter open · a add · A project · r rename · D delete · J/K reorder · esc back · {label}"),
             Style::new().dim(),
         ));
     } else {
         spans.push(Span::styled(format!(" {label}"), Style::new().bold()));
-        spans.push(Span::styled(" then  t tab · v s split · hjkl move · z zoom · m menu · ? help · q quit", Style::new().dim()));
+        spans.push(Span::styled(" then  t tab · v s split · hjkl move · z zoom · ? help · q quit", Style::new().dim()));
     }
     let right = app.attention().map(|(p, w)| Span::styled(format!("◐ {p} › {w} needs you "), Style::new().fg(Color::Red).bold()));
     let rw = right.as_ref().map(|s| s.width() as u16).unwrap_or(0);
@@ -322,7 +321,6 @@ pub fn help_lines(prefix: &str) -> Vec<Line<'static>> {
         Line::from("  b          hide or show the sidebar"),
         Line::from("  < / >      narrower / wider sidebar"),
         Line::from("  n / N      new workspace in this project / new project"),
-        Line::from("  m          menu: agents board, tasks, pipelines, usage, templates, broadcast"),
         Line::from("  ?          this help        q   quit Hiero (terminals keep running)"),
         Line::from(format!("  {prefix}   send the prefix key itself to the program")),
         Line::from("  esc        cancel"),
@@ -354,20 +352,4 @@ fn draw_help(f: &mut Frame, area: Rect, prefix: &str, top: usize) {
             .block(Block::new().borders(Borders::ALL).border_type(BorderType::Rounded).title(title)),
         r,
     );
-}
-
-/// The menu of the old views.
-fn draw_menu(f: &mut Frame, area: Rect, cursor: usize) {
-    let inner = popup(f, area, 34, MENU.len() as u16 + 4, "menu");
-    let mut lines: Vec<Line> = MENU
-        .iter()
-        .enumerate()
-        .map(|(i, (name, _))| {
-            let style = if i == cursor { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
-            Line::from(Span::styled(format!(" {name:<30}"), style))
-        })
-        .collect();
-    lines.push(Line::from(""));
-    lines.push(Line::from("j/k move · enter open · esc").dim());
-    f.render_widget(Paragraph::new(lines), inner);
 }

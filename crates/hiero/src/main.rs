@@ -1,18 +1,8 @@
-mod app;
-mod attach;
 mod config;
-mod forms;
-mod git;
-mod integrate;
 mod keys;
 mod notify;
-mod pipeline;
-mod tasks;
-mod tui;
-mod ui;
-mod usage;
+mod widgets;
 mod workspace;
-mod worktree;
 mod ws_app;
 mod ws_tui;
 mod ws_ui;
@@ -30,8 +20,7 @@ use hc_client::{AgentState, Client, Filter, TerminalSet, WatchMsg, Watcher, endp
         Run `hiero` with no command to open the workspace: a sidebar of projects and named \
         workspaces, and tabs and splits of terminals (nvim, Claude Code, shells) that keep \
         running when you quit. Hiero's keys sit behind a prefix key (default ctrl+b); press \
-        the prefix then ? for help. The agent tools (board, tasks, pipelines, usage, templates, \
-        broadcast) are in the prefix menu (m), or `hiero board`."
+        the prefix then ? for help."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -46,64 +35,14 @@ enum Command {
     /// Low-level checks against the running core.
     #[command(subcommand)]
     Debug(Debug),
-    /// Install or remove the status bridge for an agent.
-    Integrate {
-        /// The agent: claude.
-        agent: String,
-        /// Remove Hiero's hooks instead.
-        #[arg(long)]
-        uninstall: bool,
-        /// Only show what's installed.
-        #[arg(long)]
-        status: bool,
-        /// Settings file (default: ~/.claude/settings.json).
-        #[arg(long)]
-        settings: Option<std::path::PathBuf>,
-        /// Hiero binary the hooks run (default: this one).
-        #[arg(long)]
-        exe: Option<std::path::PathBuf>,
-        /// Install even if the agent reports status by itself.
-        #[arg(long)]
-        force: bool,
-    },
-    /// Report a status for the hc terminal this runs in (for any agent or script).
-    Report {
-        /// idle, working, done, blocked, error or clear.
-        state: String,
-        /// For blocked: permission, question or auth.
-        #[arg(long)]
-        kind: Option<String>,
-        /// A short message shown on the board.
-        #[arg(long)]
-        msg: Option<String>,
-        /// Who is reporting.
-        #[arg(long, default_value = "hiero")]
-        app: String,
-    },
-    /// Send one message to many live agents (the same as the board's broadcast).
-    Broadcast {
-        /// The message.
-        text: String,
-        /// Only terminals with this label (key=value; repeatable).
-        #[arg(long = "label", value_name = "KEY=VALUE")]
-        labels: Vec<String>,
-        /// Type even into agents that are blocked.
-        #[arg(long)]
-        force: bool,
-    },
     /// Workspaces: projects, named workspaces, tabs and panes.
     #[command(subcommand)]
     Ws(WsCmd),
-    /// The agent board (also in the workspace menu): every terminal at a glance, tasks, pipelines.
-    Board,
     /// Hiero's settings file.
     Config {
         #[command(subcommand)]
         action: Option<ConfigCmd>,
     },
-    /// Called by agent hooks; reports status to herdr-core.
-    #[command(hide = true)]
-    Hook { agent: String, event: String, arg: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -191,7 +130,7 @@ enum Debug {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    init_logging(matches!(cli.command, None | Some(Command::Board)));
+    init_logging(cli.command.is_none());
     let config_error = match config::load() {
         Ok(cfg) => {
             config::set(cfg);
@@ -212,29 +151,17 @@ async fn main() -> Result<()> {
             }
             ws_tui::run(config_error).await
         }
-        Some(Command::Board) => tui::run(config_error).await,
         Some(Command::Config { action }) => config_cmd(action, config_error),
         Some(Command::Debug(d)) => debug(d).await,
         Some(Command::Ws(w)) => ws_cmd(w).await,
-        Some(Command::Hook { agent, event, arg }) => {
-            integrate::run_hook(&agent, &event, arg.as_deref()).await;
-            Ok(())
-        }
-        Some(Command::Broadcast { text, labels, force }) => broadcast(&text, &labels, force).await,
-        Some(Command::Report { state, kind, msg, app }) => {
-            integrate::report_cmd(&state, kind.as_deref(), msg.as_deref(), &app).await
-        }
-        Some(Command::Integrate { agent, uninstall, status, settings, exe, force }) => {
-            integrate_cmd(&agent, uninstall, status, settings, exe, force)
-        }
     }
 }
 
-/// The board logs to a file (stderr would draw over the screen); commands
+/// The workspace screen logs to a file (stderr would draw over the screen); commands
 /// log to stderr.
-fn init_logging(board: bool) {
+fn init_logging(screen: bool) {
     let filter = tracing_subscriber::EnvFilter::try_from_env("HIERO_LOG").unwrap_or_else(|_| "warn".into());
-    if board {
+    if screen {
         let dir = config::state_dir();
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("hiero.log");
@@ -275,6 +202,9 @@ fn config_cmd(action: Option<ConfigCmd>, error: Option<String>) -> Result<()> {
             }
             let exists = if path.exists() { "" } else { " (not created yet; defaults in effect)" };
             println!("# {}{exists}", path.display());
+            if let Some(w) = config::get().ignored_warning() {
+                println!("# warning: {w}");
+            }
             print!("{}", toml::to_string_pretty(config::get())?);
             println!("# logs: {}", config::state_dir().join("hiero.log").display());
         }
@@ -388,104 +318,6 @@ async fn inside_hiero() -> Option<String> {
     }
     .await;
     Some(name.unwrap_or_else(|| "a Hiero pane".into()))
-}
-
-async fn broadcast(text: &str, labels: &[String], force: bool) -> Result<()> {
-    let mut filter = hc_client::Labels::new();
-    for l in labels {
-        let (k, v) = l.split_once('=').ok_or_else(|| anyhow::anyhow!("label must be KEY=VALUE: {l}"))?;
-        filter.insert(k.to_string(), v.to_string());
-    }
-    let hc = Client::connect().await?;
-    let me = std::env::var("HC_TERMINAL_ID").ok();
-    let targets: Vec<_> = hc
-        .list(false, &filter)
-        .await?
-        .terminals
-        .into_iter()
-        .filter(|t| Some(&t.address) != me.as_ref())
-        .collect();
-    if targets.is_empty() {
-        println!("no live terminals match");
-        return Ok(());
-    }
-    let mut failed = 0;
-    for t in &targets {
-        match hc.send_with(&t.address, text, force).await {
-            Ok(_) => println!("✓ {} {}", t.address, t.display_name()),
-            Err(e) => {
-                failed += 1;
-                println!("✗ {} {}: {e}", t.address, t.display_name());
-            }
-        }
-    }
-    if failed > 0 {
-        anyhow::bail!("{failed} of {} failed", targets.len());
-    }
-    Ok(())
-}
-
-fn integrate_cmd(
-    agent: &str,
-    uninstall: bool,
-    status: bool,
-    settings: Option<std::path::PathBuf>,
-    exe: Option<std::path::PathBuf>,
-    force: bool,
-) -> Result<()> {
-    let exe = match exe {
-        Some(e) => e,
-        None => std::env::current_exe()?.canonicalize()?,
-    };
-    if agent == "codex" {
-        let q = |s: &str| serde_json::to_string(s).unwrap();
-        println!("Codex reports only finished turns, through `notify`. Add this to ~/.codex/config.toml:\n");
-        println!("notify = [{}, \"hook\", \"codex\"]\n", q(&exe.to_string_lossy()));
-        println!("Codex sessions in hc terminals will then show `done` when a turn ends.");
-        return Ok(());
-    }
-    if agent != "claude" {
-        anyhow::bail!("supported: claude, codex. Other agents can call `hiero report <state>` from their own hooks.");
-    }
-    let path = settings.unwrap_or_else(integrate::claude_settings_path);
-    if status {
-        let hooks = integrate::claude_status(&path)?;
-        if hooks.is_empty() {
-            println!("not installed in {}", path.display());
-        } else {
-            println!("installed in {}:", path.display());
-            for (event, cmd) in hooks {
-                println!("  {event:<18} {cmd}");
-            }
-        }
-        return Ok(());
-    }
-    if uninstall {
-        let n = integrate::uninstall_claude(&path)?;
-        println!("removed {n} hiero hook(s) from {}", path.display());
-        return Ok(());
-    }
-    if !force && let Some(v) = integrate::claude_version()
-        && v >= integrate::CLAUDE_NATIVE_SINCE
-    {
-        println!(
-            "Claude Code {}.{}.{} reports working / blocked / done by itself, so no hooks are needed.",
-            v.0, v.1, v.2
-        );
-        println!("Hiero's board already shows it. Use --force to install the hooks anyway (they stay quiet");
-        println!("while Claude reports natively).");
-        return Ok(());
-    }
-    integrate::install_claude(&path, &exe)?;
-    println!("installed hiero status hooks in {}", path.display());
-    println!("  events: {}", integrate::CLAUDE_EVENTS.join(", "));
-    println!("  runs:   {} hook claude <event>", exe.display());
-    println!("Other hooks were kept; the previous file is saved as settings.json.hiero-backup.");
-    println!("New Claude sessions in hc terminals will report working / blocked / done.");
-    if exe.components().any(|c| c.as_os_str() == "target") {
-        println!("Note: this points at a build folder; reinstall if you move or clean it.");
-    }
-    Ok(())
 }
 
 async fn debug(cmd: Debug) -> Result<()> {

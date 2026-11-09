@@ -1,5 +1,5 @@
 //! Turn crossterm key events back into the bytes a terminal would send,
-//! for typing into an agent from inside the board.
+//! for typing into a pane's program.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton};
 use vt100::MouseProtocolEncoding;
@@ -114,27 +114,6 @@ fn ctrl_byte(c: char) -> Option<u8> {
     }
 }
 
-/// The keys that leave an attached view: ctrl+\ (like hc) and ctrl+].
-pub fn is_detach(key: &KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('\\') | KeyCode::Char('4') | KeyCode::Char(']') | KeyCode::Char('5'))
-}
-
-/// Find a detach key in raw input bytes: 0x1c / 0x1d, or their kitty-protocol
-/// forms (`CSI 92;5u`, `CSI 93;5u`) when the program turned that on.
-/// Returns the bytes before it.
-pub fn find_detach(bytes: &[u8]) -> Option<usize> {
-    if let Some(i) = bytes.iter().position(|&b| b == 0x1c || b == 0x1d) {
-        return Some(i);
-    }
-    for pat in [b"\x1b[92;5u".as_slice(), b"\x1b[93;5u".as_slice()] {
-        if let Some(i) = bytes.windows(pat.len()).position(|w| w == pat) {
-            return Some(i);
-        }
-    }
-    None
-}
-
 /// What the pointer did, for [`encode_mouse`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseAct {
@@ -222,14 +201,6 @@ mod tests {
         assert_eq!(encode(k(KeyCode::Right, KeyModifiers::CONTROL), false).unwrap(), b"\x1b[1;5C");
         assert_eq!(encode(k(KeyCode::Delete, none), false).unwrap(), b"\x1b[3~");
         assert_eq!(encode(k(KeyCode::F(5), none), false).unwrap(), b"\x1b[15~");
-    }
-
-    #[test]
-    fn finds_detach() {
-        assert_eq!(find_detach(b"abc\x1cdef"), Some(3));
-        assert_eq!(find_detach(b"x\x1b[92;5u"), Some(1));
-        assert_eq!(find_detach(b"plain"), None);
-        assert!(is_detach(&k(KeyCode::Char('\\'), KeyModifiers::CONTROL)));
     }
 
     fn mouse(act: MouseAct, m: KeyModifiers, x: u16, y: u16, enc: MouseProtocolEncoding) -> Option<Vec<u8>> {

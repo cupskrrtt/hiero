@@ -3,6 +3,11 @@
 The short table is in the [README](../README.md#development-history). This file keeps the
 per-phase checklists as they were written while each phase was built.
 
+> **Removed in 0.3.0.** The board era (phases 0 to 6: the agent board, tasks and worktrees,
+> pipelines, broadcast, usage, templates and the status bridge) was removed in 0.3.0. Hiero is only
+> the workspace now. The code lives in git history; the last commit that has it is `49e17c5`.
+> The checklists below stay as they were written (the `hc-client` library from phase 0 is kept).
+
 ## Workspace redesign (W1 to W5)
 
 Hiero became a terminal workspace. A sidebar lists projects, each with named workspaces you

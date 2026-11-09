@@ -40,8 +40,15 @@ fn is_wsl() -> bool {
             .unwrap_or(false)
 }
 
+pub struct Alert {
+    /// blocked, error, done, exited or failed (for `[notify] on`).
+    pub what: String,
+    pub title: String,
+    pub body: String,
+}
+
 /// Ring the bell and show a notification, as `[notify]` allows, for an
-/// alert of kind `what` (blocked, done, pipeline, …). Never blocks.
+/// alert of kind `what` (blocked, done, …). Never blocks.
 pub fn alert(what: &str, title: &str, body: &str) {
     let cfg = &crate::config::get().notify;
     if !cfg.wants(what) {
