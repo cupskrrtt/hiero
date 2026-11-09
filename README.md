@@ -41,10 +41,55 @@ The layout is remembered, and each pane stores its command so a missing terminal
 | Phase | What | State |
 |---|---|---|
 | W1 | Workspace data model in hc doc `hiero-ws`, plus `hiero ws` CLI | ✅ done |
-| W2 | Sidebar and one live pane | planned |
+| W2 | Sidebar and one live pane | ✅ done |
 | W3 | Tabs and splits | planned |
 | W4 | Restore terminals, and a menu with the old views (board, tasks, pipelines) | planned |
 | W5 | Polish | planned |
+
+**W2 ✅** `hiero` now opens the workspace screen: a sidebar of projects and workspaces, the open
+workspace's terminal in the middle, and a one-line bar at the bottom. The old agent board is still
+there as `hiero board`.
+
+- Every pane is an hc terminal. Opening a workspace attaches to its terminal if it still runs, or
+  starts a shell in the workspace folder (labels `hiero.ws`, `hiero.pane`, `hiero.project`) and saves
+  its address in the doc. Switching workspaces or quitting Hiero leaves programs running.
+- Only the focused pane of the active tab is shown for now. Tabs and splits come in W3.
+- Hiero's own keys sit behind a prefix key (default `ctrl+space`), so nvim and Claude get every
+  other key. Set it with `[workspace] prefix = "ctrl+b"` (`ctrl+space` or `ctrl+<letter>`).
+- The sidebar shows a dot per workspace (● working, ◐ needs you, ✓ done) and a dot on a collapsed
+  project. The bottom bar names a workspace that needs you. Changes to attention or done ring the
+  bell and notify, using the `[notify]` rules.
+- `hiero ws …` edits show up live. The open workspace is remembered (`remember = true`).
+- When a pane's program ends, the title says so and `Enter` starts a fresh shell there.
+- Deleting a workspace or project only removes it from the list. Its terminals keep running
+  (W4 will offer to stop them).
+
+### Workspace keys
+
+After the prefix (`ctrl+space`), the bar shows `prefix` until the next key:
+
+| Key | Action |
+|---|---|
+| `w` | switch between sidebar and workspace |
+| `n` / `N` | new workspace in this project / new project |
+| `?` | help |
+| `q` | quit Hiero (terminals keep running) |
+| prefix again | send the prefix key itself to the program |
+| `Esc` | cancel |
+
+In the sidebar (no prefix needed):
+
+| Key | Action |
+|---|---|
+| `j` `k` / `↑` `↓`, `g` `G` | move |
+| `Enter` | open a workspace; on a project, fold or unfold it |
+| `a` / `A` | add workspace under this project / add project (name and folder) |
+| `r` | rename |
+| `D` | delete (asks first) |
+| `J` / `K` | move down / up |
+| `z` | fold or unfold the project |
+| `Esc`, `l`, `Tab` | back to the workspace |
+| `q` | quit |
 
 ## Development phases
 
@@ -219,7 +264,7 @@ cd packaging/arch && makepkg -si
 cargo install --path crates/hiero
 ```
 
-Then run `hiero`. Optional: `hiero config init` writes a commented settings file.
+Then run `hiero` (the workspace screen) or `hiero board` (the agent board). Optional: `hiero config init` writes a commented settings file.
 
 ## Configuration
 
@@ -228,6 +273,9 @@ Then run `hiero`. Optional: `hiero config init` writes a commented settings file
 ```toml
 [board]
 grouping = "tree"            # project, tree or flat
+
+[workspace]
+prefix = "ctrl+space"        # or ctrl+<letter>; not c, h, i, j, m
 
 [notify]
 bell = false
@@ -252,7 +300,8 @@ Requires a running herdr-core (`hc server status`) and a Rust toolchain.
 ```sh
 cargo build
 cargo test
-cargo run -p hiero                          # the board
+cargo run -p hiero                          # the workspace screen
+cargo run -p hiero -- board                 # the agent board
 
 cargo run -p hiero -- debug status          # handshake and core info
 cargo run -p hiero -- debug ls --all        # terminals
@@ -267,7 +316,7 @@ cargo run -p hiero -- integrate codex             # prints the Codex notify line
 hiero report blocked --kind question --msg "pick a database"   # from inside an hc terminal
 hiero broadcast --label hiero.project=shosha "please rebase on main"
 
-# workspaces (W1: no UI yet; stored in hc doc "hiero-ws")
+# workspaces (stored in hc doc "hiero-ws"; the same edits are in the UI)
 hiero ws add-project shosha --root ~/code/shosha   # root defaults to the current folder
 hiero ws add shosha frontend --folder ~/code/shosha/web   # folder defaults to the project root
 hiero ws list                                       # projects > workspaces > tabs > panes
@@ -290,6 +339,8 @@ be unique among siblings. Folders must exist. Reset with `hiero debug doc null -
 | `XDG_STATE_HOME` | Where `hiero/hiero.log` and `hiero/ui.json` live (default `~/.local/state`) |
 
 ### Board keys
+
+These are for `hiero board`.
 
 | Key | Action |
 |---|---|
@@ -345,7 +396,10 @@ crates/
 │   └── state.rs      TerminalSet
 └── hiero/src/
     ├── main.rs       CLI entry
-    ├── tui.rs        event loop: keys, core events, screen reads, timers
+    ├── ws_tui.rs     workspace screen: event loop, starts and attaches terminals
+    ├── ws_app.rs     workspace screen state: sidebar, prefix key, dialogs (tested, no I/O)
+    ├── ws_ui.rs      workspace screen drawing
+    ├── tui.rs        board event loop: keys, core events, screen reads, timers
     ├── app.rs        board state and behaviour (tested, no I/O)
     ├── ui.rs         drawing (board, dialogs, attached pane)
     ├── forms.rs      dialog state: text input, new agent, templates

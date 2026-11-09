@@ -11,6 +11,7 @@ use std::path::PathBuf;
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub board: Board,
+    pub workspace: WorkspaceCfg,
     pub notify: Notify,
     /// Per-agent launch settings, by agent name (`claude`, `pi`, …).
     pub agents: BTreeMap<String, AgentConfig>,
@@ -33,6 +34,75 @@ pub struct Board {
 impl Default for Board {
     fn default() -> Self {
         Board { grouping: "project".into(), show_finished: true, preview_history: 200, remember: true }
+    }
+}
+
+/// The workspace screen.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkspaceCfg {
+    /// The key that reaches Hiero's own controls: `ctrl+space` or `ctrl+<letter>`.
+    pub prefix: String,
+}
+
+impl Default for WorkspaceCfg {
+    fn default() -> Self {
+        WorkspaceCfg { prefix: "ctrl+space".into() }
+    }
+}
+
+/// The prefix key. Every other key goes to the program in the pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Prefix {
+    Space,
+    Ctrl(char),
+}
+
+impl Prefix {
+    pub fn parse(s: &str) -> Result<Prefix, String> {
+        let low = s.trim().to_lowercase();
+        let bad = || format!("prefix must be ctrl+space or ctrl+<letter>, not `{s}`");
+        let Some(key) = low.strip_prefix("ctrl+") else { return Err(bad()) };
+        if key == "space" {
+            return Ok(Prefix::Space);
+        }
+        let mut chars = key.chars();
+        match (chars.next(), chars.next()) {
+            // These letters are Enter, Tab, Backspace and Ctrl+C on the wire.
+            (Some(c @ ('c' | 'h' | 'i' | 'j' | 'm')), None) => {
+                Err(format!("prefix ctrl+{c} can't be used: terminals send it for Enter, Tab, Backspace or interrupt"))
+            }
+            (Some(c @ 'a'..='z'), None) => Ok(Prefix::Ctrl(c)),
+            _ => Err(bad()),
+        }
+    }
+
+    /// Terminals disagree on ctrl+space: crossterm gives `Char(' ')` with
+    /// CONTROL, or `Null` when the terminal sends a bare NUL byte.
+    pub fn matches(&self, k: &crossterm::event::KeyEvent) -> bool {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL) && !k.modifiers.contains(KeyModifiers::ALT);
+        match (self, k.code) {
+            (Prefix::Space, KeyCode::Null) => true,
+            (Prefix::Space, KeyCode::Char(' ')) => ctrl,
+            (Prefix::Ctrl(c), KeyCode::Char(x)) => ctrl && x.to_ascii_lowercase() == *c,
+            _ => false,
+        }
+    }
+
+    /// What the program receives when the prefix is pressed twice.
+    pub fn byte(&self) -> u8 {
+        match self {
+            Prefix::Space => 0,
+            Prefix::Ctrl(c) => *c as u8 - b'a' + 1,
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Prefix::Space => "ctrl+space".into(),
+            Prefix::Ctrl(c) => format!("ctrl+{c}"),
+        }
     }
 }
 
@@ -124,6 +194,11 @@ impl Config {
         Ok(map)
     }
 
+    /// The workspace prefix key (`load` has checked it).
+    pub fn prefix(&self) -> Prefix {
+        Prefix::parse(&self.workspace.prefix).unwrap_or(Prefix::Space)
+    }
+
     pub fn agent(&self, name: &str) -> Option<&AgentConfig> {
         self.agents.get(name)
     }
@@ -184,6 +259,7 @@ pub fn load() -> Result<Config, String> {
     };
     let cfg: Config = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     cfg.key_map()?;
+    Prefix::parse(&cfg.workspace.prefix).map_err(|e| format!("[workspace] {e}"))?;
     if !matches!(cfg.board.grouping.as_str(), "project" | "tree" | "flat") {
         return Err(format!("[board] grouping must be project, tree or flat, not `{}`", cfg.board.grouping));
     }
@@ -205,6 +281,9 @@ grouping = "project"     # project, tree or flat (p cycles)
 show_finished = true     # f toggles
 preview_history = 200    # lines above the screen in the preview
 remember = true          # restore grouping, filters and selection on start
+
+[workspace]
+prefix = "ctrl+space"    # reaches Hiero's controls; or ctrl+<letter> (not c, h, i, j, m)
 
 [notify]
 bell = true
@@ -235,6 +314,8 @@ pub struct UiState {
     pub show_finished: Option<bool>,
     pub selected: Option<String>,
     pub query: String,
+    /// The workspace open on the main screen (its id).
+    pub workspace: Option<String>,
 }
 
 fn ui_state_path() -> PathBuf {
@@ -272,6 +353,27 @@ mod tests {
         assert!(!c.notify.bell && c.notify.desktop, "unset fields keep defaults");
         assert_eq!(c.agent("pi").unwrap().task.as_deref(), Some("send"));
         assert!(toml::from_str::<Config>("[board]\ntypo = 1").is_err());
+    }
+
+    #[test]
+    fn prefix_parsing() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        assert_eq!(Prefix::parse("ctrl+space"), Ok(Prefix::Space));
+        assert_eq!(Prefix::parse(" Ctrl+B "), Ok(Prefix::Ctrl('b')));
+        for bad in ["space", "alt+b", "ctrl+", "ctrl+bb", "ctrl+1", "ctrl+c", "ctrl+m"] {
+            assert!(Prefix::parse(bad).is_err(), "{bad}");
+        }
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        assert!(Prefix::Space.matches(&ctrl(' ')));
+        assert!(Prefix::Space.matches(&KeyEvent::new(KeyCode::Null, KeyModifiers::NONE)));
+        assert!(!Prefix::Space.matches(&KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)));
+        assert!(Prefix::Ctrl('b').matches(&ctrl('b')) && !Prefix::Ctrl('b').matches(&ctrl('a')));
+        assert_eq!((Prefix::Space.byte(), Prefix::Ctrl('a').byte()), (0, 1));
+
+        let c: Config = toml::from_str("[workspace]\nprefix = \"ctrl+a\"").unwrap();
+        assert_eq!(c.prefix(), Prefix::Ctrl('a'));
+        assert!(toml::from_str::<Config>("[workspace]\ntypo = 1").is_err());
+        assert_eq!(toml::from_str::<Config>(DEFAULT_TOML).unwrap().prefix(), Prefix::Space);
     }
 
     #[test]

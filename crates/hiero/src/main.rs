@@ -13,13 +13,16 @@ mod ui;
 mod usage;
 mod workspace;
 mod worktree;
+mod ws_app;
+mod ws_tui;
+mod ws_ui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use hc_client::{AgentState, Client, Filter, TerminalSet, WatchMsg, Watcher, endpoint};
 
 #[derive(Parser)]
-#[command(name = "hiero", version, about = "A TUI agent manager on top of herdr-core")]
+#[command(name = "hiero", version, about = "A terminal workspace on top of herdr-core")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -78,6 +81,8 @@ enum Command {
     /// Workspaces: projects, named workspaces, tabs and panes.
     #[command(subcommand)]
     Ws(WsCmd),
+    /// The agent board: every terminal at a glance (the screen before workspaces).
+    Board,
     /// Hiero's settings file.
     Config {
         #[command(subcommand)]
@@ -171,7 +176,7 @@ enum Debug {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    init_logging(cli.command.is_none());
+    init_logging(matches!(cli.command, None | Some(Command::Board)));
     let config_error = match config::load() {
         Ok(cfg) => {
             config::set(cfg);
@@ -180,7 +185,8 @@ async fn main() -> Result<()> {
         Err(e) => Some(e),
     };
     match cli.command {
-        None => tui::run(config_error).await,
+        None => ws_tui::run(config_error).await,
+        Some(Command::Board) => tui::run(config_error).await,
         Some(Command::Config { action }) => config_cmd(action, config_error),
         Some(Command::Debug(d)) => debug(d).await,
         Some(Command::Ws(w)) => ws_cmd(w).await,

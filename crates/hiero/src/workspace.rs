@@ -6,9 +6,6 @@
 //! is a [`WsOp`] applied by the pure [`apply`], which keeps it easy to test;
 //! [`update`] does the read-modify-write against the core.
 
-// The sidebar and tabs that use most of this come in W2/W3.
-#![allow(dead_code)]
-
 use hc_client::{AgentState, Client, ErrorKind, TerminalSet};
 use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
@@ -153,16 +150,19 @@ impl WsDoc {
         self.projects.iter().find_map(|p| p.workspaces.iter().find(|w| w.id == id).map(|w| (p, w)))
     }
 
+    #[allow(dead_code)] // used by tabs and splits in W3
     pub fn tab(&self, id: &str) -> Option<(&Workspace, &Tab)> {
         self.all_workspaces().find_map(|w| w.tabs.iter().find(|t| t.id == id).map(|t| (w, t)))
     }
 
+    #[allow(dead_code)] // used by tabs and splits in W3
     pub fn pane(&self, id: &str) -> Option<(&Workspace, &Tab, &Pane)> {
         self.all_workspaces().find_map(|w| {
             w.tabs.iter().find_map(|t| t.layout.find(id).map(|p| (w, t, p)))
         })
     }
 
+    #[allow(dead_code)] // used by tabs and splits in W3
     fn all_workspaces(&self) -> impl Iterator<Item = &Workspace> {
         self.projects.iter().flat_map(|p| p.workspaces.iter())
     }
@@ -200,6 +200,7 @@ pub enum Move {
 
 /// One change to the document. Everything is addressed by id.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // tab, split and folder ops are used from W3 on
 pub enum WsOp {
     AddProject { id: String, name: String, root: String },
     RenameProject { id: String, name: String },
@@ -555,6 +556,7 @@ fn normalize(l: &mut Layout) {
 
 /// Cut `total` cells into parts in proportion to `weights`. The parts add
 /// up to `total` exactly: part k ends where `total * (weights so far) / sum` says.
+#[allow(dead_code)] // used by splits in W3
 fn share(total: u16, weights: &[u16], n: usize) -> Vec<u16> {
     let w: Vec<u64> = (0..n).map(|i| weights.get(i).copied().unwrap_or(1).max(1) as u64).collect();
     let sum: u64 = w.iter().sum();
@@ -571,12 +573,14 @@ fn share(total: u16, weights: &[u16], n: usize) -> Vec<u16> {
 }
 
 /// Where each pane goes inside `area`. Every cell is given to exactly one pane.
+#[allow(dead_code)] // used by splits in W3
 pub fn rects(layout: &Layout, area: Rect) -> Vec<(String, Rect)> {
     let mut out = Vec::new();
     place(layout, area, &mut out);
     out
 }
 
+#[allow(dead_code)] // used by splits in W3
 fn place(l: &Layout, area: Rect, out: &mut Vec<(String, Rect)>) {
     match l {
         Layout::Pane(p) => out.push((p.id.clone(), area)),

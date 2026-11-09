@@ -306,7 +306,7 @@ async fn event_loop(
     Ok(())
 }
 
-async fn pane_recv(pane: &mut Option<AttachStream>) -> StreamMsg {
+pub(crate) async fn pane_recv(pane: &mut Option<AttachStream>) -> StreamMsg {
     match pane {
         Some(p) => p.recv().await,
         None => std::future::pending().await,

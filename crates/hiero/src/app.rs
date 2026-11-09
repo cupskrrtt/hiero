@@ -551,6 +551,8 @@ impl App {
             show_finished: Some(self.show_finished),
             selected: self.selected.clone(),
             query: self.query.clone(),
+            // Belongs to the workspace screen; don't wipe it.
+            workspace: crate::config::load_ui_state().workspace,
         }
     }
 
@@ -1539,7 +1541,7 @@ pub fn now_ms() -> u64 {
 
 /// The hook's fallback (labels) when an agent couldn't report through its
 /// terminal. A real OSC 7501 report always wins.
-fn status_from_labels(t: &mut Terminal) {
+pub(crate) fn status_from_labels(t: &mut Terminal) {
     use crate::integrate::{LABEL_STATUS, LABEL_STATUS_KIND, LABEL_STATUS_MS, LABEL_STATUS_MSG};
     if t.reported || !t.is_live() {
         return;

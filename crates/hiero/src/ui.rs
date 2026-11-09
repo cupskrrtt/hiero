@@ -315,7 +315,7 @@ fn hints(keys: &[(&str, &str)]) -> Line<'static> {
 }
 
 /// A centered box of `w`×`h` cells, cleared.
-fn popup(f: &mut Frame, area: Rect, w: u16, h: u16, title: &str) -> Rect {
+pub(crate) fn popup(f: &mut Frame, area: Rect, w: u16, h: u16, title: &str) -> Rect {
     let w = w.min(area.width.saturating_sub(2));
     let h = h.min(area.height.saturating_sub(2));
     let r = Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h);
@@ -331,7 +331,7 @@ fn popup(f: &mut Frame, area: Rect, w: u16, h: u16, title: &str) -> Rect {
 }
 
 /// One text field; puts the cursor in it when focused.
-fn draw_input(f: &mut Frame, area: Rect, input: &TextInput, focused: bool) {
+pub(crate) fn draw_input(f: &mut Frame, area: Rect, input: &TextInput, focused: bool) {
     let style = if focused { Style::new().bg(Color::Rgb(40, 44, 52)) } else { Style::new().dim() };
     let text = input.value();
     // Scroll horizontally so the cursor stays visible.
@@ -905,7 +905,12 @@ fn draw_pane(f: &mut Frame, pane: &PaneView, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let screen = pane.parser.screen();
+    draw_vt(f, &pane.parser, inner, pane.ended.is_none());
+}
+
+/// Paint a terminal screen into `inner`, and put the cursor there if asked.
+pub(crate) fn draw_vt(f: &mut Frame, parser: &vt100::Parser, inner: Rect, show_cursor: bool) {
+    let screen = parser.screen();
     let buf = f.buffer_mut();
     let (rows, cols) = screen.size();
     for r in 0..rows.get().min(inner.height) {
@@ -949,7 +954,7 @@ fn draw_pane(f: &mut Frame, pane: &PaneView, area: Rect) {
             }
         }
     }
-    if pane.ended.is_none() && !screen.hide_cursor() {
+    if show_cursor && !screen.hide_cursor() {
         let (r, c) = screen.cursor_position();
         if r < inner.height && c < inner.width {
             f.set_cursor_position((inner.x + c, inner.y + r));
