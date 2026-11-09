@@ -121,6 +121,9 @@ enum Debug {
         /// How long to watch, in seconds.
         #[arg(long, default_value_t = 20)]
         secs: u64,
+        /// Also write the raw bytes received to this file.
+        #[arg(long)]
+        dump: Option<std::path::PathBuf>,
     },
     /// Show the key events your terminal sends (to check a prefix key).
     Keys,
@@ -399,7 +402,7 @@ async fn debug(cmd: Debug) -> Result<()> {
             }
         }
         Debug::Keys => debug_keys()?,
-        Debug::Vtcompare { terminal, secs } => vtcompare(&terminal, secs).await?,
+        Debug::Vtcompare { terminal, secs, dump } => vtcompare(&terminal, secs, dump).await?,
         Debug::Type { terminal, text } => {
             let hc = Client::connect().await?;
             let t = hc.get(&terminal).await?;
@@ -456,7 +459,8 @@ impl vt100::Callbacks for Unhandled {
 
 /// Watch a terminal as an observer, feed its output to vt100, and every
 /// second compare the screen with herdr-core's (Ghostty's) rendering.
-async fn vtcompare(terminal: &str, secs: u64) -> Result<()> {
+async fn vtcompare(terminal: &str, secs: u64, dump: Option<std::path::PathBuf>) -> Result<()> {
+    let mut raw = Vec::new();
     use hc_client::{AttachParams, AttachStream, StreamMsg};
     let hc = Client::connect().await?;
     let t = hc.get(terminal).await?;
@@ -469,12 +473,21 @@ async fn vtcompare(terminal: &str, secs: u64) -> Result<()> {
     println!("watching {terminal} ({cols}x{rows}) for {secs}s; use the program now");
     let end = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    tick.tick().await; // the first tick is immediate, before the first paint lands
     let mut worst = 0usize;
+    // Rows that differed at the last check: only a difference seen twice in
+    // a row counts, so output caught mid-flight doesn't.
+    let mut last: Vec<usize> = Vec::new();
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(end) => break,
             msg = stream.recv() => match msg {
-                StreamMsg::Data(bytes) => parser.process(&bytes),
+                StreamMsg::Data(bytes) => {
+                    if dump.is_some() {
+                        raw.extend_from_slice(&bytes);
+                    }
+                    parser.process(&bytes)
+                }
                 StreamMsg::Closed(_) => break,
                 StreamMsg::Resize { .. } => {}
             },
@@ -485,6 +498,9 @@ async fn vtcompare(terminal: &str, secs: u64) -> Result<()> {
                 let differ: Vec<usize> = (0..rows as usize)
                     .filter(|&i| ours.get(i).map(|s| s.trim_end()).unwrap_or("") != theirs.get(i).map(|s| s.trim_end()).unwrap_or(""))
                     .collect();
+                let stuck: Vec<usize> = differ.iter().copied().filter(|i| last.contains(i)).collect();
+                last = differ;
+                let differ = stuck;
                 if differ.len() > worst {
                     worst = differ.len();
                     println!("\n{} differing row(s):", differ.len());
@@ -497,6 +513,10 @@ async fn vtcompare(terminal: &str, secs: u64) -> Result<()> {
         }
     }
     stream.close().await;
+    if let Some(path) = &dump {
+        std::fs::write(path, &raw)?;
+        println!("wrote {} bytes to {}", raw.len(), path.display());
+    }
     println!("\nmost differing rows seen: {worst}");
     let unhandled = &parser.callbacks().0;
     if unhandled.is_empty() {

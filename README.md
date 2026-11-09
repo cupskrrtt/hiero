@@ -286,6 +286,7 @@ running terminals are not touched.
 
 Fixed:
 
+- ✅ With a pane streaming fast output (nvim plugins like dap-ui), the screen could fall seconds behind and show old frames mixed with new ones, worst on Windows where output goes through ConPTY. Hiero now applies all queued output before drawing and draws at most every 16 ms while busy.
 - ✅ After a core restart, panes stayed `ended` until Enter or a tab switch (W5: they restore by themselves).
 
 ## Development

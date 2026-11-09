@@ -18,6 +18,8 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, interval};
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+/// The longest the screen goes without a redraw while panes stream output.
+const FRAME: Duration = Duration::from_millis(16);
 
 enum Msg {
     Connected(Result<(Client, String), String>),
@@ -131,6 +133,7 @@ async fn event_loop(
     // The pane that last got the focus event.
     let mut last_focus: Option<String> = None;
     let mut slow = interval(Duration::from_secs(1));
+    let mut last_draw = Instant::now() - FRAME;
 
     loop {
         if client.is_none() && !connecting && Instant::now() >= next_connect {
@@ -221,7 +224,14 @@ async fn event_loop(
             last_focus = focused;
         }
 
-        term.draw(|f| ws_ui::draw(f, &app))?;
+        // Draw once the queue is drained, or at least every frame while a pane
+        // streams fast. Drawing after every chunk can't keep up when output
+        // floods in (slow consoles, ConPTY on Windows): the screen then lags
+        // seconds behind and shows old frames mixed with new ones.
+        if rx.is_empty() || last_draw.elapsed() >= FRAME {
+            term.draw(|f| ws_ui::draw(f, &app))?;
+            last_draw = Instant::now();
+        }
 
         tokio::select! {
             ev = keys.next() => match ev {
