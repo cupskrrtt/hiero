@@ -1,0 +1,184 @@
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use hc_client::{AgentState, Client, Filter, TerminalSet, WatchMsg, Watcher, endpoint};
+
+#[derive(Parser)]
+#[command(name = "hiero", version, about = "A TUI agent manager on top of herdr-core")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Low-level checks against the running core.
+    #[command(subcommand)]
+    Debug(Debug),
+}
+
+#[derive(Subcommand)]
+enum Debug {
+    /// Handshake and server status.
+    Status,
+    /// List terminals.
+    Ls {
+        /// Include finished terminals.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Print the screen of a terminal.
+    Read {
+        terminal: String,
+        #[arg(long, default_value_t = 0)]
+        lines: usize,
+    },
+    /// Follow live events (reconnects if the core restarts).
+    Events {
+        /// Print raw event data too.
+        #[arg(long)]
+        raw: bool,
+    },
+    /// Read or write Hiero's document in the core.
+    Doc {
+        /// JSON to store; omit to read.
+        value: Option<String>,
+        #[arg(long, default_value = "hiero")]
+        name: String,
+    },
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_env("HIERO_LOG")
+                .unwrap_or_else(|_| "warn".into()),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
+    let cli = Cli::parse();
+    match cli.command {
+        None => {
+            eprintln!("The board UI arrives in Phase 1. For now try `hiero debug --help`.");
+            Ok(())
+        }
+        Some(Command::Debug(d)) => debug(d).await,
+    }
+}
+
+async fn debug(cmd: Debug) -> Result<()> {
+    match cmd {
+        Debug::Status => {
+            let hc = Client::connect().await?;
+            let hello = hc.hello().await?;
+            let st = hc.status().await?;
+            println!("socket     {}", endpoint::socket_path().display());
+            println!("core       {} ({})", hello.core.name, hello.core.id);
+            println!("version    {} (protocol gen {})", hello.version, hello.generation);
+            println!("pid        {}  uptime {}s", st.pid, st.uptime_ms / 1000);
+            println!("terminals  {} live, {} finished", st.live, st.finished);
+            println!("features   {}", hello.features.join(", "));
+        }
+        Debug::Ls { all } => {
+            let hc = Client::connect().await?;
+            let list = hc.list(all, &Default::default()).await?;
+            println!("{:<8} {:<16} {:<9} {:<8} CWD / CMD", "ADDR", "NAME", "STATE", "STATUS");
+            for t in &list.terminals {
+                println!(
+                    "{:<8} {:<16} {:<9} {:<8} {}  {}",
+                    t.address,
+                    t.name.as_deref().unwrap_or("-"),
+                    format!("{:?}", t.state).to_lowercase(),
+                    status_word(t),
+                    t.cwd,
+                    t.argv.join(" ")
+                );
+            }
+            if list.hidden_finished > 0 {
+                println!("({} finished hidden; --all shows them)", list.hidden_finished);
+            }
+        }
+        Debug::Read { terminal, lines } => {
+            let hc = Client::connect().await?;
+            print!("{}", hc.read(&terminal, lines).await?.text);
+        }
+        Debug::Events { raw } => {
+            let mut rx = Watcher::spawn(endpoint::socket_path(), Filter::default());
+            let mut set = TerminalSet::new();
+            eprintln!("following events from {} (ctrl+c to stop)", endpoint::socket_path().display());
+            loop {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => break,
+                    msg = rx.recv() => {
+                        let Some(msg) = msg else { break };
+                        set.apply_watch(&msg);
+                        match &msg {
+                            WatchMsg::Snapshot { seq, terminals } => {
+                                println!("[snapshot] seq={seq} terminals={}", terminals.len());
+                            }
+                            WatchMsg::Disconnected { error } => println!("[disconnected] {error}; retrying"),
+                            WatchMsg::Event(e) => {
+                                let who = e.terminal.as_deref().unwrap_or("-");
+                                let name = e.terminal.as_deref()
+                                    .and_then(|a| set.get(a))
+                                    .map(|t| t.display_name().to_string())
+                                    .unwrap_or_default();
+                                if raw {
+                                    println!("[{:>5}] {who:<6} {name:<14} {:?}", e.seq, e.data);
+                                } else {
+                                    println!("[{:>5}] {who:<6} {name:<14} {}", e.seq, summarize(&e.data));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Debug::Doc { value, name } => {
+            let hc = Client::connect().await?;
+            let cur = hc.doc_get(&name).await?;
+            match value {
+                None => println!("v{} {}", cur.version, serde_json::to_string_pretty(&cur.value)?),
+                Some(v) => {
+                    let v: serde_json::Value = serde_json::from_str(&v)?;
+                    let set = hc.doc_set(&name, &v, cur.version).await?;
+                    println!("wrote v{}", set.version);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn status_word(t: &hc_client::Terminal) -> String {
+    match t.agent_state() {
+        AgentState::Unknown => "-".into(),
+        s => format!("{s:?}").to_lowercase(),
+    }
+}
+
+fn summarize(d: &hc_client::EventData) -> String {
+    use hc_client::EventData::*;
+    match d {
+        Created(t) => format!("created  {}", t.argv.join(" ")),
+        Restarted(_) => "restarted (new shell)".into(),
+        Lost(e) => format!("lost     {:?}", e.reason),
+        Finished(e) => format!("finished {} code={:?}", e.reason.as_deref().unwrap_or("?"), e.exit_code),
+        Removed => "removed".into(),
+        Keep { keep } => format!("keep     {keep}"),
+        Status { status, .. } => match status {
+            Some(s) if !s.msg.is_empty() => format!("status   {} — {}", s.state, s.msg),
+            Some(s) => format!("status   {}", s.state),
+            None => "status   cleared".into(),
+        },
+        Turn { turn, state } => format!("turn     #{turn} ended {state}"),
+        Title { title } => format!("title    {title}"),
+        Labels { labels, .. } => format!("labels   {labels:?}"),
+        Size { cols, rows } => format!("size     {cols}x{rows}"),
+        Foreground(Some(f)) => format!("fg       {} in {}", f.name, f.cwd),
+        Foreground(None) => "fg       -".into(),
+        Doc { name, version } => format!("doc      {name} v{version}"),
+        Unknown { kind, .. } => format!("{kind} (unknown)"),
+    }
+}
