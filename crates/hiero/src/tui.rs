@@ -2,6 +2,7 @@
 //! attached agents and timers.
 
 use crate::app::{Action, App, Mode, PaneView};
+use crate::pipeline;
 use crate::tasks::{self, TaskOp, TaskStatus};
 use crate::{attach, forms, keys, notify, ui, worktree};
 use anyhow::Result;
@@ -30,6 +31,8 @@ enum Msg {
     Done { result: Result<String, String>, select: Option<String> },
     Templates(Vec<TemplateInfo>),
     Doc(tasks::Doc),
+    Machines(Vec<String>),
+    StageStarted(String),
     Review { id: String, result: Result<worktree::Review, String> },
     PaneOpened { addr: String, name: String, cols: u16, rows: u16, result: Result<Box<AttachStream>, String> },
 }
@@ -132,6 +135,18 @@ async fn event_loop(
                         load_templates(c.clone(), tx.clone());
                     }
                 }
+                Action::EditPipeline(file) => {
+                    drop(keys);
+                    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+                    ratatui::restore();
+                    let r = edit_pipeline(&file);
+                    resume(term)?;
+                    keys = EventStream::new();
+                    if let Err(e) = r {
+                        app.flash_error(&e);
+                    }
+                    app.reload_pipelines();
+                }
                 Action::AttachPane(addr) => {
                     let name = app.selected_info().map(|i| i.name.clone()).unwrap_or_else(|| addr.clone());
                     let inner = pane_size(term, app.disconnected.is_some())?;
@@ -220,6 +235,7 @@ async fn event_loop(
                     connecting = false;
                     load_templates(c.clone(), tx.clone());
                     load_doc(c.clone(), tx.clone());
+                    run_action(c.clone(), Action::LoadMachines, tx.clone());
                     client = Some(c);
                     app.core_name = name;
                     app.preview.dirty = true;
@@ -245,6 +261,11 @@ async fn event_loop(
                 }
                 Msg::Templates(t) => app.on_templates(t),
                 Msg::Doc(doc) => app.on_doc(doc),
+                Msg::Machines(m) => app.machines = m,
+                Msg::StageStarted(id) => {
+                    app.on_stage_started(&id);
+                    app.drive_pipelines();
+                }
                 Msg::Review { id, result } => app.on_review(&id, result),
                 Msg::PaneOpened { addr, name, cols, rows, result } => match result {
                     Ok(stream) => {
@@ -300,15 +321,18 @@ fn resume(term: &mut ratatui::DefaultTerminal) -> Result<()> {
     Ok(())
 }
 
-/// Open a template in the person's editor, creating it from a skeleton first.
-fn edit_file(file: &Path) -> Result<(), String> {
+/// Open a pipeline file in the editor; a new one starts as a copy of the built-in.
+fn edit_pipeline(file: &Path) -> Result<(), String> {
     if !file.exists() {
-        let name = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         if let Some(dir) = file.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("can't make {}: {e}", dir.display()))?;
         }
-        std::fs::write(file, forms::template_skeleton(&name)).map_err(|e| format!("can't write template: {e}"))?;
+        std::fs::write(file, pipeline::BUILTIN).map_err(|e| format!("can't write pipeline: {e}"))?;
     }
+    open_editor(file)
+}
+
+fn open_editor(file: &Path) -> Result<(), String> {
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".into());
@@ -325,6 +349,18 @@ fn edit_file(file: &Path) -> Result<(), String> {
         return Err(format!("{} exited with {status}", argv[0]));
     }
     Ok(())
+}
+
+/// Open a template in the person's editor, creating it from a skeleton first.
+fn edit_file(file: &Path) -> Result<(), String> {
+    if !file.exists() {
+        let name = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("can't make {}: {e}", dir.display()))?;
+        }
+        std::fs::write(file, forms::template_skeleton(&name)).map_err(|e| format!("can't write template: {e}"))?;
+    }
+    open_editor(file)
 }
 
 fn load_templates(c: Client, tx: mpsc::UnboundedSender<Msg>) {
@@ -359,55 +395,30 @@ async fn run_task_action(c: Client, action: Action, tx: mpsc::UnboundedSender<Ms
     let mut select = None;
     let result: Result<String, String> = async {
         match action {
-            Action::RunTask { mut params, send_after, spec } => {
-                let folder = spec.folder.clone();
-                let slug = spec.slug.clone();
-                let made = blocking(move || worktree::create(&folder, &slug)).await?;
-                let now = crate::app::now_ms();
-                let id = tasks::new_id(&made.slug, now);
-                params.cwd = Some(made.path.to_string_lossy().into_owned());
-                params.labels.insert(crate::app::LABEL_PROJECT.into(), worktree_project(&made.repo));
-                params.labels.insert("hiero.task_id".into(), id.clone());
-                if params.name.is_none() {
-                    params.name = Some(made.slug.clone());
-                }
-                let started = async {
-                    let t = c.run(&params).await.map_err(explain)?;
-                    if let Some(text) = &send_after {
-                        c.send(&t.address, text).await.map_err(explain)?;
-                    }
-                    Ok::<_, String>(t)
-                }
-                .await;
-                let t = match started {
-                    Ok(t) => t,
-                    Err(e) => {
-                        // Don't leave an empty worktree behind.
-                        let (repo, path, branch) = (made.repo.clone(), made.path.clone(), made.branch.clone());
-                        let _ = blocking(move || worktree::remove(&repo, &path, &branch)).await;
-                        return Err(e);
-                    }
-                };
-                let task = tasks::Task {
-                    id,
-                    title: spec.title,
-                    prompt: spec.prompt,
-                    agent: spec.agent,
-                    repo: made.repo.to_string_lossy().into_owned(),
-                    base_branch: made.base_branch,
-                    base_commit: made.base_commit,
-                    branch: made.branch.clone(),
-                    worktree: made.path.to_string_lossy().into_owned(),
-                    terminal: Some(t.address.clone()),
-                    created_ms: now,
-                    status: TaskStatus::Running,
-                    timeline: vec![],
-                    pr_url: None,
-                };
-                let doc = tasks::update(&c, &[TaskOp::Insert(Box::new(task))]).await?;
-                let _ = tx.send(Msg::Doc(doc));
+            Action::RunTask { params, send_after, spec } => {
+                let (t, task) = start_task(&c, params, send_after, spec, &tx).await?;
                 select = Some(t.address.clone());
-                Ok(format!("started {} on {} in {}", t.display_name(), made.branch, crate::app::shorten_home(&made.path.to_string_lossy())))
+                Ok(format!("started {} on {} in {}", t.display_name(), task.branch, crate::app::shorten_home(&task.worktree)))
+            }
+            Action::LaunchRun { spec, task, folder, driver } => {
+                let now = crate::app::now_ms();
+                let run = pipeline::Run {
+                    id: format!("{}-{:x}", worktree::slugify(&spec.name), now % 0xff_ffff),
+                    pipeline: spec.name.clone(),
+                    task,
+                    folder,
+                    stages: spec.stages.clone(),
+                    stage: 0,
+                    members: vec![],
+                    history: vec![],
+                    status: pipeline::RunStatus::Running,
+                    driver,
+                    started_ms: now,
+                    note: String::new(),
+                };
+                let doc = tasks::update(&c, &[TaskOp::RunPut(Box::new(run))]).await?;
+                let _ = tx.send(Msg::Doc(doc));
+                Ok(String::new())
             }
             Action::TaskOps(ops) => {
                 let doc = tasks::update(&c, &ops).await?;
@@ -478,6 +489,155 @@ async fn run_task_action(c: Client, action: Action, tx: mpsc::UnboundedSender<Ms
     let _ = tx.send(Msg::Done { result, select });
 }
 
+/// Make a worktree, start the agent in it, and record the task.
+async fn start_task(
+    c: &Client,
+    mut params: hc_client::RunParams,
+    send_after: Option<String>,
+    spec: forms::TaskSpec,
+    tx: &mpsc::UnboundedSender<Msg>,
+) -> Result<(hc_client::Terminal, tasks::Task), String> {
+    let folder = spec.folder.clone();
+    let slug = spec.slug.clone();
+    let made = blocking(move || worktree::create(&folder, &slug)).await?;
+    let now = crate::app::now_ms();
+    let id = tasks::new_id(&made.slug, now);
+    params.cwd = Some(made.path.to_string_lossy().into_owned());
+    params.labels.insert(crate::app::LABEL_PROJECT.into(), worktree_project(&made.repo));
+    params.labels.insert("hiero.task_id".into(), id.clone());
+    if params.name.is_none() {
+        params.name = Some(made.slug.clone());
+    }
+    let started = async {
+        let t = c.run(&params).await.map_err(explain)?;
+        if let Some(text) = &send_after {
+            c.send(&t.address, text).await.map_err(explain)?;
+        }
+        Ok::<_, String>(t)
+    }
+    .await;
+    let t = match started {
+        Ok(t) => t,
+        Err(e) => {
+            // Don't leave an empty worktree behind.
+            let (repo, path, branch) = (made.repo.clone(), made.path.clone(), made.branch.clone());
+            let _ = blocking(move || worktree::remove(&repo, &path, &branch)).await;
+            return Err(e);
+        }
+    };
+    let task = tasks::Task {
+        id,
+        title: spec.title,
+        prompt: spec.prompt,
+        agent: spec.agent,
+        repo: made.repo.to_string_lossy().into_owned(),
+        base_branch: made.base_branch,
+        base_commit: made.base_commit,
+        branch: made.branch.clone(),
+        worktree: made.path.to_string_lossy().into_owned(),
+        terminal: Some(t.address.clone()),
+        created_ms: now,
+        status: TaskStatus::Running,
+        timeline: vec![],
+        pr_url: None,
+    };
+    let doc = tasks::update(c, &[TaskOp::Insert(Box::new(task.clone()))]).await?;
+    let _ = tx.send(Msg::Doc(doc));
+    Ok((t, task))
+}
+
+/// Start every member of one pipeline stage, then record them on the run.
+async fn start_stage(
+    c: &Client,
+    mut run: pipeline::Run,
+    stage: usize,
+    templates: &[TemplateInfo],
+    tx: &mpsc::UnboundedSender<Msg>,
+) -> Result<String, String> {
+    let spec = run.stages.get(stage).cloned().ok_or("no such stage")?;
+    // The finished stage moves to history first, so {branches}/{dirs} see it.
+    if stage != run.stage || !run.members.is_empty() {
+        run.history.push(std::mem::take(&mut run.members));
+    }
+    run.stage = stage;
+    let count = spec.members();
+    let short = run.id.rsplit('-').next().unwrap_or(&run.id).to_string();
+    let parent = run.root().map(str::to_string);
+    let project = crate::git::probe(std::path::Path::new(&run.folder))
+        .map(|g| g.name())
+        .unwrap_or_else(|| worktree_project(std::path::Path::new(&run.folder)));
+    let mut members = Vec::new();
+    let mut failure = None;
+    for n in 1..=count {
+        let name = if count == 1 { format!("{}-{short}", spec.name) } else { format!("{}{n}-{short}", spec.name) };
+        let mut params = hc_client::RunParams::new()
+            .cwd(run.folder.clone())
+            .name(name)
+            .label("hiero.run", run.id.clone())
+            .label("hiero.stage", spec.name.clone())
+            .label(crate::app::LABEL_PROJECT, project.clone());
+        if let Some(p) = &parent {
+            params = params.child_of(p.clone());
+        }
+        let result: Result<pipeline::Member, String> = async {
+            if let Some(cmd) = &spec.command {
+                params = params.line(pipeline::fill(cmd, &run, n, count)).label(crate::app::LABEL_AGENT, "command");
+                let t = c.run(&params).await.map_err(explain)?;
+                return Ok(pipeline::Member { terminal: t.address, task_id: None, branch: None, dir: run.folder.clone(), start_turn: 0, command: true });
+            }
+            let agent = spec.agent.clone().unwrap_or_else(|| "claude".into());
+            let kind = pipeline::resolve_agent(&agent, templates);
+            let prompt = pipeline::fill(spec.prompt.as_deref().unwrap_or(""), &run, n, count);
+            let (argv, send_after) = forms::agent_argv(&kind, &prompt)?;
+            params = params.argv(argv).label(crate::app::LABEL_AGENT, agent.clone()).label(crate::app::LABEL_TASK, prompt.chars().take(200).collect::<String>());
+            if spec.worktree {
+                let task_spec = forms::TaskSpec {
+                    slug: worktree::slugify(&format!("{} {} {n} {short}", run.pipeline, spec.name)),
+                    title: format!("{} {} {n}/{count}: {}", run.pipeline, spec.name, run.task.chars().take(50).collect::<String>()),
+                    prompt: prompt.clone(),
+                    agent: agent.clone(),
+                    folder: run.folder.clone().into(),
+                };
+                let (t, task) = start_task(c, params, send_after, task_spec, tx).await?;
+                Ok(pipeline::Member { terminal: t.address, task_id: Some(task.id), branch: Some(task.branch), dir: task.worktree, start_turn: t.turn, command: false })
+            } else {
+                let t = c.run(&params).await.map_err(explain)?;
+                if let Some(text) = send_after {
+                    c.send(&t.address, &text).await.map_err(explain)?;
+                }
+                Ok(pipeline::Member { terminal: t.address, task_id: None, branch: None, dir: run.folder.clone(), start_turn: t.turn, command: false })
+            }
+        }
+        .await;
+        match result {
+            Ok(m) => members.push(m),
+            Err(e) => {
+                failure = Some(format!("{} {n}: {e}", spec.name));
+                break;
+            }
+        }
+    }
+    run.members = members;
+    if let Some(why) = &failure {
+        run.status = pipeline::RunStatus::Failed;
+        run.note = why.clone();
+    }
+    let doc = tasks::update(c, &[TaskOp::RunPut(Box::new(run.clone()))]).await?;
+    let _ = tx.send(Msg::Doc(doc));
+    match failure {
+        Some(why) => Err(format!("pipeline {}: {why}", run.pipeline)),
+        None => Ok(format!(
+            "{}: stage {}/{} {} started ({} member{})",
+            run.pipeline,
+            stage + 1,
+            run.stages.len(),
+            spec.name,
+            count,
+            if count == 1 { "" } else { "s" }
+        )),
+    }
+}
+
 /// Kill the task's agent (if it still runs) and remove its finished record.
 async fn stop_agent(c: &Client, task: &tasks::Task) {
     if let Some(addr) = &task.terminal {
@@ -501,7 +661,25 @@ fn run_action(c: Client, action: Action, tx: mpsc::UnboundedSender<Msg>) {
     match action {
         Action::LoadTemplates => return load_templates(c, tx),
         Action::LoadDoc => return load_doc(c, tx),
+        Action::LoadMachines => {
+            tokio::spawn(async move {
+                if let Ok(m) = c.machines().await {
+                    let _ = tx.send(Msg::Machines(m.machines.into_iter().map(|m| m.name).collect()));
+                }
+            });
+            return;
+        }
+        Action::StartStage { run, stage, templates } => {
+            tokio::spawn(async move {
+                let id = run.id.clone();
+                let result = start_stage(&c, *run, stage, &templates, &tx).await;
+                let _ = tx.send(Msg::StageStarted(id));
+                let _ = tx.send(Msg::Done { result, select: None });
+            });
+            return;
+        }
         Action::RunTask { .. }
+        | Action::LaunchRun { .. }
         | Action::TaskOps(_)
         | Action::LoadReview(_)
         | Action::TaskMerge(_)
@@ -544,6 +722,21 @@ fn run_action(c: Client, action: Action, tx: mpsc::UnboundedSender<Msg>) {
                 Action::Keep(addr, keep) => {
                     c.keep(&addr, keep).await?;
                     format!("keep {} for {addr}", if keep { "on" } else { "off" })
+                }
+                Action::Broadcast { addrs, text } => {
+                    let mut ok = 0;
+                    let mut failed = Vec::new();
+                    for a in &addrs {
+                        match c.send(a, &text).await {
+                            Ok(_) => ok += 1,
+                            Err(e) => failed.push(format!("{a}: {}", Explain::from(e).0)),
+                        }
+                    }
+                    if failed.is_empty() {
+                        format!("sent to {ok} agent{}", if ok == 1 { "" } else { "s" })
+                    } else {
+                        return Err(Explain(format!("sent to {ok}; failed {}", failed.join(", "))));
+                    }
                 }
                 Action::Label(addr, labels) => {
                     c.label(&addr, &labels).await?;

@@ -118,6 +118,29 @@ pub struct AgentChoice {
     pub kind: AgentKind,
 }
 
+/// How to start an agent of `kind` with `task`: argv, plus text to type after
+/// it starts (for a shell).
+pub fn agent_argv(kind: &AgentKind, task: &str) -> Result<(Vec<String>, Option<String>), String> {
+    let task = task.trim();
+    Ok(match kind {
+        AgentKind::Template(t) => {
+            let mut argv = vec![t.clone()];
+            if !task.is_empty() {
+                argv.push(task.to_string());
+            }
+            (argv, None)
+        }
+        AgentKind::Command(cmd) => {
+            let mut argv = shell_words::split(cmd).map_err(|e| format!("bad command: {e}"))?;
+            if !task.is_empty() {
+                argv.push(task.to_string());
+            }
+            (argv, None)
+        }
+        AgentKind::Shell => (vec![], (!task.is_empty()).then(|| task.to_string())),
+    })
+}
+
 /// Interactive coding agents Hiero looks for on PATH.
 const KNOWN_AGENTS: &[&str] = &["claude", "codex", "pi", "gemini", "opencode", "aider", "goose", "amp", "cursor-agent"];
 
@@ -156,14 +179,21 @@ fn on_path(cmd: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpawnField {
     Agent,
+    Machine,
     Folder,
     Worktree,
     Task,
     Name,
 }
 
-const FIELDS: [SpawnField; 5] =
-    [SpawnField::Agent, SpawnField::Folder, SpawnField::Worktree, SpawnField::Task, SpawnField::Name];
+const FIELDS: [SpawnField; 6] = [
+    SpawnField::Agent,
+    SpawnField::Machine,
+    SpawnField::Folder,
+    SpawnField::Worktree,
+    SpawnField::Task,
+    SpawnField::Name,
+];
 
 pub struct SpawnForm {
     pub field: SpawnField,
@@ -174,6 +204,9 @@ pub struct SpawnForm {
     pub name: TextInput,
     /// Run in a new git worktree on its own branch (a task).
     pub worktree: bool,
+    /// "local" first, then the machines this core added.
+    pub machines: Vec<String>,
+    pub machine: usize,
     pub error: Option<String>,
 }
 
@@ -210,13 +243,24 @@ impl SpawnForm {
             folder: TextInput::new(folder),
             task: TextInput::default(),
             name: TextInput::default(),
+            machines: vec!["local".into()],
+            machine: 0,
             error: None,
         }
+    }
+
+    /// The chosen machine, or None for this one.
+    pub fn machine(&self) -> Option<&str> {
+        (self.machine > 0).then(|| self.machines.get(self.machine).map(String::as_str)).flatten()
     }
 
     fn step(&mut self, delta: isize) {
         let i = FIELDS.iter().position(|f| *f == self.field).unwrap() as isize;
         self.field = FIELDS[(i + delta).rem_euclid(FIELDS.len() as isize) as usize];
+        // The machine line only exists when there are machines.
+        if self.field == SpawnField::Machine && self.machines.len() < 2 {
+            self.step(delta);
+        }
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> FormResult {
@@ -241,6 +285,19 @@ impl SpawnForm {
                     SpawnField::Folder => {
                         self.folder.handle(key);
                     }
+                    SpawnField::Machine => {
+                        let n = self.machines.len().max(1);
+                        match key.code {
+                            KeyCode::Left | KeyCode::Char('h') => self.machine = (self.machine + n - 1) % n,
+                            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => {
+                                self.machine = (self.machine + 1) % n
+                            }
+                            _ => {}
+                        }
+                        if self.machine > 0 {
+                            self.worktree = false;
+                        }
+                    }
                     SpawnField::Worktree => {
                         if matches!(
                             key.code,
@@ -263,7 +320,7 @@ impl SpawnForm {
 
     pub fn paste(&mut self, text: &str) {
         match self.field {
-            SpawnField::Agent | SpawnField::Worktree => {}
+            SpawnField::Agent | SpawnField::Machine | SpawnField::Worktree => {}
             SpawnField::Folder => self.folder.insert_str(text.trim()),
             SpawnField::Task => self.task.insert_str(text),
             SpawnField::Name => self.name.insert_str(text.trim()),
@@ -292,34 +349,20 @@ impl SpawnForm {
     pub fn plan(&self) -> Result<SpawnPlan, String> {
         let agent = self.selected_agent().ok_or("no agent to start")?;
         let folder = expand_home(self.folder.value().trim());
-        if !folder.is_dir() {
+        if self.machine().is_none() && !folder.is_dir() {
             return Err(format!("no such folder: {}", folder.display()));
         }
         let task = self.task.value().trim().to_string();
         let name = self.name.value().trim();
 
         let mut params = RunParams::new().cwd(folder.to_string_lossy());
-        let mut send_after = None;
-        match &agent.kind {
-            AgentKind::Template(t) => {
-                let mut argv = vec![t.clone()];
-                if !task.is_empty() {
-                    argv.push(task.clone());
-                }
-                params = params.argv(argv);
+        let (argv, send_after) = agent_argv(&agent.kind, &task)?;
+        params = params.argv(argv);
+        if let Some(m) = self.machine() {
+            if self.worktree {
+                return Err("worktrees are local only — turn worktree off for another machine".into());
             }
-            AgentKind::Command(cmd) => {
-                let mut argv = shell_words::split(cmd).map_err(|e| format!("bad command: {e}"))?;
-                if !task.is_empty() {
-                    argv.push(task.clone());
-                }
-                params = params.argv(argv);
-            }
-            AgentKind::Shell => {
-                if !task.is_empty() {
-                    send_after = Some(task.clone());
-                }
-            }
+            params = params.on(m);
         }
         if !name.is_empty() {
             params = params.name(name);
@@ -371,6 +414,8 @@ pub fn expand_home(p: &str) -> PathBuf {
 
 pub enum InputPurpose {
     Send(String),
+    /// Send to all of these.
+    Broadcast(Vec<String>),
     Rename(String),
     NewTemplate,
 }

@@ -265,7 +265,17 @@ pub struct RunParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on: Option<String>,
     /// Hiero is not an agent: started terminals have no parent by default.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub no_parent: bool,
+    /// Make it a child of this terminal (clears `no_parent`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Don't type notes about it into its parent.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub no_notify: bool,
+    /// Keep it running when its parent's program ends.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub outlive_parent: bool,
 }
 
 impl RunParams {
@@ -303,6 +313,36 @@ impl RunParams {
         self.keep = keep;
         self
     }
+    /// A quiet child of `parent` that outlives it.
+    pub fn child_of(mut self, parent: impl Into<String>) -> Self {
+        self.parent = Some(parent.into());
+        self.no_parent = false;
+        self.no_notify = true;
+        self.outlive_parent = true;
+        self
+    }
+    pub fn on(mut self, machine: impl Into<String>) -> Self {
+        self.on = Some(machine.into());
+        self
+    }
+}
+
+/// Another machine this core added (`hc machine ls`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct MachineView {
+    pub name: String,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub target: String,
+    /// connecting, connected, needs_login or unreachable.
+    #[serde(default)]
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MachineListResult {
+    pub machines: Vec<MachineView>,
 }
 
 #[cfg(test)]

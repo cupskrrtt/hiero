@@ -74,6 +74,8 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Templates(v) => draw_templates(f, area, v),
         Mode::Tasks(v) => draw_tasks(f, app, area, v.selected),
         Mode::Review(v) => draw_review(f, app, area, v),
+        Mode::Pipelines(v) => draw_pipelines(f, app, area, v),
+        Mode::Launch(form) => draw_launch(f, area, form),
         _ => {}
     }
 }
@@ -153,7 +155,10 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                 let name_style = if i.live { Style::new().bold() } else { Style::new().dim() };
                 rows.push(Row::new(vec![
                     Cell::from(Span::styled(sym, sym_style)),
-                    Cell::from(Span::styled(i.name.clone(), name_style)),
+                    Cell::from(Span::styled(
+                        if i.depth > 0 { format!("{}└ {}", "  ".repeat(i.depth as usize - 1), i.name) } else { i.name.clone() },
+                        name_style,
+                    )),
                     Cell::from(Span::styled(i.agent.clone(), Style::new().fg(Color::Cyan))),
                     Cell::from(Span::styled(i.status.clone(), sym_style)),
                     Cell::from(Span::styled(where_, Style::new().dim())),
@@ -290,6 +295,8 @@ fn draw_bottom(f: &mut Frame, app: &App, area: Rect) {
             ("/", "search"),
             ("v", "review"),
             ("T", "tasks"),
+            ("w", "pipelines"),
+            ("B", "broadcast"),
             ("?", "all keys"),
             ("q", "quit"),
         ]),
@@ -382,6 +389,21 @@ fn draw_spawn(f: &mut Frame, form: &SpawnForm, area: Rect) {
         f.render_widget(Span::styled(detail, Style::new().dim().italic()), d);
     }
 
+    if form.machines.len() > 1 {
+        let focused = form.field == SpawnField::Machine;
+        let v = label(f, rows[2], "machine", focused);
+        let mut spans = Vec::new();
+        for (i, m) in form.machines.iter().enumerate() {
+            let style = if i == form.machine {
+                if focused { Style::new().fg(Color::Black).bg(Color::Cyan).bold() } else { Style::new().bold().underlined() }
+            } else {
+                Style::new().dim()
+            };
+            spans.push(Span::styled(format!(" {m} "), style));
+            spans.push(Span::raw(" "));
+        }
+        f.render_widget(Line::from(spans), v);
+    }
     let v = label(f, rows[3], "folder", form.field == SpawnField::Folder);
     draw_input(f, v, &form.folder, form.field == SpawnField::Folder);
     let wt_focused = form.field == SpawnField::Worktree;
@@ -658,6 +680,138 @@ fn draw_review(f: &mut Frame, app: &App, area: Rect, v: &crate::app::ReviewView)
     f.render_widget(hints(&k), keys);
 }
 
+fn run_style(status: crate::pipeline::RunStatus) -> Style {
+    use crate::pipeline::RunStatus::*;
+    match status {
+        Running => Style::new().fg(Color::Yellow),
+        Done => Style::new().fg(Color::Green),
+        Failed => Style::new().fg(Color::Red),
+        Stopped => Style::new().dim(),
+    }
+}
+
+fn draw_pipelines(f: &mut Frame, app: &App, area: Rect, v: &crate::app::PipelinesView) {
+    let runs = app.run_list();
+    let h = (v.specs.len() as u16 + runs.len() as u16 + v.errors.len() as u16 + 9).clamp(12, area.height.saturating_sub(2));
+    let inner = popup(f, area, 116, h, "pipelines");
+    let [top, mid, errs, path, keys] = Layout::vertical([
+        Constraint::Length(v.specs.len() as u16 + 1),
+        Constraint::Min(3),
+        Constraint::Length(v.errors.len() as u16),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let mut rows: Vec<Row> = v
+        .specs
+        .iter()
+        .map(|p| {
+            let stages: Vec<String> = p
+                .stages
+                .iter()
+                .map(|s| if s.members() > 1 { format!("{}×{}", s.name, s.members()) } else { s.name.clone() })
+                .collect();
+            Row::new(vec![
+                Cell::from(Span::styled(p.name.clone(), Style::new().bold().fg(Color::Cyan))),
+                Cell::from(Span::styled(stages.join(" → "), Style::new().fg(Color::Magenta))),
+                Cell::from(Span::styled(p.description.clone(), Style::new().dim())),
+            ])
+        })
+        .collect();
+    let sel_spec = (v.selected < v.specs.len()).then_some(v.selected);
+    let t = Table::new(std::mem::take(&mut rows), [Constraint::Length(22), Constraint::Length(34), Constraint::Min(10)])
+        .header(Row::new(["PIPELINE", "STAGES", ""]).style(Style::new().dim()))
+        .row_highlight_style(Style::new().bg(Color::DarkGray))
+        .highlight_symbol("▌");
+    f.render_stateful_widget(t, top, &mut TableState::default().with_selected(sel_spec));
+
+    let now = crate::app::now_ms();
+    let run_rows: Vec<Row> = runs
+        .iter()
+        .map(|r| {
+            let style = run_style(r.status);
+            let mut who = r.members.iter().map(|m| m.terminal.as_str()).collect::<Vec<_>>().join(" ");
+            if r.status == crate::pipeline::RunStatus::Running && r.driver != app.driver_id {
+                who.push_str("  (driven by another board — A adopts)");
+            }
+            Row::new(vec![
+                Cell::from(Span::styled(r.progress(), style)),
+                Cell::from(Span::styled(r.pipeline.clone(), Style::new().fg(Color::Cyan))),
+                Cell::from(r.task.clone()),
+                Cell::from(Span::styled(if r.note.is_empty() { who } else { r.note.clone() }, Style::new().dim())),
+                Cell::from(Span::styled(fmt_dur(now.saturating_sub(r.started_ms)), Style::new().dim())),
+            ])
+        })
+        .collect();
+    let block = Block::new().borders(Borders::TOP).title(" runs ");
+    if runs.is_empty() {
+        f.render_widget(Paragraph::new("No runs yet. Pick a pipeline and press enter.").dim().block(block), mid);
+    } else {
+        let sel_run = v.selected.checked_sub(v.specs.len());
+        let t = Table::new(
+            run_rows,
+            [Constraint::Length(22), Constraint::Length(18), Constraint::Min(16), Constraint::Length(36), Constraint::Length(6)],
+        )
+        .block(block)
+        .row_highlight_style(Style::new().bg(Color::DarkGray))
+        .highlight_symbol("▌");
+        f.render_stateful_widget(t, mid, &mut TableState::default().with_selected(sel_run));
+    }
+    if !v.errors.is_empty() {
+        let lines: Vec<Line> = v.errors.iter().map(|e| Line::from(Span::styled(format!("✗ {e}"), Style::new().fg(Color::Red)))).collect();
+        f.render_widget(Paragraph::new(lines), errs);
+    }
+    f.render_widget(
+        Paragraph::new(shorten_home(&crate::pipeline::pipelines_dir().display().to_string())).dim().italic(),
+        path,
+    );
+    f.render_widget(
+        hints(&[("enter", "launch / go to run"), ("e", "edit (copies the built-in)"), ("S", "stop run"), ("A", "adopt"), ("D", "forget run"), ("esc", "back")]),
+        keys,
+    );
+}
+
+fn draw_launch(f: &mut Frame, area: Rect, form: &crate::app::LaunchForm) {
+    use crate::app::LaunchField;
+    let inner = popup(f, area, 84, 11, &format!("launch {}", form.spec.name));
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .split(inner);
+    let stages: Vec<String> = form
+        .spec
+        .stages
+        .iter()
+        .map(|s| {
+            let what = s.agent.clone().or_else(|| s.command.clone().map(|c| format!("`{c}`"))).unwrap_or_default();
+            let n = if s.members() > 1 { format!(" ×{}", s.members()) } else { String::new() };
+            let wt = if s.worktree { " (worktrees)" } else { "" };
+            format!("{}: {what}{n}{wt}", s.name)
+        })
+        .collect();
+    f.render_widget(Paragraph::new(stages.join("  →  ")).fg(Color::Magenta), rows[0]);
+    let field = |f: &mut Frame, r: Rect, label: &str, input: &TextInput, focused: bool| {
+        let [l, v] = Layout::horizontal([Constraint::Length(8), Constraint::Min(1)]).areas(r);
+        let style = if focused { Style::new().fg(Color::Cyan).bold() } else { Style::new().dim() };
+        f.render_widget(Span::styled(label.to_string(), style), l);
+        draw_input(f, v, input, focused);
+    };
+    field(f, rows[2], "task", &form.task, form.field == LaunchField::Task);
+    field(f, rows[4], "folder", &form.folder, form.field == LaunchField::Folder);
+    if let Some(e) = &form.error {
+        f.render_widget(Span::styled(format!("✗ {e}"), Style::new().fg(Color::Red)), rows[6]);
+    }
+    f.render_widget(Paragraph::new("tab switch field · enter on folder or ctrl+s launch · esc back").dim(), rows[7]);
+}
+
 /// An agent attached inside the board, drawn from its vt100 screen.
 fn draw_pane(f: &mut Frame, pane: &PaneView, area: Rect) {
     let mut title = vec![
@@ -753,11 +907,12 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  K                kill                  d       remove finished"),
         Line::from("  e                keep on/off           R       rename"),
         Line::from("  T                tasks                 v       review this agent's task"),
+        Line::from("  w                pipelines             B       broadcast to agents shown"),
         Line::from("  ctrl+\\          leave an attached agent"),
         Line::from(""),
         Line::from("Board".bold()),
         Line::from("  /                search (fuzzy)        esc     clear"),
-        Line::from("  p                group by project      f       show finished"),
+        Line::from("  p                project / tree / flat f       show finished"),
         Line::from("  x                dismiss from NEEDS YOU"),
         Line::from("  PgUp/PgDn, ctrl+u/d  scroll preview    r       refresh preview"),
         Line::from("  q, ctrl+c        quit"),

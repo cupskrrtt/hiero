@@ -5,6 +5,7 @@ mod git;
 mod integrate;
 mod keys;
 mod notify;
+mod pipeline;
 mod tasks;
 mod tui;
 mod ui;
@@ -59,6 +60,17 @@ enum Command {
         /// Who is reporting.
         #[arg(long, default_value = "hiero")]
         app: String,
+    },
+    /// Send one message to many live agents.
+    Broadcast {
+        /// The message.
+        text: String,
+        /// Only terminals with this label (key=value; repeatable).
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Vec<String>,
+        /// Type even into agents that are blocked.
+        #[arg(long)]
+        force: bool,
     },
     /// Called by agent hooks; reports status to herdr-core.
     #[command(hide = true)]
@@ -117,6 +129,7 @@ async fn main() -> Result<()> {
             integrate::run_hook(&agent, &event, arg.as_deref()).await;
             Ok(())
         }
+        Some(Command::Broadcast { text, labels, force }) => broadcast(&text, &labels, force).await,
         Some(Command::Report { state, kind, msg, app }) => {
             integrate::report_cmd(&state, kind.as_deref(), msg.as_deref(), &app).await
         }
@@ -124,6 +137,41 @@ async fn main() -> Result<()> {
             integrate_cmd(&agent, uninstall, status, settings, exe, force)
         }
     }
+}
+
+async fn broadcast(text: &str, labels: &[String], force: bool) -> Result<()> {
+    let mut filter = hc_client::Labels::new();
+    for l in labels {
+        let (k, v) = l.split_once('=').ok_or_else(|| anyhow::anyhow!("label must be KEY=VALUE: {l}"))?;
+        filter.insert(k.to_string(), v.to_string());
+    }
+    let hc = Client::connect().await?;
+    let me = std::env::var("HC_TERMINAL_ID").ok();
+    let targets: Vec<_> = hc
+        .list(false, &filter)
+        .await?
+        .terminals
+        .into_iter()
+        .filter(|t| Some(&t.address) != me.as_ref())
+        .collect();
+    if targets.is_empty() {
+        println!("no live terminals match");
+        return Ok(());
+    }
+    let mut failed = 0;
+    for t in &targets {
+        match hc.send_with(&t.address, text, force).await {
+            Ok(_) => println!("✓ {} {}", t.address, t.display_name()),
+            Err(e) => {
+                failed += 1;
+                println!("✗ {} {}: {e}", t.address, t.display_name());
+            }
+        }
+    }
+    if failed > 0 {
+        anyhow::bail!("{failed} of {} failed", targets.len());
+    }
+    Ok(())
 }
 
 fn integrate_cmd(

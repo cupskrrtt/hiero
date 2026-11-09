@@ -200,6 +200,10 @@ impl Client {
             .await
     }
 
+    pub async fn machines(&self) -> Result<MachineListResult> {
+        self.call("machine.list", json!({})).await
+    }
+
     pub async fn templates(&self) -> Result<TemplatesResult> {
         self.call("templates.list", json!({})).await
     }

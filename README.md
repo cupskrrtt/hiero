@@ -28,8 +28,8 @@ herdr-core's document store. Close Hiero, reopen it, and everything is still the
 | 2 | Drive agents: spawn, actions, attach | ✅ done |
 | 3 | Status bridge for Claude Code, codex, pi | ✅ done |
 | 4 | Tasks and git worktrees | ✅ done |
-| 5 | Orchestration: pipelines, broadcast, machines | ⏳ next |
-| 6 | Polish: usage, config, packaging | ☐ |
+| 5 | Orchestration: pipelines, broadcast, machines | ✅ done |
+| 6 | Polish: usage, config, packaging | ⏳ next |
 
 ## Development phases
 
@@ -122,13 +122,31 @@ everything shares one history.
 (tested from the board with shell agents and a real Claude agent: create → review → merge, discard,
 PR error path, task list)
 
-### Phase 5: Orchestration
+### Phase 5: Orchestration ✅
 **Goal:** agents working together.
 
-- [ ] Pipelines in TOML, for example `plan → [worker × N] → review`, built on parent/child terminals
-- [ ] Broadcast a message to every agent matching a label filter
-- [ ] Tree view of parents and their children
-- [ ] Remote machines: pick a machine when spawning; remote terminals on the same board
+- [x] **Pipelines** (`w`): TOML files of stages in `~/.config/hiero/pipelines/`, plus a built-in
+  `plan-build-review`. A stage is an agent with a prompt or a plain `command`; `count = N` runs
+  N members side by side; `worktree = true` makes each member a Phase 4 task on its own branch.
+  Hiero starts the next stage when every member's turn has ended or it has exited; a command
+  that exits non-zero fails the run. Prompts can use `{task}` `{n}` `{count}` `{branches}`
+  `{dirs}` `{folder}` `{run}` to hand work from one stage to the next
+- [x] Runs are stored in the `hiero` doc with every stage's members; one board drives each run
+  (`A` adopts a run whose board went away); `S` stops, `D` forgets; `e` edits a pipeline
+  (the built-in is copied to a file first)
+- [x] **Tree view**: `p` cycles project → tree → flat. Pipeline members are hc children of the
+  run's first agent, with notes into the parent turned off and outliving it
+- [x] **Broadcast**: `B` sends one message to every live agent shown (search narrows it);
+  `hiero broadcast [--label k=v]… [--force] <text>` from the shell
+- [x] **Remote machines**: a machine row in the new-agent form when hc knows other machines;
+  remote agents show as `box/t3` with `box:` in the project column; attach works through the
+  relay. Worktrees stay local only
+- [x] Clean exits of pipeline members don't land in NEEDS YOU; failures do
+
+**Done when:** tested from the board: a 3-stage pipeline (command → 2 parallel worktree members →
+command) ran to the end and handed plan, branches and folders along; tree view; broadcast from
+the board and the CLI; a shell on a second machine (`hc machine add --via`) started, attached
+and typed into from the board.
 
 ### Phase 6: Polish
 - [ ] Usage and cost panel from agent transcripts
@@ -153,6 +171,9 @@ Tracked here until fixed. ✅ = fixed.
 | 11 | Merge needs the main working tree on the task's base branch with no uncommitted changes, and stops at conflicts (it undoes the merge and says so). | You resolve conflicts by hand: attach to the agent or work in the worktree, then merge again. | A "rebase onto base" action, and letting the agent resolve conflicts. |
 | 12 | Every running Hiero writes timeline notes, so two boards open at once record each note twice. | Duplicate timeline lines. | Let only one Hiero write notes (a lease in the doc). |
 | 13 | New files show in review only up to 500 lines; binary files show as "(binary file)". | Large generated files are cut short in the diff view. | Fine for review; open the worktree for the rest. |
+| 14 | A pipeline only moves forward while the board that drives it is open. | Close Hiero and the run pauses; reopen and press `A` on the run (the old board id is gone). | Adopt runs automatically when their driver has been silent for a while. |
+| 15 | The built-in `plan-build-review` (Claude) is untested end to end to save tokens; only the command/`sh -c` smoke pipeline ran. Agents that never report status (plain shells) never finish a stage. | A real Claude pipeline may need prompt tuning. | Run it on a real task; let shell members finish on exit only. |
+| 16 | Agents on other machines show no git branch and can't use worktrees. | Less information for remote agents. | Read git facts through `hc exec --on`. |
 | ✅ | Real coding agents showed `·` (no status). | — | Phase 3: Claude Code 2.1.319 reports natively (verified); hooks cover older versions; `hiero report` for others. |
 | ✅ | Only tested with shells and fake agents. | — | Phase 3: verified with real Claude Code sessions (working, blocked:permission, done). |
 | ✅ | Coming back from full-screen attach quit the board: ratatui's `clear()` asks for the cursor position and the reply was lost. | — | Fixed in Phase 2: clear the screen directly and build a fresh terminal handle. |
@@ -178,6 +199,7 @@ cargo run -p hiero -- integrate claude --status   # is the Claude bridge install
 cargo run -p hiero -- integrate claude            # install (declines on Claude Code 2.1.319+, which reports natively)
 cargo run -p hiero -- integrate codex             # prints the Codex notify line
 hiero report blocked --kind question --msg "pick a database"   # from inside an hc terminal
+hiero broadcast --label hiero.project=shosha "please rebase on main"
 ```
 
 | Setting | Meaning |
@@ -186,7 +208,8 @@ hiero report blocked --kind question --msg "pick a database"   # from inside an 
 | `HC_SESSION` | Use a separate hc session (default `default`) |
 | `HIERO_LOG` | Log level, for example `debug` or `hc_client=trace` |
 | `HIERO_NO_NOTIFY` | Turn off desktop notifications (the bell still rings) |
-| `VISUAL` / `EDITOR` | Editor for templates (default `vi`) |
+| `VISUAL` / `EDITOR` | Editor for templates and pipelines (default `vi`) |
+| `XDG_CONFIG_HOME` | Where `hiero/pipelines/` lives (default `~/.config`) |
 
 ### Board keys
 
@@ -197,7 +220,7 @@ hiero report blocked --kind question --msg "pick a database"   # from inside an 
 | `n` / `Tab` | next agent that needs you |
 | `x` | dismiss from NEEDS YOU (comes back on its next status change) |
 | `/` | fuzzy search; `Esc` clears |
-| `p` | group by project on/off |
+| `p` | grouping: project → tree (children under parents) → flat |
 | `f` | show finished terminals on/off |
 | `PgUp` `PgDn` / `Ctrl+U` `Ctrl+D` | scroll the preview |
 | `r` | refresh the preview |
@@ -213,6 +236,8 @@ hiero report blocked --kind question --msg "pick a database"   # from inside an 
 | `t` | templates: `r` run · `e` edit · `n` new · `D` delete |
 | `v` | review this agent's task: `j`/`k` file · `PgUp`/`PgDn` scroll · `m` merge · `P` pull request · `K` keep · `D` discard · `r` refresh |
 | `T` | task list: `Enter` review · `g` go to agent · `D` forget a finished task |
+| `w` | pipelines: `Enter` launch / go to run · `e` edit · `S` stop run · `A` adopt run · `D` forget run |
+| `B` | broadcast a message to every live agent shown |
 | `?` | help |
 | `q` / `Ctrl+C` | quit |
 
@@ -250,6 +275,7 @@ crates/
     ├── integrate.rs  status bridge: hooks, report, installers
     ├── tasks.rs      task records in doc "hiero"
     ├── worktree.rs   git worktrees: create, review, merge, PR, remove
+    ├── pipeline.rs   pipeline specs, runs and the stage driver
     ├── git.rs        repo root and branch, read from .git
     └── notify.rs     bell and desktop notifications
 ```

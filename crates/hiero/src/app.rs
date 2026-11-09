@@ -4,6 +4,7 @@ use crate::forms::{
     self, Confirm, FormResult, InputDialog, InputPurpose, SpawnForm, TemplatesView, TextInput,
 };
 use crate::git::GitCache;
+use crate::pipeline::{self, PipelineSpec, Run, RunStatus, Step};
 use crate::tasks::{self, Task, TaskOp, TaskStatus};
 use crate::worktree;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -32,12 +33,44 @@ pub enum Mode {
     Templates(TemplatesView),
     Tasks(TasksView),
     Review(Box<ReviewView>),
+    Pipelines(PipelinesView),
+    Launch(Box<LaunchForm>),
     /// Typing into an agent inside the board.
     Pane,
 }
 
 pub struct TasksView {
     pub selected: usize,
+}
+
+/// How the board groups agents (`p` cycles).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Grouping {
+    Project,
+    /// Parents with their children indented.
+    Tree,
+    Flat,
+}
+
+pub struct PipelinesView {
+    pub specs: Vec<PipelineSpec>,
+    pub errors: Vec<String>,
+    /// Index into specs, then runs (newest first).
+    pub selected: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchField {
+    Task,
+    Folder,
+}
+
+pub struct LaunchForm {
+    pub spec: PipelineSpec,
+    pub task: TextInput,
+    pub folder: TextInput,
+    pub field: LaunchField,
+    pub error: Option<String>,
 }
 
 pub struct ReviewView {
@@ -73,6 +106,13 @@ pub enum Action {
     TaskPr(Box<Task>),
     TaskKeep(Box<Task>),
     TaskDiscard(Box<Task>),
+    /// Send one message to several agents.
+    Broadcast { addrs: Vec<String>, text: String },
+    LoadMachines,
+    LaunchRun { spec: PipelineSpec, task: String, folder: String, driver: String },
+    /// Start a stage of a run; the driver's job.
+    StartStage { run: Box<Run>, stage: usize, templates: Vec<TemplateInfo> },
+    EditPipeline(PathBuf),
 }
 
 pub struct Flash {
@@ -152,6 +192,9 @@ pub struct Info {
     pub turn: u64,
     /// The task this agent works on.
     pub task: Option<String>,
+    /// Nesting in the tree view.
+    pub depth: u16,
+    pub parent: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -186,7 +229,7 @@ pub struct App {
     pub selected: Option<String>,
     pub mode: Mode,
     pub query: String,
-    pub group_by_project: bool,
+    pub grouping: Grouping,
     pub show_finished: bool,
     /// Address → the attention timestamp the person dismissed.
     pub dismissed: HashMap<String, u64>,
@@ -204,8 +247,15 @@ pub struct App {
     pub launch_dir: String,
     /// The terminal Hiero itself runs in, when started inside hc.
     pub self_addr: Option<String>,
-    /// Task records (doc `hiero`).
+    /// Task records and pipeline runs (doc `hiero`).
     pub tasks: tasks::Doc,
+    /// This Hiero's id as a pipeline driver.
+    pub driver_id: String,
+    /// Runs whose next stage is being started right now.
+    pub starting_runs: std::collections::HashSet<String>,
+    /// Alerts raised outside `on_watch` (pipeline results).
+    pub alerts: Vec<Alert>,
+    pub machines: Vec<String>,
     pub tick: u64,
     pub quit: bool,
 }
@@ -226,7 +276,7 @@ impl App {
             selected: None,
             mode: Mode::Normal,
             query: String::new(),
-            group_by_project: true,
+            grouping: Grouping::Project,
             show_finished: true,
             dismissed: HashMap::new(),
             preview: Preview::default(),
@@ -242,6 +292,10 @@ impl App {
                 .unwrap_or_default(),
             self_addr: std::env::var("HC_TERMINAL_ID").ok().filter(|s| !s.is_empty()),
             tasks: tasks::Doc::default(),
+            driver_id: format!("{}-{:x}", std::process::id(), now_ms() % 0xffff_ffff),
+            starting_runs: Default::default(),
+            alerts: Vec::new(),
+            machines: Vec::new(),
             tick: 0,
             quit: false,
         }
@@ -302,6 +356,7 @@ impl App {
                 }
             }
         }
+        self.drive_pipelines();
         self.rebuild();
         alerts
     }
@@ -419,8 +474,228 @@ impl App {
             Mode::Templates(v) => self.key_templates(v, key),
             Mode::Tasks(v) => self.key_tasks(v, key),
             Mode::Review(v) => self.key_review(v, key),
+            Mode::Pipelines(v) => self.key_pipelines(v, key),
+            Mode::Launch(f) => self.key_launch(f, key),
         };
         self.rebuild();
+    }
+
+    /// Live agents in the list right now, except Hiero itself.
+    pub fn broadcast_targets(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Item(i) if i.live && self.self_addr.as_deref() != Some(i.addr.as_str()) => Some(i.addr.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Order items parent-first with children indented under them.
+    fn as_tree(&self, items: Vec<Info>) -> Vec<Info> {
+        let present: std::collections::HashSet<String> = items.iter().map(|i| i.addr.clone()).collect();
+        let mut children: HashMap<String, Vec<Info>> = HashMap::new();
+        let mut roots = Vec::new();
+        for i in items {
+            match i.parent.clone().filter(|p| present.contains(p) && *p != i.addr) {
+                Some(p) => children.entry(p).or_default().push(i),
+                None => roots.push(i),
+            }
+        }
+        fn walk(i: Info, depth: u16, children: &mut HashMap<String, Vec<Info>>, out: &mut Vec<Info>) {
+            let addr = i.addr.clone();
+            out.push(Info { depth, ..i });
+            if depth < 8 {
+                for c in children.remove(&addr).unwrap_or_default() {
+                    walk(c, depth + 1, children, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for r in roots {
+            walk(r, 0, &mut children, &mut out);
+        }
+        // Anything left (cycles) goes at the end, flat.
+        out.extend(children.into_values().flatten());
+        out
+    }
+
+    // ---- pipelines ------------------------------------------------------------
+
+    /// Runs newest first.
+    pub fn run_list(&self) -> Vec<&Run> {
+        let mut list: Vec<&Run> = self.tasks.runs.values().collect();
+        list.sort_by_key(|r| std::cmp::Reverse(r.started_ms));
+        list
+    }
+
+    fn pipelines_view(&mut self) -> Mode {
+        let (specs, errors) = pipeline::load_all();
+        Mode::Pipelines(PipelinesView { specs, errors, selected: 0 })
+    }
+
+    fn key_pipelines(&mut self, mut v: PipelinesView, key: KeyEvent) -> Mode {
+        let runs: Vec<Run> = self.run_list().into_iter().cloned().collect();
+        let n = v.specs.len() + runs.len();
+        let on_run = v.selected.checked_sub(v.specs.len()).and_then(|i| runs.get(i));
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('w') => return Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down if n > 0 => v.selected = (v.selected + 1).min(n - 1),
+            KeyCode::Char('k') | KeyCode::Up => v.selected = v.selected.saturating_sub(1),
+            KeyCode::Enter | KeyCode::Char('r') => {
+                if let Some(spec) = v.specs.get(v.selected) {
+                    let folder = self
+                        .selected_info()
+                        .map(|i| i.dir.clone())
+                        .filter(|d| !d.is_empty() && self.selected.as_deref().is_some_and(|a| !a.contains('/')))
+                        .unwrap_or_else(|| self.launch_dir.clone());
+                    return Mode::Launch(Box::new(LaunchForm {
+                        spec: spec.clone(),
+                        task: TextInput::default(),
+                        folder: TextInput::new(shorten_home(&folder)),
+                        field: LaunchField::Task,
+                        error: None,
+                    }));
+                }
+                if let Some(root) = on_run.and_then(|r| r.members.first().or(r.history.first().and_then(|h| h.first())))
+                    && self.set.get(&root.terminal).is_some()
+                {
+                    self.want_select = Some(root.terminal.clone());
+                    return Mode::Normal;
+                }
+            }
+            KeyCode::Char('e') => {
+                if let Some(spec) = v.specs.get(v.selected) {
+                    self.actions.push(Action::EditPipeline(pipeline::pipelines_dir().join(format!("{}.toml", spec.name))));
+                }
+            }
+            KeyCode::Char('S') => {
+                if let Some(r) = on_run.filter(|r| r.status == RunStatus::Running) {
+                    let mut r = r.clone();
+                    r.status = RunStatus::Stopped;
+                    r.note = "stopped by you; its agents keep running".into();
+                    return Mode::Confirm(Confirm {
+                        message: format!("Stop pipeline run {}? Its agents keep running. (y/n)", r.id),
+                        action: Action::TaskOps(vec![TaskOp::RunPut(Box::new(r))]),
+                    });
+                }
+            }
+            KeyCode::Char('A') => {
+                if let Some(r) = on_run.filter(|r| r.status == RunStatus::Running && r.driver != self.driver_id) {
+                    let mut r = r.clone();
+                    r.driver = self.driver_id.clone();
+                    self.actions.push(Action::TaskOps(vec![TaskOp::RunPut(Box::new(r))]));
+                    self.flash("this board drives the run now");
+                }
+            }
+            KeyCode::Char('D') => {
+                if let Some(r) = on_run {
+                    if r.status == RunStatus::Running {
+                        self.flash_error("stop it first (S)");
+                    } else {
+                        self.actions.push(Action::TaskOps(vec![TaskOp::RunForget(r.id.clone())]));
+                    }
+                }
+            }
+            _ => {}
+        }
+        Mode::Pipelines(v)
+    }
+
+    fn key_launch(&mut self, mut f: Box<LaunchForm>, key: KeyEvent) -> Mode {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => return self.pipelines_view(),
+            KeyCode::Tab | KeyCode::Down | KeyCode::Up | KeyCode::BackTab => {
+                f.field = if f.field == LaunchField::Task { LaunchField::Folder } else { LaunchField::Task };
+            }
+            KeyCode::Enter if f.field == LaunchField::Task => f.field = LaunchField::Folder,
+            KeyCode::Enter => return self.submit_launch(f),
+            KeyCode::Char('s') if ctrl => return self.submit_launch(f),
+            _ => {
+                f.error = None;
+                match f.field {
+                    LaunchField::Task => f.task.handle(key),
+                    LaunchField::Folder => f.folder.handle(key),
+                };
+            }
+        }
+        Mode::Launch(f)
+    }
+
+    fn submit_launch(&mut self, mut f: Box<LaunchForm>) -> Mode {
+        let task = f.task.value().trim().to_string();
+        let folder = forms::expand_home(f.folder.value().trim());
+        if task.is_empty() {
+            f.error = Some("say what the pipeline should do".into());
+            return Mode::Launch(f);
+        }
+        if !folder.is_dir() {
+            f.error = Some(format!("no such folder: {}", folder.display()));
+            return Mode::Launch(f);
+        }
+        if f.spec.stages.iter().any(|s| s.worktree) && crate::git::probe(&folder).is_none() {
+            f.error = Some("this pipeline uses worktrees; pick a folder inside a git repo".into());
+            return Mode::Launch(f);
+        }
+        self.actions.push(Action::LaunchRun {
+            spec: f.spec.clone(),
+            task,
+            folder: folder.to_string_lossy().into_owned(),
+            driver: self.driver_id.clone(),
+        });
+        self.flash(&format!("launching {}…", f.spec.name));
+        Mode::Normal
+    }
+
+    /// Re-read pipeline files after an edit.
+    pub fn reload_pipelines(&mut self) {
+        if let Mode::Pipelines(v) = &mut self.mode {
+            let (specs, errors) = pipeline::load_all();
+            v.specs = specs;
+            v.errors = errors;
+            v.selected = v.selected.min(v.specs.len().saturating_sub(1));
+        }
+    }
+
+    /// Advance the runs this Hiero drives.
+    pub fn drive_pipelines(&mut self) {
+        let runs: Vec<Run> = self
+            .tasks
+            .runs
+            .values()
+            .filter(|r| r.status == RunStatus::Running && r.driver == self.driver_id && !self.starting_runs.contains(&r.id))
+            .cloned()
+            .collect();
+        for run in runs {
+            match pipeline::next_step(&run, &self.set) {
+                Step::Wait => {}
+                Step::Start(stage) => {
+                    self.starting_runs.insert(run.id.clone());
+                    self.actions.push(Action::StartStage { run: Box::new(run), stage, templates: self.templates.clone() });
+                }
+                Step::Finish => {
+                    let mut r = run.clone();
+                    r.status = RunStatus::Done;
+                    r.history.push(std::mem::take(&mut r.members));
+                    r.note = "all stages finished".into();
+                    self.alerts.push(Alert {
+                        title: "hiero · pipeline".into(),
+                        body: format!("{} finished: {}", r.pipeline, r.task),
+                    });
+                    self.starting_runs.insert(r.id.clone()); // until the doc says done
+                    self.actions.push(Action::TaskOps(vec![TaskOp::RunPut(Box::new(r))]));
+                }
+                Step::Fail(why) => {
+                    let mut r = run.clone();
+                    r.status = RunStatus::Failed;
+                    r.note = why.clone();
+                    self.alerts.push(Alert { title: "hiero · pipeline failed".into(), body: format!("{}: {why}", r.pipeline) });
+                    self.starting_runs.insert(r.id.clone());
+                    self.actions.push(Action::TaskOps(vec![TaskOp::RunPut(Box::new(r))]));
+                }
+            }
+        }
     }
 
     /// Tasks newest first.
@@ -574,7 +849,16 @@ impl App {
 
     pub fn on_doc(&mut self, doc: tasks::Doc) {
         self.tasks = doc;
+        // Runs no longer running need no guard.
+        let runs = &self.tasks.runs;
+        self.starting_runs.retain(|id| runs.get(id).is_some_and(|r| r.status == RunStatus::Running));
+        self.drive_pipelines();
         self.rebuild();
+    }
+
+    /// A stage finished starting (or failed to).
+    pub fn on_stage_started(&mut self, run_id: &str) {
+        self.starting_runs.remove(run_id);
     }
 
     /// Pasted text goes into whatever is being typed.
@@ -633,9 +917,32 @@ impl App {
             KeyCode::Char('/') => return Mode::Search,
             KeyCode::Esc => self.query.clear(),
             KeyCode::Char('p') => {
-                self.group_by_project = !self.group_by_project;
-                self.flash(if self.group_by_project { "grouped by project" } else { "one list" });
+                self.grouping = match self.grouping {
+                    Grouping::Project => Grouping::Tree,
+                    Grouping::Tree => Grouping::Flat,
+                    Grouping::Flat => Grouping::Project,
+                };
+                self.flash(match self.grouping {
+                    Grouping::Project => "grouped by project",
+                    Grouping::Tree => "tree: children under their parents",
+                    Grouping::Flat => "one list",
+                });
             }
+            KeyCode::Char('B') => {
+                let addrs = self.broadcast_targets();
+                if addrs.is_empty() {
+                    self.flash_error("no live agents shown to broadcast to");
+                } else {
+                    return Mode::Input(InputDialog {
+                        title: format!("broadcast to {} agent{} shown", addrs.len(), if addrs.len() == 1 { "" } else { "s" }),
+                        hint: "enter sends to every live agent in the list (search narrows it) · esc cancel".into(),
+                        input: TextInput::default(),
+                        purpose: InputPurpose::Broadcast(addrs),
+                        force: false,
+                    });
+                }
+            }
+            KeyCode::Char('w') => return self.pipelines_view(),
             KeyCode::Char('f') => {
                 self.show_finished = !self.show_finished;
                 self.flash(if self.show_finished { "showing finished" } else { "hiding finished" });
@@ -760,6 +1067,13 @@ impl App {
                         self.actions.push(Action::Label(addr.clone(), labels));
                         Mode::Normal
                     }
+                    InputPurpose::Broadcast(addrs) => {
+                        if text.is_empty() {
+                            return Mode::Input(d);
+                        }
+                        self.actions.push(Action::Broadcast { addrs: addrs.clone(), text });
+                        Mode::Normal
+                    }
                     InputPurpose::NewTemplate => {
                         if !forms::valid_template_name(&text) {
                             self.flash_error("use letters, digits, - and _");
@@ -834,11 +1148,9 @@ impl App {
             .filter(|d| !d.is_empty())
             .unwrap_or_else(|| self.launch_dir.clone());
         let folder = shorten_home(&folder);
-        Mode::Spawn(Box::new(SpawnForm::new(
-            forms::agent_choices(&self.templates),
-            folder,
-            preselect,
-        )))
+        let mut form = SpawnForm::new(forms::agent_choices(&self.templates), folder, preselect);
+        form.machines.extend(self.machines.iter().cloned());
+        Mode::Spawn(Box::new(form))
     }
 
     /// The selected terminal as (address, name), if it fits.
@@ -999,7 +1311,10 @@ impl App {
             if info.wait_ms.is_some() {
                 waiting.push(info);
             } else if info.live || self.show_finished {
-                let key = if self.group_by_project { info.project.clone() } else { "agents".into() };
+                let key = match self.grouping {
+                    Grouping::Project => info.project.clone(),
+                    Grouping::Tree | Grouping::Flat => "agents".into(),
+                };
                 groups.entry(key).or_default().push(info);
             }
         }
@@ -1016,6 +1331,9 @@ impl App {
         }
         for (title, mut items) in groups {
             items.sort_by(|a, b| (!a.live, b.up_ms).cmp(&(!b.live, a.up_ms)));
+            if self.grouping == Grouping::Tree {
+                items = self.as_tree(items);
+            }
             entries.push(Entry::Header {
                 title,
                 count: items.len(),
@@ -1063,7 +1381,8 @@ impl App {
             .filter(|d| !d.is_empty())
             .unwrap_or(&t.cwd)
             .to_string();
-        let git = self.git.lookup(&dir);
+        // Remote folders aren't on this disk.
+        let git = if t.address.contains('/') { None } else { self.git.lookup(&dir) };
         let project = t
             .labels
             .get(LABEL_PROJECT)
@@ -1071,6 +1390,11 @@ impl App {
             .or_else(|| git.as_ref().map(|g| g.name()))
             .unwrap_or_else(|| basename(&dir));
 
+        // Say which machine a remote agent is on.
+        let project = match t.address.split_once('/') {
+            Some((machine, _)) => format!("{machine}:{project}"),
+            None => project,
+        };
         let att = attention(t);
         let dismissed = self.dismissed.get(&t.address) == Some(&attention_ts(t));
         let wait_ms = match att {
@@ -1100,6 +1424,8 @@ impl App {
             title: t.title.clone(),
             turn: t.turn,
             task: self.tasks.by_terminal(&t.address).map(|k| k.title.clone()),
+            depth: 0,
+            parent: t.parent.clone(),
         }
     }
 }
@@ -1145,6 +1471,10 @@ pub fn attention(t: &Terminal) -> Option<Attention> {
             AgentState::Done => Some(Attention::Done),
             _ => None,
         };
+    }
+    // Pipeline members are meant to finish; only a failure needs a person.
+    if t.labels.contains_key("hiero.run") && t.exit_code == Some(0) {
+        return None;
     }
     match t.reason.as_deref() {
         Some("killed" | "server_stop" | "host_shutdown" | "stopped_by_restart") => None,

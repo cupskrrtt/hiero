@@ -78,6 +78,9 @@ pub struct Task {
 pub struct Doc {
     #[serde(default)]
     pub tasks: BTreeMap<String, Task>,
+    /// Pipeline runs.
+    #[serde(default)]
+    pub runs: BTreeMap<String, crate::pipeline::Run>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -107,6 +110,9 @@ pub enum TaskOp {
     Note { id: String, what: String },
     SetPr { id: String, url: String },
     Forget(String),
+    /// Insert or replace a pipeline run.
+    RunPut(Box<crate::pipeline::Run>),
+    RunForget(String),
 }
 
 pub fn apply(doc: &mut Doc, op: &TaskOp, now: u64) {
@@ -137,6 +143,12 @@ pub fn apply(doc: &mut Doc, op: &TaskOp, now: u64) {
         }
         TaskOp::Forget(id) => {
             doc.tasks.remove(id);
+        }
+        TaskOp::RunPut(r) => {
+            doc.runs.insert(r.id.clone(), (**r).clone());
+        }
+        TaskOp::RunForget(id) => {
+            doc.runs.remove(id);
         }
     }
 }
