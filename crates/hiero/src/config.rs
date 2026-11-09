@@ -1,8 +1,8 @@
 //! `~/.config/hiero/config.toml`, plus per-viewer UI state in
-//! `~/.local/state/hiero/ui.json`. Everything has a default; a missing or
+//! `~/.local/state/hiero/ui.json` (on Windows `%APPDATA%\hiero` and `%LOCALAPPDATA%\hiero`). Everything has a default; a missing or
 //! partly filled file is fine.
 
-use crate::widgets::expand_home;
+use crate::paths;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -140,19 +140,11 @@ pub fn set(cfg: Config) {
 }
 
 pub fn config_path() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| expand_home("~/.config"));
-    base.join("hiero").join("config.toml")
+    paths::config_base().join("hiero").join("config.toml")
 }
 
 pub fn state_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| expand_home("~/.local/state"));
-    base.join("hiero")
+    paths::state_base().join("hiero")
 }
 
 /// Load the config; a broken file is an error worth showing, not a crash.

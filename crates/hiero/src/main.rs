@@ -1,6 +1,7 @@
 mod config;
 mod keys;
 mod notify;
+mod paths;
 mod widgets;
 mod workspace;
 mod ws_app;
@@ -215,11 +216,11 @@ fn config_cmd(action: Option<ConfigCmd>, error: Option<String>) -> Result<()> {
 
 /// An existing folder, as an absolute path.
 fn existing_dir(p: &std::path::Path) -> Result<String> {
-    let abs = p.canonicalize().map_err(|e| anyhow::anyhow!("{}: {e}", p.display()))?;
-    if !abs.is_dir() {
-        anyhow::bail!("{} is not a folder", abs.display());
+    let abs = paths::canonical(p).map_err(|e| anyhow::anyhow!("{}: {e}", p.display()))?;
+    if !std::path::Path::new(&abs).is_dir() {
+        anyhow::bail!("{abs} is not a folder");
     }
-    Ok(abs.to_string_lossy().into_owned())
+    Ok(abs)
 }
 
 async fn ws_cmd(cmd: WsCmd) -> Result<()> {
@@ -419,7 +420,7 @@ async fn debug(cmd: Debug) -> Result<()> {
 
 /// Print each key event as crossterm sees it, and whether it is the prefix.
 fn debug_keys() -> Result<()> {
-    use crossterm::event::{Event, KeyCode, KeyEventKind, read};
+    use crossterm::event::{Event, KeyCode, read};
     let prefix = config::get().prefix();
     println!("Press keys to see what Hiero receives (prefix is {}). Esc twice quits.\r", prefix.label());
     crossterm::terminal::enable_raw_mode()?;
@@ -427,7 +428,7 @@ fn debug_keys() -> Result<()> {
         let mut last_esc = false;
         loop {
             if let Event::Key(k) = read()? {
-                if k.kind == KeyEventKind::Release {
+                if !keys::is_input(k.kind) {
                     continue;
                 }
                 let tag = if prefix.matches(&k) { "  <- PREFIX" } else { "" };

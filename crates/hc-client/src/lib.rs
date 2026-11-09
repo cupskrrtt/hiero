@@ -19,6 +19,7 @@ mod error;
 pub mod events;
 pub mod framed;
 mod state;
+mod transport;
 mod types;
 
 pub use client::Client;

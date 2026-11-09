@@ -1,5 +1,5 @@
 //! Tell the person an agent needs them: terminal bell plus a desktop
-//! notification when one is available (notify-send, or a Windows toast on WSL).
+//! notification when one is available (notify-send, or a Windows toast on Windows and WSL).
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -7,8 +7,10 @@ use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Backend {
+    #[cfg_attr(windows, allow(dead_code))]
     NotifySend,
-    WslToast,
+    /// A PowerShell toast; under WSL the text needs `WSLENV` to cross over.
+    Toast,
     None,
 }
 
@@ -17,22 +19,36 @@ fn backend() -> Backend {
     *B.get_or_init(|| {
         if std::env::var_os("HIERO_NO_NOTIFY").is_some() {
             Backend::None
-        } else if on_path("notify-send") {
-            Backend::NotifySend
-        } else if is_wsl() && on_path("powershell.exe") {
-            Backend::WslToast
         } else {
-            Backend::None
+            detect()
         }
     })
 }
 
+#[cfg(windows)]
+fn detect() -> Backend {
+    Backend::Toast
+}
+
+#[cfg(unix)]
+fn detect() -> Backend {
+    if on_path("notify-send") {
+        Backend::NotifySend
+    } else if is_wsl() && on_path("powershell.exe") {
+        Backend::Toast
+    } else {
+        Backend::None
+    }
+}
+
+#[cfg(unix)]
 fn on_path(cmd: &str) -> bool {
     std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|d| d.join(cmd).is_file()))
         .unwrap_or(false)
 }
 
+#[cfg(unix)]
 fn is_wsl() -> bool {
     std::env::var_os("WSL_DISTRO_NAME").is_some()
         || std::fs::read_to_string("/proc/sys/kernel/osrelease")
@@ -69,16 +85,25 @@ pub fn alert(what: &str, title: &str, body: &str) {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn(),
-        Backend::WslToast => Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", TOAST_PS])
-            // Text goes through the environment so nothing needs escaping.
-            .env("HIERO_TOAST_TITLE", title)
-            .env("HIERO_TOAST_BODY", body)
-            .env("WSLENV", "HIERO_TOAST_TITLE:HIERO_TOAST_BODY")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn(),
+        Backend::Toast => {
+            let mut cmd = Command::new("powershell.exe");
+            cmd.args(["-NoProfile", "-NonInteractive", "-Command", TOAST_PS])
+                // Text goes through the environment so nothing needs escaping.
+                .env("HIERO_TOAST_TITLE", title)
+                .env("HIERO_TOAST_BODY", body)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if !cfg!(windows) {
+                cmd.env("WSLENV", "HIERO_TOAST_TITLE:HIERO_TOAST_BODY");
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            }
+            cmd.spawn()
+        }
         Backend::None => return,
     };
     if let Ok(mut child) = spawned {

@@ -39,6 +39,43 @@ cargo install --locked --git https://github.com/cupskrrtt/hiero hiero
 cargo install --path crates/hiero
 ```
 
+## Windows
+
+Hiero runs natively on Windows (not only in WSL).
+
+Requirements:
+
+- [herdr-core](https://github.com/herdrdev/herdr-core) for Windows (`hc.exe`), running: `hc server status`.
+- Rust with the MSVC toolchain (`stable-x86_64-pc-windows-msvc`) and the Visual Studio C++ build tools.
+
+Install, in PowerShell:
+
+```powershell
+cargo install --locked --git https://github.com/cupskrrtt/hiero hiero
+# or from a checkout
+cargo install --path crates\hiero
+```
+
+Hiero finds the core on the named pipe `\\.\pipe\herdr-core-<user>-<session>.sock` (`<user>` is
+`%USERNAME%` with only letters and digits; `<session>` is `HC_SESSION` or `default`). `HC_SOCKET`
+overrides it. A `socket` key in herdr-core's `config.toml` is not read.
+
+| Path | What |
+|---|---|
+| `%APPDATA%\hiero\config.toml` | settings |
+| `%LOCALAPPDATA%\hiero\ui.json`, `hiero.log` | remembered UI state, log |
+
+`XDG_CONFIG_HOME` and `XDG_STATE_HOME`, when set, win over these. Folders are stored as plain
+`C:\...` paths; `~` means `%USERPROFILE%`.
+
+- A pane without a command starts PowerShell 7 (or Windows PowerShell), chosen by herdr-core.
+- **Windows and WSL are two separate cores.** Native Windows Hiero and Hiero inside WSL talk to
+  different herdr-core servers, with separate terminals, workspaces and documents.
+- The Windows core keeps running after you close the window, and ends when you sign out or
+  restart. With `restore = true`, opening a workspace afterwards starts its terminals again in
+  their layout.
+- Desktop notifications are a PowerShell toast (plus the bell).
+
 ## Quick start
 
 1. Run `hiero`. The sidebar is empty.
@@ -177,7 +214,7 @@ mouse = true                 # clicks, wheel, border drags; Shift+drag still sel
 
 [notify]
 bell = true
-desktop = true               # notify-send, or a Windows toast on WSL
+desktop = true               # notify-send, or a Windows toast (Windows and WSL)
 on = ["blocked", "error", "done", "failed"]   # also: exited
 ```
 
@@ -212,12 +249,12 @@ Projects and workspaces are named exactly on the command line. Folders must exis
 
 | Variable | Meaning |
 |---|---|
-| `HC_SOCKET` | Use this core socket |
+| `HC_SOCKET` | Use this core socket (on Windows a pipe name like `\\.\pipe\herdr-core-me-x.sock`) |
 | `HC_SESSION` | Use a separate hc session (default `default`) |
 | `HIERO_LOG` | Log level, for example `debug` or `hc_client=trace` |
 | `HIERO_NO_NOTIFY` | Turn off desktop notifications (the bell still rings) |
-| `XDG_CONFIG_HOME` | Where `hiero/config.toml` lives (default `~/.config`) |
-| `XDG_STATE_HOME` | Where `hiero/hiero.log` and `hiero/ui.json` live (default `~/.local/state`) |
+| `XDG_CONFIG_HOME` | Where `hiero/config.toml` lives (default `~/.config`, Windows `%APPDATA%`) |
+| `XDG_STATE_HOME` | Where `hiero/hiero.log` and `hiero/ui.json` live (default `~/.local/state`, Windows `%LOCALAPPDATA%`) |
 | `HIERO_PANE` / `HIERO_WS` | Set by Hiero inside its panes (pane and workspace id); used to refuse nesting |
 
 ## Files
@@ -243,6 +280,8 @@ running terminals are not touched.
 | 4 | A second client attached to a workspace pane (for example `hc attach`) takes the size: herdr-core gives it to the last active viewer. | The program reflows to the smaller size. | Observe-only stream until the first key. |
 | 5 | The Windows toast (WSL) is sent with exit code 0, but nobody has confirmed it appears. | Desktop notifications may be silent on WSL; the bell still rings. | Confirm on a real desktop. |
 | 6 | No release binaries and no AUR entry. The PKGBUILD builds the local checkout. | Install from source. | Tag `v0.3.0`, point the PKGBUILD at the tarball. |
+| 7 | Windows: not tested in a real console (Windows Terminal, conhost); only inside an hc terminal. Bracketed paste may be refused by the console (a paste then arrives as typed keys). | Pastes into panes can be slower, and a multi-line paste may run line by line. | Check in Windows Terminal. |
+| 8 | Windows: the `socket` key of herdr-core's `config.toml` is not read, and win32-input-mode (`CSI ?9001h`) is not implemented (plain VT keys work in PowerShell 7 and cmd.exe). | A program that insists on win32-input-mode may misread keys. | Encode keys that way when a pane asks. |
 
 Fixed:
 
@@ -290,7 +329,8 @@ are fixed).
 crates/
 ├── hc-client/src/
 │   ├── lib.rs        exports
-│   ├── endpoint.rs   find the socket
+│   ├── endpoint.rs   find the socket or pipe
+│   ├── transport.rs  Unix socket / Windows named pipe
 │   ├── client.rs     JSON-RPC calls
 │   ├── error.rs      typed errors
 │   ├── types.rs      Terminal, Status, RunParams, …
@@ -306,6 +346,7 @@ crates/
     ├── widgets.rs    text input, popups, painting a terminal screen
     ├── keys.rs       key and mouse events → terminal bytes
     ├── config.rs     config.toml, remembered UI state
+    ├── paths.rs      config/state folders, home, folder spelling (Unix and Windows)
     └── notify.rs     bell and desktop notifications
 packaging/arch/       PKGBUILD
 docs/HISTORY.md       per-phase checklists

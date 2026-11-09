@@ -1,8 +1,14 @@
 //! Turn crossterm key events back into the bytes a terminal would send,
 //! for typing into a pane's program.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton};
 use vt100::MouseProtocolEncoding;
+
+/// Whether a key event should act: crossterm on Windows also reports key releases,
+/// which must not type a second time. Repeat is auto-repeat of a held key.
+pub fn is_input(kind: KeyEventKind) -> bool {
+    kind != KeyEventKind::Release
+}
 
 /// `app_cursor`: the program asked for application cursor keys (DECCKM).
 pub fn encode(key: KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
@@ -185,6 +191,13 @@ mod tests {
 
     fn k(code: KeyCode, m: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, m)
+    }
+
+    #[test]
+    fn releases_are_not_input() {
+        assert!(is_input(KeyEventKind::Press));
+        assert!(is_input(KeyEventKind::Repeat));
+        assert!(!is_input(KeyEventKind::Release));
     }
 
     #[test]

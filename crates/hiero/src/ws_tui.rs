@@ -5,7 +5,7 @@ use crate::ws_app::{Action, Out, Plan, WsApp};
 use crate::{config, keys, notify, ws_ui};
 use anyhow::Result;
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event as TermEvent, EventStream, KeyEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event as TermEvent, EventStream,
 };
 use crossterm::execute;
 use futures::StreamExt;
@@ -89,7 +89,10 @@ pub async fn run(config_error: Option<String>) -> Result<()> {
         let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
         previous(info);
     }));
-    execute!(std::io::stdout(), EnableBracketedPaste)?;
+    // Some Windows consoles refuse bracketed paste (pastes then arrive as keys); that's fine.
+    if let Err(e) = execute!(std::io::stdout(), EnableBracketedPaste) {
+        tracing::debug!("bracketed paste unavailable: {e}");
+    }
     if config::get().workspace.mouse {
         execute!(std::io::stdout(), EnableMouseCapture)?;
     }
@@ -222,7 +225,7 @@ async fn event_loop(
 
         tokio::select! {
             ev = keys.next() => match ev {
-                Some(Ok(TermEvent::Key(k))) if k.kind != KeyEventKind::Release => {
+                Some(Ok(TermEvent::Key(k))) if keys::is_input(k.kind) => {
                     if let Some(out) = app.on_key(k) {
                         let bytes = match out {
                             Out::Key(k) => keys::encode(k, app.focused_app_cursor()),

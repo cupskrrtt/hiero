@@ -8,7 +8,6 @@ use ratatui::text::Span;
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::num::NonZeroU16;
-use std::path::PathBuf;
 
 #[derive(Debug, Clone, Default)]
 pub struct TextInput {
@@ -92,15 +91,6 @@ impl TextInput {
             _ => return false,
         }
         true
-    }
-}
-
-pub fn expand_home(p: &str) -> PathBuf {
-    match (p.strip_prefix('~'), std::env::var_os("HOME")) {
-        (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
-            PathBuf::from(home).join(rest.trim_start_matches('/'))
-        }
-        _ => PathBuf::from(p),
     }
 }
 

@@ -5,6 +5,7 @@
 
 use crate::endpoint;
 use crate::error::{Error, Result, WireError};
+use crate::transport::{self, Reader, Writer};
 use crate::types::Terminal;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -13,7 +14,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, oneshot};
 
 pub const DATA: u8 = 0;
@@ -77,7 +77,7 @@ struct Routes {
 /// One framed connection. Each attach gets its own, so dropping the stream
 /// closes everything.
 struct Conn {
-    writer: tokio::sync::Mutex<OwnedWriteHalf>,
+    writer: tokio::sync::Mutex<Writer>,
     pending: Pending,
     routes: Arc<Mutex<Routes>>,
     next_id: AtomicU64,
@@ -85,13 +85,12 @@ struct Conn {
 
 impl Conn {
     async fn open(path: &Path) -> Result<Arc<Conn>> {
-        let stream = tokio::net::UnixStream::connect(path)
+        let (r, mut w) = transport::connect(path)
             .await
             .map_err(|source| Error::Connect {
                 path: path.display().to_string(),
                 source,
             })?;
-        let (r, mut w) = stream.into_split();
         let mut r = BufReader::new(r);
 
         // Plain-mode hello asking to switch; its reply is the last plain line.
@@ -161,7 +160,7 @@ impl Conn {
     }
 }
 
-async fn read_loop(mut r: BufReader<OwnedReadHalf>, pending: Pending, routes: Arc<Mutex<Routes>>) {
+async fn read_loop(mut r: BufReader<Reader>, pending: Pending, routes: Arc<Mutex<Routes>>) {
     let mut header = [0u8; 9];
     loop {
         if r.read_exact(&mut header).await.is_err() {

@@ -44,13 +44,12 @@ impl Client {
         path: &Path,
         notifications: bool,
     ) -> Result<(Self, Option<mpsc::UnboundedReceiver<Notification>>)> {
-        let stream = tokio::net::UnixStream::connect(path)
+        let (r, w) = crate::transport::connect(path)
             .await
             .map_err(|source| Error::Connect {
                 path: path.display().to_string(),
                 source,
             })?;
-        let (r, w) = stream.into_split();
         Ok(Self::from_parts(r, w, notifications))
     }
 

@@ -4,7 +4,8 @@
 //! can be tested.
 
 use crate::notify::Alert;
-use crate::widgets::{PaneView, TextInput, expand_home};
+use crate::paths::{self, expand_home};
+use crate::widgets::{PaneView, TextInput};
 use crate::config::Prefix;
 use crate::keys::{self, MouseAct};
 use crate::workspace::{self, Border, Dir, Move, Tab, Workspace, WsDoc, WsOp, WsStatus, new_id};
@@ -1321,7 +1322,7 @@ impl WsApp {
 
     /// The tab's name for a command: its program (`nvim .` is `nvim`).
     fn tab_base(command: Option<&str>) -> String {
-        let prog = command.and_then(|c| c.split_whitespace().next()).and_then(|p| p.rsplit('/').next());
+        let prog = command.and_then(|c| c.split_whitespace().next()).map(paths::program_name);
         prog.filter(|p| !p.is_empty()).unwrap_or("shell").to_string()
     }
 
@@ -1789,11 +1790,11 @@ fn existing_dir(text: &str) -> Result<String, String> {
     if text.is_empty() {
         return Err("the folder can't be empty".into());
     }
-    let abs = expand_home(text).canonicalize().map_err(|_| format!("{text}: no such folder"))?;
-    if !abs.is_dir() {
+    let abs = paths::canonical(&expand_home(text)).map_err(|_| format!("{text}: no such folder"))?;
+    if !std::path::Path::new(&abs).is_dir() {
         return Err(format!("{text} is not a folder"));
     }
-    Ok(abs.to_string_lossy().into_owned())
+    Ok(abs)
 }
 
 #[cfg(test)]
@@ -2279,14 +2280,14 @@ mod tests {
         assert!(a.actions.is_empty());
 
         a.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        for c in "/tmp".chars() {
+        for c in std::env::temp_dir().to_string_lossy().chars() {
             a.on_key(key(c));
         }
         a.on_key(code(KeyCode::Enter));
         let ops = only_update(&mut a);
         let [WsOp::AddWorkspace { project, id, name, folder, .. }] = &ops[..] else { panic!("{ops:?}") };
         assert_eq!((project.as_str(), name.as_str()), ("p1", "api"));
-        assert!(folder.starts_with('/'));
+        assert!(std::path::Path::new(folder).is_absolute() && !folder.starts_with(r"\\?\"), "{folder}");
 
         // When the doc comes back the new workspace opens with focus.
         let mut doc = a.doc.clone();
