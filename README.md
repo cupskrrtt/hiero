@@ -118,6 +118,22 @@ everything shares one history.
 - [ ] Restore layout and selection, help overlay, log file
 - [ ] AUR `PKGBUILD` and release binaries
 
+## Known issues
+
+Tracked here until fixed. ✅ = fixed.
+
+| # | Issue | Impact | Plan |
+|---|---|---|---|
+| 1 | Real coding agents show `·` (no status). herdr-core only knows a status the program reports through OSC 7501, and Claude Code doesn't report one natively. | Claude agents never reach NEEDS YOU. | Phase 3 status bridge (hooks). |
+| 2 | Only tested with shells and fake agents, not a real Claude session. | Agent-specific quirks (trust dialogs, startup timing) are unverified. | Test with real Claude in Phase 3. |
+| 3 | Opening an agent inside the board (`o`) resizes the agent to the pane. herdr-core gives the size to the last active viewer. | The agent reflows to a smaller size; full-screen attach (`a`) sizes it back. | Could use an observe-only stream for viewing and become a viewer only on the first keypress. |
+| 4 | The board redraws timers and the spinner every second, so its screen never goes quiet. | When Hiero itself runs inside an hc terminal, `hc send` / `hc keys` into it fail with "output has not settled". Normal use is unaffected. | Redraw only when something visible changes, and tick wait timers less often. |
+| 5 | For agents on PATH the task goes in as the last argument (`claude "<task>"`). | Agents that take their prompt differently start without the task. | Use a template for those; later, per-agent launch settings in Hiero's config. |
+| 6 | The Windows toast (WSL) is sent with exit code 0, but nobody has confirmed it actually appears. | Desktop notifications may be silent on WSL; the bell still rings. | Confirm on a real desktop; fall back to `wsl-notify-send` if needed. |
+| 7 | Rename is stored as a `hiero.name` label because hc has no rename. | `hc ls` and other tools still show the original name. | Use a real rename if herdr-core adds one. |
+| ✅ | Coming back from full-screen attach quit the board: ratatui's `clear()` asks for the cursor position and the reply was lost. | — | Fixed in Phase 2: clear the screen directly and build a fresh terminal handle. |
+| ✅ | The board could attach to its own terminal (endless loop). | — | Fixed in Phase 2: attach, open, kill and preview skip the terminal Hiero runs in. |
+
 ## Getting started
 
 Requires a running herdr-core (`hc server status`) and a Rust toolchain.
