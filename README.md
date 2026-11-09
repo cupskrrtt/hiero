@@ -2,293 +2,291 @@
 
 A terminal workspace on top of [herdr-core](https://github.com/herdrdev/herdr-core) (`hc`).
 
-Hiero shows projects and named workspaces in a sidebar. Each workspace is a set of tabs and
-splits, and every pane is a terminal (nvim, Claude Code, a shell) that herdr-core keeps running
-in the background. Quit Hiero, come back later, and the layout and the programs are still there.
+The sidebar lists your projects, and each project holds named workspaces (`frontend`,
+`backend`, `runner`, …). A workspace is a set of tabs and splits, and every pane is a real
+terminal (nvim, Claude Code, a shell, anything) that herdr-core keeps running in the background.
+Quit Hiero, come back later, and the layout and the programs are still there.
 
 ```
 ┌ projects ──────────┐  1 editor   2 agents   3 shell
-│▾ shosha            │┌ nvim . t4 ──────────────────┐┌ claude t5 ─────────────────┐
-│  ▶ ● frontend      ││                             ││ ◐ approve Write: src/a.rs  │
-│    ◐ backend       ││  fn main() {                ││                            │
-│    ✓ docs          ││                             │└────────────────────────────┘
-│▸ solo ·            ││                             │┏ shell t6 ━━━━━━━━━━━━━━━━━━┓
-│                    ││                             │┃ $ cargo test               ┃
-└────────────────────┘└─────────────────────────────┘┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
- ctrl+b then  t tab · v s split · hjkl move · z zoom · ? help · q quit
+│▾ shosha            │┏ nvim . t4 ━━━━━━━━━━━━━━━━━━━┓┌ claude t5 ─────────────────┐
+│  ▶ ● frontend      │┃                              ┃│                            │
+│    ◐ backend       │┃  fn main() {                 ┃│                            │
+│    ✓ docs          │┃                              ┃└────────────────────────────┘
+│▾ hiero             │┃                              ┃┌ server t6 ─────────────────┐
+│    · notes         │┃                              ┃│ $ cargo run                │
+└────────────────────┘┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛└────────────────────────────┘
+ t/T tab · v/s split (V/S ask) · hjkl move · HJKL size · 1-9 [ ] tab · … · ? help
 ```
 
-Hiero keeps no database of its own. Terminals live in herdr-core, and Hiero's data (projects,
-workspaces, layouts) lives in herdr-core's document store.
+- **Persistent.** Panes are herdr-core terminals. Closing Hiero, switching workspaces or losing the
+  connection doesn't stop them.
+- **Restored.** Layouts are saved. When a workspace opens, panes whose terminals are gone start
+  again with their saved command.
+- **Out of the way.** Hiero's own keys sit behind a prefix key (`ctrl+b`), so nvim and Claude get
+  every other key. The mouse works too.
+- **Status at a glance.** The sidebar shows which workspace is working, done, or needs you, from
+  what the programs report (Claude Code does this by itself).
 
-Hiero's own keys sit behind a prefix key (default `ctrl+b`), so nvim and Claude get every other
-key.
+Hiero keeps no database of its own: terminals live in herdr-core, and the projects, workspaces
+and layouts live in herdr-core's document store. It runs on Linux, WSL and native Windows.
 
 ## Install
 
-Needs [herdr-core](https://github.com/herdrdev/herdr-core) running (`hc server status`).
+You need herdr-core installed and running (`hc server status`).
 
 ```sh
-# Arch: build and install a package from this checkout
+# Linux / WSL / Windows, with Rust
+cargo install --locked --git https://github.com/cupskrrtt/hiero hiero
+
+# a fixed release
+cargo install --locked --git https://github.com/cupskrrtt/hiero --tag v0.3.0 hiero
+
+# from a checkout
+cargo install --locked --path crates/hiero
+
+# Arch: build and install a package from a checkout
 cd packaging/arch && makepkg -si
-
-# from GitHub, with Rust
-cargo install --locked --git https://github.com/cupskrrtt/hiero hiero
-
-# from a checkout, with Rust
-cargo install --path crates/hiero
 ```
 
-## Windows
+Update with the same `cargo install` command plus `--force`. On Windows, quit Hiero first: a running
+`.exe` can't be replaced.
 
-Hiero runs natively on Windows (not only in WSL).
-
-Requirements:
-
-- [herdr-core](https://github.com/herdrdev/herdr-core) for Windows (`hc.exe`), running: `hc server status`.
-- Rust with the MSVC toolchain (`stable-x86_64-pc-windows-msvc`) and the Visual Studio C++ build tools.
-
-Install, in PowerShell:
-
-```powershell
-cargo install --locked --git https://github.com/cupskrrtt/hiero hiero
-# or from a checkout
-cargo install --path crates\hiero
-```
-
-Hiero finds the core on the named pipe `\\.\pipe\herdr-core-<user>-<session>.sock` (`<user>` is
-`%USERNAME%` with only letters and digits; `<session>` is `HC_SESSION` or `default`). `HC_SOCKET`
-overrides it. A `socket` key in herdr-core's `config.toml` is not read.
-
-| Path | What |
-|---|---|
-| `%APPDATA%\hiero\config.toml` | settings |
-| `%LOCALAPPDATA%\hiero\ui.json`, `hiero.log` | remembered UI state, log |
-
-`XDG_CONFIG_HOME` and `XDG_STATE_HOME`, when set, win over these. Folders are stored as plain
-`C:\...` paths; `~` means `%USERPROFILE%`.
-
-- A pane without a command starts PowerShell 7 (or Windows PowerShell), chosen by herdr-core.
-- **Windows and WSL are two separate cores.** Native Windows Hiero and Hiero inside WSL talk to
-  different herdr-core servers, with separate terminals, workspaces and documents.
-- The Windows core keeps running after you close the window, and ends when you sign out or
-  restart. With `restore = true`, opening a workspace afterwards starts its terminals again in
-  their layout.
-- Desktop notifications are a PowerShell toast (plus the bell).
+**Windows** needs herdr-core for Windows (`hc.exe`) and Rust with the MSVC toolchain
+(`stable-x86_64-pc-windows-msvc`) plus the Visual Studio C++ build tools. See [Windows](#windows).
 
 ## Quick start
 
-1. Run `hiero`. The sidebar is empty.
+1. Run `hiero`. The sidebar is empty and has the focus.
 2. `A` adds a project: a name and a folder.
-3. `a` adds a workspace under it. `Enter` opens it. A shell starts in the folder.
-4. `ctrl+b v` splits the pane side by side, `ctrl+b s` stacks one. `ctrl+b V` and `S` ask for a
-   command first: type `nvim .` or `claude`. `ctrl+b t` opens a new tab, `T` asks for a command.
-5. `ctrl+b h j k l` moves between panes. `ctrl+b ?` shows every key.
+3. `a` adds a workspace to it (its folder defaults to the project's). It opens with a shell.
+4. `ctrl+b v` splits side by side, `ctrl+b s` stacked. `ctrl+b V` / `S` ask for a command first:
+   type `nvim .` or `claude`. `ctrl+b t` opens a new tab (`T` asks for a command).
+5. `ctrl+b h` `j` `k` `l` moves between panes; or click one. `ctrl+b ?` shows every key.
 6. `ctrl+b q` quits Hiero. The programs keep running.
-7. Run `hiero` again. The same workspace opens and every pane attaches to its running terminal.
+7. Run `hiero` again: the same workspace opens and every pane reattaches to its terminal.
 
 ## Keys
 
-After the prefix (`ctrl+b`) the bottom bar shows `prefix` until the next key.
+### After the prefix (`ctrl+b`)
+
+The bottom bar shows `prefix` until the next key.
 
 | Key | Action |
 |---|---|
 | `t` / `T` | new tab with a shell / ask for a command first |
-| `v` / `s` | split side by side / stacked (new shell, same folder, gets focus) |
-| `V` / `S` | same, but ask for a command first |
-| `h` `j` `k` `l` or arrows | move focus to the neighbouring pane |
+| `v` / `s` | split side by side / stacked: a shell in the same folder, which gets the focus |
+| `V` / `S` | the same, asking for a command first |
+| `h` `j` `k` `l`, arrows | move to the pane on the left / below / above / right |
 | `H` `J` `K` `L` | narrower / taller / shorter / wider (5% a press) |
-| `1` … `9` | go to tab N |
-| `[` / `]` | previous / next tab |
-| `r` | rename the tab |
-| `R` | rename the pane (empty brings back the automatic title) |
-| `x` / `X` | close the pane / the tab (asks; its programs end) |
-| `z` | zoom the pane to the whole area, again to undo (a view only, not saved) |
+| `1` … `9`, `[` / `]` | go to tab N, previous / next tab |
+| `r` / `R` | rename the tab / the pane (an empty pane name brings back the automatic title) |
+| `x` / `X` | close the pane / the tab; asks first, because its programs end |
+| `z` | zoom the pane to the whole area; again to undo (not saved) |
 | `w` | switch between sidebar and workspace (shows a hidden sidebar) |
 | `b` | hide or show the sidebar |
 | `<` / `>` | narrower / wider sidebar (4 columns a step, 16 to 60) |
 | `n` / `N` | new workspace in this project / new project |
 | `?` | help |
-| `q` | quit Hiero (terminals keep running) |
-| prefix again | send the prefix key itself to the program |
+| `q` | quit Hiero; the terminals keep running |
+| `ctrl+b` | send `ctrl+b` itself to the program |
 | `Esc` | cancel |
 
-The last pane of a tab closes the tab. The last tab of a workspace can't be closed; delete the
-workspace instead. Sidebar width and hidden state are remembered.
+The last pane of a tab closes the tab. The last tab of a workspace can't be closed: delete the
+workspace instead.
 
-In the sidebar (no prefix needed):
+### In the sidebar (no prefix)
 
 | Key | Action |
 |---|---|
-| `j` `k` / `↑` `↓`, `g` `G` | move |
+| `j` `k`, `↑` `↓`, `g` `G`, `Home` `End` | move |
 | `Enter` | open a workspace; on a project, fold or unfold it |
-| `a` / `A` | add workspace under this project / add project |
+| `a` / `A` | add a workspace to this project / add a project |
 | `r` | rename |
-| `D` | delete (asks: `y` end its terminals · `k` keep them running · `n` cancel) |
+| `D` | delete; asks: `y` end its terminals · `k` keep them running · `n` cancel |
 | `J` / `K` | move down / up |
 | `z` | fold or unfold the project |
-| `Esc`, `l`, `Tab` | back to the workspace |
-| `q` | quit |
+| `Esc`, `l`, `→`, `Tab` | back to the workspace |
+| `?` / `q` | help / quit |
 
-Mouse (the workspace screen):
+### Mouse
 
 | Mouse | Action |
 |---|---|
-| click a workspace in the sidebar | open it |
-| click a project | fold or unfold it |
+| click a workspace / a project | open it / fold or unfold it |
 | click a tab | go to it |
 | click a pane | focus it |
 | drag the line between two panes | resize the split (saved when you let go) |
 | wheel over the sidebar | move the selection |
-| wheel over a pane | scroll a program that takes the mouse; arrows for a full-screen one (less, man) |
+| wheel over a pane | goes to a program that takes the mouse; arrow keys for a full-screen one (less, man) |
 
-If the program in a pane turned on mouse reporting (nvim with `mouse=a`, htop, tmux), clicks,
-drags and the wheel go to it, with positions relative to the pane. Other panes only get focus.
-Hold **Shift** while dragging to select text with the terminal's own selection (Ghostty, kitty,
-WezTerm, Windows Terminal, xterm and most others). Dialogs and the help ignore the mouse. Turn it
-all off with `mouse = false` under `[workspace]`.
+When the program in a pane turns on mouse reporting (nvim with `mouse=a`, htop, tmux), its clicks,
+drags and wheel go to it, at positions inside the pane. Hold **Shift** while dragging to select text
+with your terminal's own selection. `mouse = false` under `[workspace]` leaves the mouse to the
+terminal.
 
-If a prefix key does not seem to work, `hiero debug keys` shows what your terminal sends.
+## How it works
 
-## Workspaces in depth
+**Projects and workspaces.** A project has a root folder; a workspace has its own folder (the
+project's by default). Names are unique among siblings. Rename, reorder and delete them in the
+sidebar or with `hiero ws …`; changes from the command line show up live.
 
-**Projects and workspaces.** A project has a root folder. A workspace has its own folder (the
-project's root by default). Names are unique among siblings. Both can be renamed, reordered and
-deleted from the sidebar, or with `hiero ws …`; changes from the CLI show up live.
+**Panes.** Every pane is an hc terminal, labelled `hiero.ws`, `hiero.pane` and `hiero.project`, with
+`HIERO_PANE` and `HIERO_WS` in its environment. The focused pane has a thick border and the cursor;
+keys and paste go to it only. A pane opened with a command stores the command, so it can be started
+again. Its title shows its name, else its command (or `shell`), then the terminal address.
 
-**Panes.** Every pane is an hc terminal with labels `hiero.ws`, `hiero.pane` and `hiero.project`.
-The focused pane has a thick border and the cursor. Keys and paste go to it only. A pane that was
-started with a command stores it, so it can be started again.
+**Layouts** — tabs, splits, sizes, pane names and commands — are stored in herdr-core's document
+`hiero-ws`. The open workspace and the sidebar's width and visibility are remembered per machine.
 
-**Layouts.** Tabs, splits and sizes are stored in herdr-core's document `hiero-ws`, so they
-survive closing Hiero, a core restart and a reboot. The open workspace is remembered.
+**Restore.** When a workspace opens, every pane in every tab gets a running terminal; only the
+visible tab is drawn. A pane starts again by itself (in its folder, with its command or a shell)
+when its terminal is gone from herdr-core, or finished because the system stopped it
+(`server_stop`, `host_shutdown`, `holder_lost`, `stopped_by_restart`). If its program exited or you
+killed it, the pane shows `ended: …` and `Enter` starts a fresh one. Nothing starts twice.
+`restore = false` turns the automatic start off: those panes say "not running" until `Enter`.
 
-**Restore rule.** When a workspace opens, every pane of every tab gets a running terminal, not only
-the visible tab. Missing ones start in the background (the pane's command or a shell, in its
-folder). A pane's terminal starts again by itself when it is gone from hc, or when it finished
-because the system went down (`server_stop`, `host_shutdown`, `holder_lost`,
-`stopped_by_restart`). If its program exited or you killed it, the pane stays as `ended: …` and
-`Enter` starts a fresh one. Nothing starts twice, and nothing starts before Hiero has seen the
-terminal list.
+**Core restart while Hiero is open.** A red banner shows while herdr-core is unreachable. When it's
+back, Hiero applies the same rule to every pane and says `core restarted — restored N panes`.
 
-**Core restart while Hiero is open.** The pane area shows a red banner while the core is away.
-When it is back, Hiero checks every pane with the same rule: missing terminals start again, a
-stream that was only lost attaches again, and programs you ended stay ended. The bar says
-`core restarted — restored 3 panes`. Restored programs start from their command; what was on their
-screen is gone.
+**Status dots.** `●` working, `◐` needs you (or an error), `✓` done, `○` idle, `·` nothing reported.
+Shown per workspace, and on a folded project for its workspaces. The bottom bar names a workspace
+that needs you, also when the sidebar is hidden. A workspace turning "needs you" or "done" rings the
+bell and sends a desktop notification (see `[notify]`).
 
-**Nesting.** Every pane's environment has `HIERO_PANE` and `HIERO_WS`. Running `hiero` inside one
-of its own panes stops with a message (*You're already inside Hiero (shosha › backend)…*) instead of
-opening a second workspace screen; use the prefix then `w` to switch. `hiero --nested` opens it
-anyway. Even then Hiero never attaches the terminal it runs in: that pane shows
-`ended: this is Hiero itself` rather than a picture of itself drawing itself. Older panes without
-the variables are recognised by their `hiero.pane` label. Commands like `hiero ws` work normally inside panes.
+**Delete.** `D` asks what happens to the terminals: `y` ends them, `k` leaves them running (they are
+no longer in any workspace), `n` cancels.
 
-**Delete.** `D` on a workspace or project asks what to do with its terminals: `y` ends them and
-deletes, `k` deletes and leaves them running, `n` or `Esc` cancels.
+**Nesting.** Running `hiero` inside one of its own panes stops with *You're already inside Hiero
+(shosha › backend)…*; use `ctrl+b w` instead. `hiero --nested` opens it anyway, and even then Hiero
+never shows the terminal it runs in: that pane says `ended: this is Hiero itself` rather than drawing
+itself forever. `hiero ws`, `hiero config` and `hiero debug` work normally inside panes.
 
-**Status dots.** The sidebar shows `●` working, `◐` needs you, `✓` done, `○` idle, `·` no terminal,
-per workspace and on a collapsed project. The bottom bar names a workspace that needs you, also
-when the sidebar is hidden. Changes to needs-you or done ring the bell and notify, following the
-`[notify]` rules.
+## Keeping terminals alive
 
-**`[workspace]` config.** `prefix` is `ctrl+<letter>` (not c, h, i, j, m) or `ctrl+space`.
-`restore = false` turns the automatic start off: panes without a terminal then say "not running"
-and `Enter` starts one. `mouse = false` leaves the mouse to your terminal.
+herdr-core keeps the terminals; Hiero only shows them. What can still end them:
+
+- **Linux and WSL:** with systemd, the core stops when your **last login session ends** — on WSL,
+  when you close the last WSL window. Keep it running with:
+  ```sh
+  sudo loginctl enable-linger $USER
+  ```
+- **Windows:** the core survives closing windows, sleep and locking the screen. It ends when you
+  **sign out**.
+- **Everywhere:** a reboot, `wsl --shutdown`, or herdr-core crashing.
+
+After that, opening a workspace brings the layout back and starts every pane again from its command.
+The old programs' state and screens are gone. For Claude, open the pane with the command
+`claude --continue` (`ctrl+b T`, `V` or `S`): after a restart it resumes the last conversation in that
+folder instead of starting a new one.
+
+## Windows
+
+Hiero runs natively on Windows as well as in WSL.
+
+- **Two separate worlds.** Native Windows Hiero and Hiero in WSL talk to two different herdr-core
+  servers, with separate terminals and separate workspaces.
+- Hiero finds the core on the named pipe `\\.\pipe\herdr-core-<user>-<session>.sock` (`<user>` is
+  `%USERNAME%` with letters and digits only, `<session>` is `HC_SESSION` or `default`). `HC_SOCKET`
+  overrides it.
+- A pane without a command starts PowerShell 7, or Windows PowerShell (herdr-core's choice).
+- Folders are stored as plain `C:\…` paths, and `~` means `%USERPROFILE%`.
+- Notifications are a Windows toast, plus the bell.
 
 ## Configuration
 
-`~/.config/hiero/config.toml`. Every setting has a default, so the file can stay short.
-`hiero config init` writes a commented starting file, `hiero config show` checks it and prints what
-is in effect. A broken file is reported and ignored.
-
-Older files may still have the `[board]`, `[agents]` and `[keys]` sections from the removed agent
-board. Hiero skips them with a warning (shown for a few seconds in the bottom bar, logged, and
-printed by `hiero config show`); delete them when you like.
+`~/.config/hiero/config.toml` (Windows: `%APPDATA%\hiero\config.toml`). Everything has a default.
+`hiero config init` writes a commented file, `hiero config show` checks it and prints what is in
+effect. A broken file is reported on the bottom bar and ignored.
 
 ```toml
 [workspace]
-prefix = "ctrl+b"            # ctrl+<letter> (not c, h, i, j, m) or ctrl+space
-restore = true               # start missing terminals when a workspace opens
-mouse = true                 # clicks, wheel, border drags; Shift+drag still selects text
+prefix = "ctrl+b"        # ctrl+<letter> (not c, h, i, j, m) or ctrl+space
+restore = true           # start missing terminals when a workspace opens
+mouse = true             # clicks, wheel, border drags; Shift+drag still selects text
 
 [notify]
 bell = true
-desktop = true               # notify-send, or a Windows toast (Windows and WSL)
-on = ["blocked", "error", "done", "failed"]   # also: exited
+desktop = true           # notify-send on Linux; a Windows toast on Windows and WSL
+on = ["blocked", "done"] # blocked: a workspace needs you (or a program errored); done
 ```
 
-## CLI reference
+Sections left over from old versions (`[board]`, `[agents]`, `[keys]`) are skipped with a warning.
+
+## Command line
 
 ```sh
-hiero                                  # the workspace
-hiero --nested                         # the workspace, even from inside a Hiero pane
+hiero                                    # the workspace
+hiero --nested                           # the workspace, even inside a Hiero pane
 
-# workspaces (the same edits are in the UI)
-hiero ws add-project shosha --root ~/code/shosha     # root defaults to the current folder
-hiero ws add shosha frontend --folder ~/code/shosha/web   # folder defaults to the project root
-hiero ws list                          # projects > workspaces > tabs > panes
-hiero ws rename shosha frontend web    # or: rename shosha shosha-app
-hiero ws move shosha web up            # or: move shosha down
-hiero ws rm shosha web                 # or: rm shosha
+hiero ws list                            # projects › workspaces › tabs › panes
+hiero ws add-project shosha --root ~/code/shosha        # root defaults to the current folder
+hiero ws add shosha frontend --folder ~/code/shosha/web # folder defaults to the project's
+hiero ws rename shosha frontend web      # a workspace; `rename shosha new-name` for a project
+hiero ws move shosha web up              # or down; `move shosha up` for a project
+hiero ws rm shosha web                   # `rm shosha` removes the project
 
 hiero config [path | init | show]
 
-hiero debug status                     # handshake and core info
-hiero debug ls --all                   # terminals
-hiero debug events                     # follow live events
-hiero debug read t1 --lines 50         # a terminal's screen
-hiero debug keys                       # what your terminal sends (to check a prefix key)
-hiero debug type t1 'ls\r'             # type raw bytes over an attach stream (\r \n \t \e \xNN)
-hiero debug doc --name hiero-ws [JSON]  # read or write a document (the name is required)
-hiero debug vtcompare t4 [--secs 20]   # compare Hiero's emulator with herdr-core's screen for a terminal
+hiero debug status                       # connect and show the core
+hiero debug ls [--all]                   # terminals
+hiero debug read t1 [--lines 50]         # a terminal's screen
+hiero debug events [--raw]               # follow live events
+hiero debug keys                         # what your terminal sends; marks the prefix
+hiero debug type t1 'ls\r'               # type into a terminal (\r \n \t \e \\ \xNN)
+hiero debug doc --name hiero-ws [JSON]   # read or write a herdr-core document
+hiero debug vtcompare t4 [--secs 20] [--dump FILE]   # check Hiero's screen against herdr-core's
 ```
 
-Projects and workspaces are named exactly on the command line. Folders must exist.
+Projects and workspaces are named exactly; folders must exist.
 
-## Environment variables
+## Troubleshooting
 
-| Variable | Meaning |
-|---|---|
-| `HC_SOCKET` | Use this core socket (on Windows a pipe name like `\\.\pipe\herdr-core-me-x.sock`) |
-| `HC_SESSION` | Use a separate hc session (default `default`) |
-| `HIERO_LOG` | Log level, for example `debug` or `hc_client=trace` |
-| `HIERO_NO_NOTIFY` | Turn off desktop notifications (the bell still rings) |
-| `XDG_CONFIG_HOME` | Where `hiero/config.toml` lives (default `~/.config`, Windows `%APPDATA%`) |
-| `XDG_STATE_HOME` | Where `hiero/hiero.log` and `hiero/ui.json` live (default `~/.local/state`, Windows `%LOCALAPPDATA%`) |
-| `HIERO_PANE` / `HIERO_WS` | Set by Hiero inside its panes (pane and workspace id); used to refuse nesting |
+- **The prefix does nothing.** Run `hiero debug keys` and press it. If nothing shows up, something in
+  front of Hiero takes the key (tmux uses `ctrl+b` too; `ctrl+space` is often an input-method
+  switch). Pick another: `prefix = "ctrl+a"`.
+- **A pane draws wrong.** Run `hiero debug vtcompare <terminal>` in another terminal while it happens
+  (the address is in the pane's title). Differing rows mean Hiero's emulator got something wrong, and
+  the report shows which escape sequences it didn't handle. Zero rows means the problem is between
+  Hiero and your outer terminal.
+- **Terminals disappear when you close your windows.** See [Keeping terminals alive](#keeping-terminals-alive).
+- **Start over.** `hiero debug doc null --name hiero-ws` forgets every project and layout. Running
+  terminals are not touched.
 
-## Files
+## Files and environment
 
 | Path | What |
 |---|---|
-| `~/.config/hiero/config.toml` | settings |
-| `~/.local/state/hiero/ui.json` | remembered: open workspace, sidebar width and state |
-| `~/.local/state/hiero/hiero.log` | log of the UI (rotated past 5 MB) |
-| herdr-core doc `hiero-ws` | projects, workspaces, tabs, splits, pane commands and terminals |
+| `~/.config/hiero/config.toml` | settings (Windows `%APPDATA%\hiero\`) |
+| `~/.local/state/hiero/ui.json` | open workspace, sidebar width and visibility (Windows `%LOCALAPPDATA%\hiero\`) |
+| `~/.local/state/hiero/hiero.log` | log (rotated past 5 MB) |
+| herdr-core document `hiero-ws` | projects, workspaces, tabs, splits, pane names, commands and terminals |
 
-Old versions kept tasks and pipeline runs in a herdr-core doc named `hiero`; nothing reads it now.
-Reset the workspaces with `hiero debug doc null --name hiero-ws`. This forgets every layout;
-running terminals are not touched.
+| Variable | Meaning |
+|---|---|
+| `HC_SOCKET` | the core's socket (on Windows a pipe name) |
+| `HC_SESSION` | a separate herdr-core session (default `default`) |
+| `HIERO_LOG` | log level, e.g. `debug` |
+| `HIERO_NO_NOTIFY` | no desktop notifications (the bell still rings) |
+| `XDG_CONFIG_HOME`, `XDG_STATE_HOME` | override the config and state folders (also on Windows) |
+| `HIERO_PANE`, `HIERO_WS` | set by Hiero inside its panes |
 
 ## Known issues
 
-| # | Issue | Impact | Plan |
-|---|---|---|---|
-| 1 | Before its first report a program shows `·`, including while Claude waits at its "trust this folder?" dialog. Hiero reads only what a program reports to herdr-core (OSC 7501); Claude Code 2.1.319 and later does, older versions and other agents may not. | A new pane in a new folder looks idle while it waits for you. | Show "starting / not reported" for young panes. |
-| 2 | Panes have no scrollback. The mouse works (clicks, border drags, wheel for programs that take it). | The wheel does nothing over a plain shell, and you can't scroll up inside a pane; use the program's own pager or `hc read`. | Keep a scrollback in the pane's parser, then let the wheel scroll it. |
-| 3 | A restored terminal runs its command again from the start. | Unsaved state and screen history of the old program are gone. | None: herdr-core can't bring a stopped program back. |
-| 4 | A second client attached to a workspace pane (for example `hc attach`) takes the size: herdr-core gives it to the last active viewer. | The program reflows to the smaller size. | Observe-only stream until the first key. |
-| 5 | The Windows toast (WSL) is sent with exit code 0, but nobody has confirmed it appears. | Desktop notifications may be silent on WSL; the bell still rings. | Confirm on a real desktop. |
-| 6 | No release binaries and no AUR entry. The PKGBUILD builds the local checkout. | Install from source. | Tag `v0.3.0`, point the PKGBUILD at the tarball. |
-| 7 | Windows: not tested in a real console (Windows Terminal, conhost); only inside an hc terminal. Bracketed paste may be refused by the console (a paste then arrives as typed keys). | Pastes into panes can be slower, and a multi-line paste may run line by line. | Check in Windows Terminal. |
-| 8 | Windows: the `socket` key of herdr-core's `config.toml` is not read, and win32-input-mode (`CSI ?9001h`) is not implemented (plain VT keys work in PowerShell 7 and cmd.exe). | A program that insists on win32-input-mode may misread keys. | Encode keys that way when a pane asks. |
+| # | Issue | Impact |
+|---|---|---|
+| 1 | A program shows `·` until it reports a status to herdr-core (OSC 7501), e.g. while Claude waits at its "trust this folder?" dialog. Claude Code 2.1.319+ reports by itself; other agents may not at all. | A new pane can look idle while it waits for you. |
+| 2 | Panes have no scrollback. | You can't scroll back inside a shell pane; use the program's pager or `hiero debug read`. |
+| 3 | A restored pane runs its command again from the start. | The old program's state and screen are gone (see `claude --continue` above). |
+| 4 | A second client attached to a pane's terminal (e.g. `hc attach`) takes its size: herdr-core sizes a terminal for the last active viewer. | The program reflows until Hiero's pane is used again. |
+| 5 | Hiero doesn't honour synchronized output (`CSI ?2026`). | During heavy redraws you may glimpse a half-drawn frame for a moment; it settles. |
+| 6 | Windows: tried day to day in Alacritty; not in Windows Terminal or conhost. Bracketed paste may be refused by a console. win32-input-mode (`CSI ?9001h`) isn't implemented, and herdr-core's `socket` config key isn't read. | A multi-line paste may arrive as typed lines; a program that insists on win32 key encoding may misread keys. |
+| 7 | The desktop notification on WSL (a Windows toast) has never been confirmed on screen. | It may be silent; the bell still rings. |
+| 8 | No prebuilt binaries and no AUR entry; the PKGBUILD builds a local checkout. | Install from source. |
 
-Fixed:
-
-- ✅ When neovim scrolled a window next to others (the main buffer beside a dap-ui sidebar), the windows beside it were wiped: neovim scrolls with left/right margins (`CSI ?69h`, `CSI Pl;Pr s`), which the vt100 crate ignored. Hiero now carries a vt100 fork that supports them.
-- ✅ With a pane streaming fast output (nvim plugins like dap-ui), the screen could fall seconds behind and show old frames mixed with new ones, worst on Windows where output goes through ConPTY. Hiero now applies all queued output before drawing and draws at most every 16 ms while busy.
-- ✅ After a core restart, panes stayed `ended` until Enter or a tab switch (W5: they restore by themselves).
+Fixed recently: neovim's left/right-margin scrolling (the main buffer beside a dap-ui sidebar used
+to wipe the sidebar) — Hiero carries a vt100 fork that supports margins; and a pane streaming fast
+output no longer makes the screen fall behind.
 
 ## Development
 
@@ -296,65 +294,44 @@ Fixed:
 cargo build
 cargo test
 cargo clippy --all-targets
-cargo run -p hiero                     # the workspace
+cargo run -p hiero
 ```
 
-The test setup that doesn't touch your own core: start a separate session with
-`HC_SESSION=test hc server start`, and prefix every `hc` and `hiero` command with `HC_SESSION=test`.
-
-### Development history
-
-The per-phase checklists are in [docs/HISTORY.md](docs/HISTORY.md). Phases 0 to 6 built the agent
-board, which was removed in 0.3.0 (it lives in git history; the last commit with it is `49e17c5`).
-
-| Phase | What |
-|---|---|
-| 0 | Foundation: `hc-client` library (JSON-RPC, events, reconnecting watcher) |
-| 1 | Agent board: status, NEEDS YOU, preview, search, notifications |
-| 2 | Drive agents: spawn, quick actions, attach, templates |
-| 3 | Status bridge for Claude Code, codex, pi (`hiero report`, `hiero integrate`) |
-| 4 | Tasks and git worktrees: review, merge, pull request |
-| 5 | Pipelines, broadcast, remote machines |
-| 6 | Usage panel, config file, remembered state, log file, Arch package |
-| W1 | Workspace data model in doc `hiero-ws`, `hiero ws` CLI |
-| W2 | Workspace screen: sidebar, prefix key, one live pane |
-| W3 | Tabs and splits |
-| W4 | Restore on open, delete with terminals, menu of the old views |
-| W5 | Core-restart recovery, menu views as overlays, sidebar hide and resize, README, 0.2.0 |
-| 0.3.0 | Removed the agent board and its tools; Hiero is only the workspace |
-
-Still open: release binaries for other distros (needs hosted releases and CI), themes (colours
-are fixed).
-
-## Source layout
+Test against a separate herdr-core session so your own terminals and workspaces are left alone:
+`HC_SESSION=test hc server start`, prefix every `hc` and `hiero` command with `HC_SESSION=test`, and
+`HC_SESSION=test hc server stop` when done. `hiero debug type` drives a running Hiero, and
+`hiero debug vtcompare` checks drawing.
 
 ```
 crates/
-├── vt100/            fork of vt100 0.18.1 (MIT) with DEC left/right margins (DECLRMM/DECSLRM)
-├── hc-client/src/
-│   ├── lib.rs        exports
+├── vt100/            fork of vt100 0.18.1 (MIT) with DEC left/right margins
+├── hc-client/src/    herdr-core client
 │   ├── endpoint.rs   find the socket or pipe
 │   ├── transport.rs  Unix socket / Windows named pipe
 │   ├── client.rs     JSON-RPC calls
-│   ├── error.rs      typed errors
+│   ├── framed.rs     attach streams
+│   ├── events.rs     events and the reconnecting Watcher
+│   ├── state.rs      the live terminal list
 │   ├── types.rs      Terminal, Status, RunParams, …
-│   ├── events.rs     subscribe, notifications, Watcher
-│   ├── framed.rs     framed mode: AttachStream
-│   └── state.rs      TerminalSet
+│   └── error.rs      typed errors
 └── hiero/src/
-    ├── main.rs       CLI entry: workspace, ws, config, debug
-    ├── ws_tui.rs     workspace screen: event loop, starts and attaches terminals
-    ├── ws_app.rs     workspace screen state: sidebar, prefix key, dialogs, restore (tested, no I/O)
-    ├── ws_ui.rs      workspace screen drawing
-    ├── workspace.rs  projects, workspaces, tabs, split layouts in doc "hiero-ws"
+    ├── main.rs       command line
+    ├── ws_tui.rs     event loop: keys, mouse, streams, drawing
+    ├── ws_app.rs     state: sidebar, prefix, dialogs, restore (tested, no I/O)
+    ├── ws_ui.rs      drawing
+    ├── workspace.rs  projects, workspaces, tabs, splits (doc "hiero-ws")
     ├── widgets.rs    text input, popups, painting a terminal screen
-    ├── keys.rs       key and mouse events → terminal bytes
-    ├── config.rs     config.toml, remembered UI state
-    ├── paths.rs      config/state folders, home, folder spelling (Unix and Windows)
+    ├── keys.rs       keys and mouse → terminal bytes
+    ├── config.rs     config.toml, remembered state
+    ├── paths.rs      folders and paths on Unix and Windows
     └── notify.rs     bell and desktop notifications
 packaging/arch/       PKGBUILD
-docs/HISTORY.md       per-phase checklists
+docs/HISTORY.md       how Hiero got here
 ```
+
+Hiero started as an agent dashboard (phases 0–6) and became a workspace (W1–W5); the dashboard
+was removed in 0.3.0 and lives in git history (last commit with it: `49e17c5`). Details in
+[docs/HISTORY.md](docs/HISTORY.md).
 
 ## License
 

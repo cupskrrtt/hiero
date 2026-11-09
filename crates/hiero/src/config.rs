@@ -110,7 +110,8 @@ impl Default for Notify {
         Notify {
             bell: true,
             desktop: true,
-            on: ["blocked", "error", "done", "failed"].map(String::from).to_vec(),
+            // The workspace raises "blocked" (needs you or error) and "done".
+            on: ["blocked", "done"].map(String::from).to_vec(),
         }
     }
 }
@@ -190,9 +191,9 @@ mouse = true             # clicks, wheel and border drags; hold Shift to select 
 
 [notify]
 bell = true
-desktop = true           # notify-send, or a Windows toast on WSL
-# what alerts you: blocked, error, done, exited, failed
-on = ["blocked", "error", "done", "failed"]
+desktop = true           # notify-send, or a Windows toast (Windows and WSL)
+# what alerts you: blocked (a workspace needs you, or a program errored), done
+on = ["blocked", "done"]
 "#;
 
 // ---- per-viewer UI state --------------------------------------------------------
