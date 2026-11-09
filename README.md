@@ -241,6 +241,7 @@ hiero debug read t1 --lines 50         # a terminal's screen
 hiero debug keys                       # what your terminal sends (to check a prefix key)
 hiero debug type t1 'ls\r'             # type raw bytes over an attach stream (\r \n \t \e \xNN)
 hiero debug doc --name hiero-ws [JSON]  # read or write a document (the name is required)
+hiero debug vtcompare t4 [--secs 20]   # compare Hiero's emulator with herdr-core's screen for a terminal
 ```
 
 Projects and workspaces are named exactly on the command line. Folders must exist.

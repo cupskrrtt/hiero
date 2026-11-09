@@ -114,6 +114,14 @@ enum Debug {
         #[arg(long)]
         raw: bool,
     },
+    /// Compare Hiero's terminal emulator with herdr-core's own screen for a
+    /// terminal, and list escape sequences Hiero's emulator doesn't handle.
+    Vtcompare {
+        terminal: String,
+        /// How long to watch, in seconds.
+        #[arg(long, default_value_t = 20)]
+        secs: u64,
+    },
     /// Show the key events your terminal sends (to check a prefix key).
     Keys,
     /// Type raw bytes into a terminal over an attach stream.
@@ -391,6 +399,7 @@ async fn debug(cmd: Debug) -> Result<()> {
             }
         }
         Debug::Keys => debug_keys()?,
+        Debug::Vtcompare { terminal, secs } => vtcompare(&terminal, secs).await?,
         Debug::Type { terminal, text } => {
             let hc = Client::connect().await?;
             let t = hc.get(&terminal).await?;
@@ -419,6 +428,88 @@ async fn debug(cmd: Debug) -> Result<()> {
 }
 
 /// Print each key event as crossterm sees it, and whether it is the prefix.
+/// Records what Hiero's emulator (vt100) could not interpret.
+#[derive(Default)]
+struct Unhandled(std::collections::BTreeMap<String, usize>);
+
+impl vt100::Callbacks for Unhandled {
+    fn unhandled_char(&mut self, _: &mut vt100::Screen, c: char) {
+        *self.0.entry(format!("char {c:?}")).or_default() += 1;
+    }
+    fn unhandled_control(&mut self, _: &mut vt100::Screen, b: u8) {
+        *self.0.entry(format!("control 0x{b:02x}")).or_default() += 1;
+    }
+    fn unhandled_escape(&mut self, _: &mut vt100::Screen, i1: Option<u8>, i2: Option<u8>, b: u8) {
+        let i: String = [i1, i2].into_iter().flatten().map(char::from).collect();
+        *self.0.entry(format!("ESC {i}{}", b as char)).or_default() += 1;
+    }
+    fn unhandled_csi(&mut self, _: &mut vt100::Screen, i1: Option<u8>, i2: Option<u8>, params: &[&[u16]], c: char) {
+        let i: String = [i1, i2].into_iter().flatten().map(char::from).collect();
+        let p: Vec<String> = params.iter().map(|g| g.iter().map(u16::to_string).collect::<Vec<_>>().join(":")).collect();
+        *self.0.entry(format!("CSI {i}{}{c}", p.join(";"))).or_default() += 1;
+    }
+    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        let head = params.first().map(|p| String::from_utf8_lossy(p).into_owned()).unwrap_or_default();
+        *self.0.entry(format!("OSC {head}")).or_default() += 1;
+    }
+}
+
+/// Watch a terminal as an observer, feed its output to vt100, and every
+/// second compare the screen with herdr-core's (Ghostty's) rendering.
+async fn vtcompare(terminal: &str, secs: u64) -> Result<()> {
+    use hc_client::{AttachParams, AttachStream, StreamMsg};
+    let hc = Client::connect().await?;
+    let t = hc.get(terminal).await?;
+    let (cols, rows) = (t.cols.max(1), t.rows.max(1));
+    let mut params = AttachParams::new(terminal, cols, rows);
+    params.observe = true;
+    let mut stream = AttachStream::open(&params).await?;
+    let nz = |n: u16| std::num::NonZeroU16::new(n).unwrap();
+    let mut parser = vt100::Parser::new_with_callbacks(nz(rows), nz(cols), 0, Unhandled::default());
+    println!("watching {terminal} ({cols}x{rows}) for {secs}s; use the program now");
+    let end = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut worst = 0usize;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(end) => break,
+            msg = stream.recv() => match msg {
+                StreamMsg::Data(bytes) => parser.process(&bytes),
+                StreamMsg::Closed(_) => break,
+                StreamMsg::Resize { .. } => {}
+            },
+            _ = tick.tick() => {
+                let theirs = hc.read(terminal, 0).await?.text;
+                let theirs: Vec<&str> = theirs.lines().collect();
+                let ours: Vec<String> = parser.screen().rows(0, cols).collect();
+                let differ: Vec<usize> = (0..rows as usize)
+                    .filter(|&i| ours.get(i).map(|s| s.trim_end()).unwrap_or("") != theirs.get(i).map(|s| s.trim_end()).unwrap_or(""))
+                    .collect();
+                if differ.len() > worst {
+                    worst = differ.len();
+                    println!("\n{} differing row(s):", differ.len());
+                    for &i in differ.iter().take(6) {
+                        println!("  row {i:>3} hiero: {:?}", ours.get(i).map(|s| s.trim_end()).unwrap_or(""));
+                        println!("          herdr: {:?}", theirs.get(i).map(|s| s.trim_end()).unwrap_or(""));
+                    }
+                }
+            }
+        }
+    }
+    stream.close().await;
+    println!("\nmost differing rows seen: {worst}");
+    let unhandled = &parser.callbacks().0;
+    if unhandled.is_empty() {
+        println!("vt100 handled every sequence");
+    } else {
+        println!("sequences vt100 did not handle (count):");
+        for (k, n) in unhandled {
+            println!("  {n:>6}  {k}");
+        }
+    }
+    Ok(())
+}
+
 fn debug_keys() -> Result<()> {
     use crossterm::event::{Event, KeyCode, read};
     let prefix = config::get().prefix();
