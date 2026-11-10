@@ -265,38 +265,67 @@ Projects and workspaces are named exactly on the command line. Folders must exis
 `nvim/lua/hiero/dap.lua` puts a debug session's views in Hiero panes next to nvim instead of windows
 inside it. nvim-dap still does the debugging; nvim stays an editor.
 
+```
+┌ nvim ─────────────────────────────┐┌ dap variables ───────┐
+│                                   ││▾ Locals              │
+│ → 12   return a + b + c.Port      ││  ▸ c = *main.Config… │
+│                                   │├ dap stack ───────────┤
+│                                   ││▶ main.add  main.go:12│
+│                                   │├ dap breakpoints ─────┤
+│                                   ││● main.go:12          │
+├ dap output ───┬ dap repl ─────────┴┴─┬ dap watches ───────┤
+│ step 0 0      │> total + 1           │total * 2 = 0   int │
+│               │1   int               │                    │
+└───────────────┴──────────────────────┴────────────────────┘
+```
+
 - **Output.** Most debug adapters (delve, netcoredbg) send the program's output as DAP events. It is
   written to a file under `stdpath("run")` and a pane follows it with `hiero pane follow` (Linux and
   Windows). stderr shows red. The program has no stdin there.
 - **Panels.** Each panel is a small `nvim --clean` in its own pane that talks to your nvim over RPC
-  (`v:servername`). Move to one with the prefix and `hjkl` like any pane.
-  - `repl` (beside the output pane): type an expression, Enter evaluates it in the current frame (the
-    type is shown after the result); Up/Down go through what you typed; stops
-    (`● breakpoint at main.go:12`) and the end of the session are logged.
-  - `variables` (a column right of nvim, on top): the scopes of the current frame as a tree. `l` or
-    Enter opens, `h` closes (or goes to the parent), Enter toggles. What you opened stays open on the
-    next stop. Expensive scopes (globals, registers) start closed.
-  - `stack` (under variables): the stopped thread's frames, `▶` the current one. Enter on a frame
-    makes it current: nvim jumps there and `variables` shows that frame. `dap.up()`/`dap.down()` in
-    nvim move it too.
+  (`v:servername`). Move to one with the prefix and `hjkl` like any pane. `repl` and `watches` share
+  the output pane's row; `variables`, `stack` and `breakpoints` share a column right of nvim.
+  - `repl`: type an expression, Enter evaluates it in the current frame (the type is shown after the
+    result); Up/Down go through what you typed; stops (`● breakpoint at main.go:12`) and the end of
+    the session are logged.
+  - `watches`: expressions evaluated again on every stop and frame change. `a` adds, `e` or Enter
+    edits, `d` deletes. They are kept in your nvim, so they survive the panel and the next session.
+  - `variables`: the scopes of the current frame as a tree. `l` or Enter opens, `h` closes (or goes
+    to the parent), Enter toggles. What you opened stays open on the next stop. Expensive scopes
+    (globals, registers) start closed.
+  - `stack`: the stopped thread's frames, `▶` the current one. Enter on a frame makes it current:
+    nvim jumps there and `variables` and `watches` follow. `dap.up()`/`dap.down()` in nvim move it too.
+  - `breakpoints`: every breakpoint with its condition, hit count or log message. Enter shows it in
+    nvim, `d` removes it (also from a running session). Toggles in nvim show up within a second.
 
 ```lua
 vim.opt.rtp:append(vim.fn.expand("~/path/to/hiero/nvim"))
-require("hiero.dap").setup({
+local hiero = require("hiero.dap")
+hiero.setup({
   dir = "down",                -- the output pane: "down" or "right" of nvim
   size = 30,                   -- percent of the split
   focus = false,               -- keep the focus in nvim
   close_on_end = false,        -- keep the output pane until the next run
   categories = { stdout = true, stderr = true, console = false },  -- console: the adapter's own messages
-  panels = { "repl", "variables", "stack" },  -- {} for none
+  panels = { "repl", "watches", "variables", "stack", "breakpoints" },  -- {} for none
   close_panels_on_end = true,
-  column_size = 30,            -- percent width of the variables/stack column
+  column_size = 30,            -- percent width of the right column
 })
+vim.keymap.set("n", "<F7>", hiero.toggle_panels)
 ```
 
 Every session starts a fresh output file and reuses the panes (`dap output <id>`, `dap repl <id>`, ...,
 one set per nvim pane). `:HieroDapOutput` / `:HieroDapOutputClose` and `:HieroDapPanels` /
-`:HieroDapPanelsClose` open and close them by hand. Outside Hiero it does nothing.
+`:HieroDapPanelsClose` open and close them by hand. Outside Hiero it does nothing, so a config can
+keep dap-ui for nvim outside Hiero:
+
+```lua
+if (vim.env.HIERO_PANE or "") ~= "" then
+  require("hiero.dap").setup()
+else
+  require("dapui").setup()  -- and its open/close listeners
+end
+```
 
 ## Environment variables
 

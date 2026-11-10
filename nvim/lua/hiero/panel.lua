@@ -2,13 +2,13 @@
 -- nvim-dap session) over RPC. The main side is hiero/dap.lua.
 --
 -- Panel → main: require('hiero.dap')._subscribe / _eval / _select_frame /
--- _variables, by rpcnotify.
+-- _variables / _watch_* / _bp_*, by rpcnotify.
 -- Main → panel: require('hiero.panel').on_hello / on_eval / on_event /
--- on_frame / on_running / on_variables, by rpcnotify over a channel the main
+-- on_frame / on_running / on_variables / on_watches / on_breakpoints, by rpcnotify over a channel the main
 -- nvim opens to this panel's server. Nothing blocks on the other side, so a
 -- busy nvim never freezes the other.
 --
--- Kinds: repl, stack, variables.
+-- Kinds: repl, stack, variables, watches, breakpoints.
 
 local M = {}
 
@@ -449,6 +449,155 @@ function vars.on_event(text)
   vars.status("● " .. text)
 end
 
+-- Watches --------------------------------------------------------------------
+
+local watchv = { list = {}, note = nil }
+
+local function render_watches()
+  local lines, marks = {}, {}
+  for i, w in ipairs(watchv.list) do
+    local text
+    if w.err ~= "" then
+      text = w.expr .. ": " .. one_line(w.err)
+      table.insert(marks, { i - 1, #w.expr, { end_col = #text, hl_group = "ErrorMsg" } })
+    elseif w.stale then
+      text = w.expr .. " = " .. (w.value ~= "" and one_line(w.value) or "…")
+      table.insert(marks, { i - 1, #w.expr, { end_col = #text, hl_group = "Comment" } })
+    else
+      text = w.expr .. " = " .. one_line(w.value)
+      if w.type ~= "" then
+        table.insert(marks, { i - 1, 0, { virt_text = { { "  " .. w.type, "Comment" } } } })
+      end
+    end
+    table.insert(marks, { i - 1, 0, { end_col = #w.expr, hl_group = "Identifier" } })
+    lines[i] = text
+  end
+  local hint = #lines == 0 and "no watches · a adds one" or "a add · e edit · d delete"
+  table.insert(lines, (watchv.note and (watchv.note .. " · ") or "") .. hint)
+  table.insert(marks, { #lines - 1, 0, { line_hl_group = "Comment" } })
+  show(lines, marks)
+end
+
+function watchv.start()
+  S.buf = scratch()
+  render_watches()
+  local function at()
+    local i = cursor_line()
+    return watchv.list[i] and i or nil
+  end
+  local function add()
+    vim.ui.input({ prompt = "watchv: " }, function(text)
+      if text and vim.trim(text) ~= "" then
+        call("_watch_add", vim.v.servername, vim.trim(text))
+      end
+    end)
+  end
+  local function edit()
+    local i = at()
+    if not i then
+      return add()
+    end
+    vim.ui.input({ prompt = "watchv: ", default = watchv.list[i].expr }, function(text)
+      if text and vim.trim(text) ~= "" then
+        call("_watch_set", vim.v.servername, i, vim.trim(text))
+      end
+    end)
+  end
+  vim.keymap.set("n", "a", add, { buffer = S.buf })
+  vim.keymap.set("n", "e", edit, { buffer = S.buf })
+  vim.keymap.set("n", "<CR>", edit, { buffer = S.buf })
+  vim.keymap.set("n", "d", function()
+    local i = at()
+    if i then
+      call("_watch_del", vim.v.servername, i)
+    end
+  end, { buffer = S.buf })
+end
+
+function watchv.status(text)
+  watchv.note = text
+  render_watches()
+end
+
+function watchv.on_watches(list)
+  watchv.list, watchv.note = list, nil
+  render_watches()
+end
+
+function watchv.on_running()
+  for _, w in ipairs(watchv.list) do
+    w.stale = true
+  end
+  watchv.note = "● running"
+  render_watches()
+end
+
+function watchv.on_event(text)
+  watchv.on_running()
+  watchv.note = "● " .. text
+  render_watches()
+end
+
+-- Breakpoints ----------------------------------------------------------------
+
+local bps = { list = {}, note = nil }
+
+local function render_bps()
+  local lines, marks = {}, {}
+  for i, b in ipairs(bps.list) do
+    local where = ("%s:%d"):format(b.file, b.line)
+    local extra = {}
+    if b.cond ~= "" then
+      table.insert(extra, "if " .. b.cond)
+    end
+    if b.hit ~= "" then
+      table.insert(extra, "hit " .. b.hit)
+    end
+    if b.log ~= "" then
+      table.insert(extra, "log " .. b.log)
+    end
+    lines[i] = "● " .. where .. (#extra > 0 and ("  " .. table.concat(extra, " · ")) or "")
+    table.insert(marks, { i - 1, 0, { end_col = #"●", hl_group = "ErrorMsg" } })
+    table.insert(marks, { i - 1, #"● " + #where, { end_col = #lines[i], hl_group = "Comment" } })
+  end
+  local hint = #lines == 0 and "no breakpoints" or "Enter go to · d delete"
+  table.insert(lines, (bps.note and (bps.note .. " · ") or "") .. hint)
+  table.insert(marks, { #lines - 1, 0, { line_hl_group = "Comment" } })
+  show(lines, marks)
+end
+
+function bps.start()
+  S.buf = scratch()
+  render_bps()
+  local function at()
+    return bps.list[cursor_line()]
+  end
+  local function go()
+    local b = at()
+    if b then
+      call("_bp_jump", vim.v.servername, b.buf, b.line)
+    end
+  end
+  vim.keymap.set("n", "<CR>", go, { buffer = S.buf })
+  vim.keymap.set("n", "<2-LeftMouse>", go, { buffer = S.buf })
+  vim.keymap.set("n", "d", function()
+    local b = at()
+    if b then
+      call("_bp_delete", vim.v.servername, b.buf, b.line)
+    end
+  end, { buffer = S.buf })
+end
+
+function bps.status(text)
+  bps.note = text
+  render_bps()
+end
+
+function bps.on_breakpoints(list)
+  bps.list, bps.note = list, nil
+  render_bps()
+end
+
 -- Connection -----------------------------------------------------------------
 
 local function status(text, hl)
@@ -507,10 +656,12 @@ M.on_event = dispatch("on_event")
 M.on_frame = dispatch("on_frame")
 M.on_running = dispatch("on_running")
 M.on_variables = dispatch("on_variables")
+M.on_watches = dispatch("on_watches")
+M.on_breakpoints = dispatch("on_breakpoints")
 
 -- Start ----------------------------------------------------------------------
 
-local kinds = { repl = repl, stack = stack, variables = vars }
+local kinds = { repl = repl, stack = stack, variables = vars, watches = watchv, breakpoints = bps }
 
 function M.start(kind, server)
   S.kind, S.server = kind or "repl", server

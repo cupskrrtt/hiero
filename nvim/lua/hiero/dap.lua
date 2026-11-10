@@ -7,7 +7,7 @@
 --   talks to this nvim over RPC (see hiero/panel.lua). This nvim keeps the
 --   session; a panel asks it to evaluate, and gets told when the program stops.
 --
---   require("hiero.dap").setup({ dir = "down", size = 30, panels = { "repl", "variables", "stack" } })
+--   require("hiero.dap").setup({ dir = "down", size = 30 })
 --
 -- Outside Hiero (no $HIERO_PANE) it does nothing.
 
@@ -20,9 +20,12 @@ M.config = {
   focus = false, -- move the focus to it
   close_on_end = false, -- close the output pane when the session ends (otherwise it stays until the next run)
   categories = { stdout = true, stderr = true, console = false }, -- DAP output categories to show
-  panels = { "repl", "variables", "stack" }, -- panel panes opened with a session; {} for none
+  -- Panel panes opened with a session; {} for none. repl and watches go in a
+  -- row beside the output pane; variables, stack and breakpoints in a column
+  -- right of nvim, in the order given.
+  panels = { "repl", "watches", "variables", "stack", "breakpoints" },
   close_panels_on_end = true, -- close the panels when the session ends
-  column_size = 30, -- variables and stack share a column right of nvim, this percent wide
+  column_size = 30, -- the column's width, in percent
 }
 
 local state = { file = nil, path = nil, pane = nil }
@@ -114,6 +117,11 @@ function M._subscribe(kind, addr)
   subs[addr] = { chan = chan, kind = kind }
   local s = require("dap").session()
   notify(addr, "on_hello", s and (s.config.name or "debug") or vim.NIL)
+  if kind == "watches" then
+    send_watches(addr)
+  elseif kind == "breakpoints" then
+    send_bps(addr)
+  end
   -- Already stopped: show it now.
   if s and s.stopped_thread_id and s.current_frame then
     s:request("scopes", { frameId = s.current_frame.id }, function(err, body)
@@ -202,6 +210,131 @@ function M._variables(addr, req, ref)
   end)
 end
 
+-- Watches: kept here, so they outlive panels and sessions. Each entry is
+-- re-evaluated on every stop and frame change.
+local watches = {}
+
+local function send_watches(addr)
+  local s = require("dap").session()
+  local results = {}
+  local function done()
+    if addr then
+      notify(addr, "on_watches", results)
+    else
+      broadcast("on_watches", results)
+    end
+  end
+  local stopped = s and s.stopped_thread_id and s.current_frame
+  for i, e in ipairs(watches) do
+    results[i] = { expr = e, value = "", type = "", err = "", stale = not stopped }
+  end
+  if #watches == 0 or not stopped then
+    return done()
+  end
+  local left = #watches
+  for i, e in ipairs(watches) do
+    s:evaluate({ expression = e, context = "watch" }, function(err, resp)
+      local r = results[i]
+      r.value = resp and resp.result or ""
+      r.type = resp and resp.type or ""
+      r.err = err and err_text(err) or ""
+      left = left - 1
+      if left == 0 then
+        done()
+      end
+    end)
+  end
+end
+
+function M._watch_add(_, expr)
+  table.insert(watches, expr)
+  send_watches()
+end
+
+function M._watch_set(_, i, expr)
+  if watches[i] then
+    watches[i] = expr
+    send_watches()
+  end
+end
+
+function M._watch_del(_, i)
+  table.remove(watches, i)
+  send_watches()
+end
+
+-- Breakpoints: nvim-dap has no event for a toggle, so a breakpoints panel is
+-- sent the list again whenever it changed (checked every second).
+local function bp_list()
+  local out = {}
+  for buf, bps in pairs(require("dap.breakpoints").get()) do
+    local file = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(buf), ":~:.")
+    for _, bp in ipairs(bps) do
+      table.insert(out, {
+        buf = buf,
+        line = bp.line,
+        file = file,
+        cond = bp.condition or "",
+        hit = bp.hitCondition or "",
+        log = bp.logMessage or "",
+      })
+    end
+  end
+  table.sort(out, function(a, b)
+    if a.file ~= b.file then
+      return a.file < b.file
+    end
+    return a.line < b.line
+  end)
+  return out
+end
+
+local last_bps = nil
+
+local function send_bps(addr)
+  local list = bp_list()
+  local key = vim.inspect(list)
+  if addr then
+    notify(addr, "on_breakpoints", list)
+    return
+  end
+  if key ~= last_bps then
+    last_bps = key
+    for a, sub in pairs(subs) do
+      if sub.kind == "breakpoints" then
+        notify(a, "on_breakpoints", list)
+      end
+    end
+  end
+end
+
+--- From a panel: show breakpoint `line` of buffer `buf` in this nvim.
+function M._bp_jump(_, buf, line)
+  if not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+  local win = vim.fn.bufwinid(buf)
+  if win == -1 then
+    win = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_buf(win, buf)
+  end
+  vim.api.nvim_set_current_win(win)
+  pcall(vim.api.nvim_win_set_cursor, win, { line, 0 })
+  vim.cmd("normal! zz")
+end
+
+--- From a panel: remove a breakpoint, and tell the sessions.
+function M._bp_delete(_, buf, line)
+  local breakpoints = require("dap.breakpoints")
+  breakpoints.remove(buf, line)
+  local bps = breakpoints.get(buf)
+  bps[buf] = bps[buf] or {}
+  for _, s in pairs(require("dap").sessions()) do
+    s:set_breakpoints(bps)
+  end
+  send_bps()
+end
+
 local function panel_args(kind, where)
   local args = { "split", "--reuse", "--name", pane_name(kind), "--no-focus" }
   vim.list_extend(args, where)
@@ -209,36 +342,65 @@ local function panel_args(kind, where)
   return args
 end
 
---- The repl sits beside the output pane (`beside`), sharing its row; variables
---- and stack share a column right of nvim, one under the other.
-local function open_panels(beside)
-  local row, column = {}, {}
-  for _, kind in ipairs(M.config.panels) do
-    table.insert(kind == "repl" and row or column, kind)
-  end
-  for i, kind in ipairs(row) do
-    local where = beside and { "--pane", beside, "--dir", "right", "--size", tostring(math.floor(100 * i / (i + 1))) }
-      or { "--dir", M.config.dir, "--size", tostring(M.config.size or 30) }
-    hiero(panel_args(kind, where))
-  end
-  -- One after the other: each splits the one before.
-  local function next_in_column(i, above)
-    local kind = column[i]
+local ROW = { repl = true, watches = true }
+
+--- Open the panels as a chain: each splits the one before it in `dir`, which
+--- joins the same split, and `--size` is the new pane's share of that split.
+--- So the n-th pane of the split takes 1/n and they all end up the same size.
+--- `first` places the first one; `before` panes are already in its split.
+local function chain(kinds, first, dir, before)
+  local function step(i, prev)
+    local kind = kinds[i]
     if not kind then
       return
     end
-    local where = above and { "--pane", above, "--dir", "down", "--size", tostring(math.floor(100 / (#column - i + 2))) }
-      or { "--dir", "right", "--size", tostring(M.config.column_size) }
+    local where = prev and { "--pane", prev, "--dir", dir, "--size", tostring(math.floor(100 / (before + i))) }
+      or first()
     hiero(panel_args(kind, where), function(id)
-      next_in_column(i + 1, id)
+      step(i + 1, id)
     end)
   end
-  next_in_column(1, nil)
+  step(1, nil)
+end
+
+--- repl and watches sit beside the output pane (`beside`), sharing its row;
+--- variables, stack and breakpoints share a column right of nvim.
+local panels_open = false
+
+local function open_panels(beside)
+  panels_open = true
+  local row, column = {}, {}
+  for _, kind in ipairs(M.config.panels) do
+    table.insert(ROW[kind] and row or column, kind)
+  end
+  -- The row joins the output pane's split (or starts one under nvim).
+  chain(row, function()
+    if beside then
+      return { "--pane", beside, "--dir", "right", "--size", "50" }
+    end
+    return { "--dir", M.config.dir, "--size", tostring(M.config.size or 30) }
+  end, "right", beside and 1 or 0)
+  chain(column, function()
+    return { "--dir", "right", "--size", tostring(M.config.column_size) }
+  end, "down", 0)
 end
 
 local function close_panels()
+  panels_open = false
   for _, kind in ipairs(M.config.panels) do
     hiero({ "close", "--name", pane_name(kind) })
+  end
+end
+
+--- Open the panels, or close them when they are open (for a key like <F7>).
+function M.toggle_panels()
+  if not own_pane() then
+    return
+  end
+  if panels_open then
+    close_panels()
+  else
+    open_panels(state.pane)
   end
 end
 
@@ -355,6 +517,7 @@ function M.setup(opts)
   dap.listeners.after.scopes.hiero = function(session, err, body)
     if not err and session.stopped_thread_id then
       send_frame(session, body)
+      send_watches()
     end
   end
   local function running()
@@ -364,6 +527,11 @@ function M.setup(opts)
     dap.listeners.after[req].hiero = running
   end
   dap.listeners.after.event_continued.hiero = running
+  vim.uv.new_timer():start(1000, 1000, vim.schedule_wrap(function()
+    if next(subs) then
+      send_bps()
+    end
+  end))
   vim.api.nvim_create_user_command("HieroDapOutput", function()
     M.open("output")
   end, { desc = "Open the Hiero pane for debug output" })
