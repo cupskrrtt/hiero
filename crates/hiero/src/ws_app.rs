@@ -545,17 +545,20 @@ impl WsApp {
 
     /// A fresh copy of the document (first read, reload, or after our own edit).
     pub fn on_doc(&mut self, doc: WsDoc) {
-        // Panes whose terminal the document dropped or swapped (`hiero pane
-        // split --reuse`): show the pane's new one, started if needed.
+        // Panes on screen whose terminal the document dropped or swapped
+        // (`hiero pane split --reuse`): show the pane's new one, started if
+        // needed. Decided from the document alone: the old terminal may already
+        // have ended, and the pane be busy attaching to it again. Our own
+        // edits (a terminal we just started or show) don't count.
         let mut replaced: Vec<String> = self
             .slots
             .iter()
             .filter(|(id, _)| !self.starting.contains(*id))
             .filter_map(|(id, s)| {
-                let addr = &s.view.as_ref()?.addr;
-                let (_, _, was) = self.doc.pane(id)?;
-                let (_, _, now) = doc.pane(id)?;
-                (was.terminal.as_ref() == Some(addr) && now.terminal.as_ref() != Some(addr)).then(|| id.clone())
+                let was = self.doc.pane(id)?.2.terminal.as_ref()?;
+                let now = doc.pane(id)?.2.terminal.as_ref();
+                let ours = now.is_some_and(|n| s.view.as_ref().is_some_and(|v| &v.addr == n) || self.recent.get(id) == Some(n));
+                (now != Some(was) && !ours).then(|| id.clone())
             })
             .collect();
         replaced.sort();
@@ -2202,6 +2205,9 @@ mod tests {
         a.on_doc(doc.clone());
         a.set.terminals.insert("t-n-w1".into(), terminal("t1", true));
         a.actions.clear();
+        // The pane may show no terminal at all, e.g. its open failed because the old one had ended.
+        let slot = a.slots.get_mut("n-w1").unwrap();
+        (slot.view, slot.error) = (None, Some("t-n-w1 has finished".into()));
         // From the CLI: a new command and no terminal.
         apply(&mut doc, &WsOp::SetCommand { pane: "n-w1".into(), command: Some("make run".into()) }).unwrap();
         apply(&mut doc, &WsOp::SetTerminal { pane: "n-w1".into(), terminal: None }).unwrap();
