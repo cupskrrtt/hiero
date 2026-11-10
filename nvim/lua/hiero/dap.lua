@@ -7,7 +7,7 @@
 --   talks to this nvim over RPC (see hiero/panel.lua). This nvim keeps the
 --   session; a panel asks it to evaluate, and gets told when the program stops.
 --
---   require("hiero.dap").setup({ dir = "down", size = 30, panels = { "repl" } })
+--   require("hiero.dap").setup({ dir = "down", size = 30, panels = { "repl", "variables", "stack" } })
 --
 -- Outside Hiero (no $HIERO_PANE) it does nothing.
 
@@ -20,8 +20,9 @@ M.config = {
   focus = false, -- move the focus to it
   close_on_end = false, -- close the output pane when the session ends (otherwise it stays until the next run)
   categories = { stdout = true, stderr = true, console = false }, -- DAP output categories to show
-  panels = { "repl" }, -- panel panes opened with a session; {} for none
+  panels = { "repl", "variables", "stack" }, -- panel panes opened with a session; {} for none
   close_panels_on_end = true, -- close the panels when the session ends
+  column_size = 30, -- variables and stack share a column right of nvim, this percent wide
 }
 
 local state = { file = nil, path = nil, pane = nil }
@@ -102,6 +103,8 @@ local function err_text(err)
   return fmt or err.message or vim.inspect(err)
 end
 
+local send_frame -- below
+
 --- From a panel: it listens at `addr`. Connect back so we can tell it things.
 function M._subscribe(kind, addr)
   local ok, chan = pcall(vim.fn.sockconnect, "pipe", addr, { rpc = true })
@@ -111,6 +114,14 @@ function M._subscribe(kind, addr)
   subs[addr] = { chan = chan, kind = kind }
   local s = require("dap").session()
   notify(addr, "on_hello", s and (s.config.name or "debug") or vim.NIL)
+  -- Already stopped: show it now.
+  if s and s.stopped_thread_id and s.current_frame then
+    s:request("scopes", { frameId = s.current_frame.id }, function(err, body)
+      if not err then
+        send_frame(s, body, addr)
+      end
+    end)
+  end
 end
 
 --- From a panel: evaluate in the current frame and answer it.
@@ -132,18 +143,97 @@ function M._eval(addr, expr)
   end)
 end
 
-local function open_panels(beside)
-  for i, kind in ipairs(M.config.panels) do
-    local args = { "split", "--reuse", "--name", pane_name(kind), "--no-focus" }
-    if beside then
-      -- Side by side with the output pane, sharing its row.
-      vim.list_extend(args, { "--pane", beside, "--dir", "right", "--size", tostring(math.floor(100 * i / (i + 1))) })
-    else
-      vim.list_extend(args, { "--dir", M.config.dir, "--size", tostring(M.config.size or 30) })
-    end
-    vim.list_extend(args, { "--", vim.v.progpath, "--clean", "-u", root .. "/panel.lua", "--", kind, vim.v.servername })
-    hiero(args)
+local function frame_list(session)
+  local t = session.stopped_thread_id and session.threads[session.stopped_thread_id]
+  local out = {}
+  for _, f in ipairs(t and t.frames or {}) do
+    local src = f.source and (f.source.path or f.source.name) or ""
+    table.insert(out, { id = f.id, name = f.name or "?", file = vim.fn.fnamemodify(src, ":t"), line = f.line or 0 })
   end
+  return out
+end
+
+local function scope_list(body)
+  local out = {}
+  for _, sc in ipairs(body and body.scopes or {}) do
+    table.insert(out, { name = sc.name, ref = sc.variablesReference or 0, expensive = sc.expensive or false })
+  end
+  return out
+end
+
+--- Tell panels (one `addr`, or all) where the stopped program is: its frames,
+--- the current frame and that frame's scopes.
+send_frame = function(session, body, addr)
+  local cur = session.current_frame
+  local args = { frame_list(session), cur and cur.id or vim.NIL, scope_list(body) }
+  if addr then
+    notify(addr, "on_frame", unpack(args))
+  else
+    broadcast("on_frame", unpack(args))
+  end
+end
+
+--- From a panel: make frame `id` of the stopped thread the current one (nvim jumps there).
+function M._select_frame(_, id)
+  local s = require("dap").session()
+  if not s then
+    return
+  end
+  for _, f in ipairs(s.stopped_thread_id and s.threads[s.stopped_thread_id].frames or {}) do
+    if f.id == id then
+      s:_frame_set(f)
+      return
+    end
+  end
+end
+
+--- From a panel: the children of variables reference `ref`, answered with request `req`.
+function M._variables(addr, req, ref)
+  local s = require("dap").session()
+  if not s then
+    return
+  end
+  s:request("variables", { variablesReference = ref }, function(err, resp)
+    local out = {}
+    for _, v in ipairs(not err and resp and resp.variables or {}) do
+      table.insert(out, { name = v.name, value = v.value or "", type = v.type or "", ref = v.variablesReference or 0 })
+    end
+    notify(addr, "on_variables", req, out, err and err_text(err) or vim.NIL)
+  end)
+end
+
+local function panel_args(kind, where)
+  local args = { "split", "--reuse", "--name", pane_name(kind), "--no-focus" }
+  vim.list_extend(args, where)
+  vim.list_extend(args, { "--", vim.v.progpath, "--clean", "-u", root .. "/panel.lua", "--", kind, vim.v.servername })
+  return args
+end
+
+--- The repl sits beside the output pane (`beside`), sharing its row; variables
+--- and stack share a column right of nvim, one under the other.
+local function open_panels(beside)
+  local row, column = {}, {}
+  for _, kind in ipairs(M.config.panels) do
+    table.insert(kind == "repl" and row or column, kind)
+  end
+  for i, kind in ipairs(row) do
+    local where = beside and { "--pane", beside, "--dir", "right", "--size", tostring(math.floor(100 * i / (i + 1))) }
+      or { "--dir", M.config.dir, "--size", tostring(M.config.size or 30) }
+    hiero(panel_args(kind, where))
+  end
+  -- One after the other: each splits the one before.
+  local function next_in_column(i, above)
+    local kind = column[i]
+    if not kind then
+      return
+    end
+    local where = above and { "--pane", above, "--dir", "down", "--size", tostring(math.floor(100 / (#column - i + 2))) }
+      or { "--dir", "right", "--size", tostring(M.config.column_size) }
+    hiero(panel_args(kind, where), function(id)
+      next_in_column(i + 1, id)
+    end)
+  end
+  next_in_column(1, nil)
 end
 
 local function close_panels()
@@ -260,6 +350,20 @@ function M.setup(opts)
     broadcast("on_event", ("%s at %s"):format(stop_pending, where))
     stop_pending = nil
   end
+  -- Scopes are fetched on every stop and every frame change (from a panel,
+  -- or dap.up/down in nvim): the moment to show where the program is.
+  dap.listeners.after.scopes.hiero = function(session, err, body)
+    if not err and session.stopped_thread_id then
+      send_frame(session, body)
+    end
+  end
+  local function running()
+    broadcast("on_running")
+  end
+  for _, req in ipairs({ "continue", "next", "stepIn", "stepOut", "stepBack", "reverseContinue" }) do
+    dap.listeners.after[req].hiero = running
+  end
+  dap.listeners.after.event_continued.hiero = running
   vim.api.nvim_create_user_command("HieroDapOutput", function()
     M.open("output")
   end, { desc = "Open the Hiero pane for debug output" })
