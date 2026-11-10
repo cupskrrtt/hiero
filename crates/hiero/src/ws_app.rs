@@ -90,6 +90,10 @@ pub enum Action {
     /// `attempt` tells a late answer from one for an older attempt.
     Open { plan: Plan, attempt: u64, cols: u16, rows: u16 },
     Resize { pane: String, cols: u16, rows: u16 },
+    /// Tell the pane's program its size in-band (`CSI 48 ; rows ; cols ; 0 ; 0 t`),
+    /// for a program that turned on mode 2048: neovim then ignores SIGWINCH and
+    /// waits for this report, which the terminal (Hiero, here) has to send.
+    SizeReport { pane: String, cols: u16, rows: u16 },
     /// Kill these terminals and remove them from hc.
     Kill(Vec<String>),
     /// Start a pane's terminal in the background (no attach) and record it.
@@ -729,6 +733,9 @@ impl WsApp {
                 slot.size = size;
                 view.resize(size.0, size.1);
                 self.actions.push(Action::Resize { pane: id.clone(), cols: size.0, rows: size.1 });
+                if view.parser.screen().in_band_resize() {
+                    self.actions.push(Action::SizeReport { pane: id.clone(), cols: size.0, rows: size.1 });
+                }
             }
         }
         self.restore_hidden();
@@ -924,7 +931,16 @@ impl WsApp {
         use hc_client::StreamMsg;
         let Some(view) = self.slots.get_mut(pane).and_then(|s| s.view.as_mut()) else { return };
         match msg {
-            StreamMsg::Data(bytes) => view.parser.process(&bytes),
+            StreamMsg::Data(bytes) => {
+                let before = view.parser.screen().in_band_resize();
+                view.parser.process(&bytes);
+                // Turned on now, or seen in the replay of an attach (which may
+                // have resized the terminal under the program): report the size.
+                if !before && view.parser.screen().in_band_resize() {
+                    let (rows, cols) = view.parser.screen().size();
+                    self.actions.push(Action::SizeReport { pane: pane.to_string(), cols: cols.get(), rows: rows.get() });
+                }
+            }
             StreamMsg::Resize { .. } => {}
             StreamMsg::Closed(reason) => {
                 view.ended = Some(crate::widgets::describe_close(reason.as_ref()));
@@ -2591,6 +2607,26 @@ mod tests {
             assert_eq!((t, p, *d), (&tab, &pane, dir));
             assert_eq!(delta.signum(), sign);
         }
+    }
+
+    #[test]
+    fn a_program_in_mode_2048_gets_its_size_in_band() {
+        let mut a = three_panes();
+        let id = a.slots.keys().min().unwrap().clone();
+        a.actions.clear();
+        // Turning the mode on (or seeing it in an attach's replay) reports the size once.
+        a.on_stream(&id, hc_client::StreamMsg::Data(b"\x1b[?2048h".to_vec()));
+        a.on_stream(&id, hc_client::StreamMsg::Data(b"\x1b[?2048h".to_vec()));
+        let (cols, rows) = a.slots[&id].size;
+        let reports: Vec<_> = a.actions.iter().filter(|x| matches!(x, Action::SizeReport { .. })).collect();
+        assert!(matches!(&reports[..], [Action::SizeReport { pane, cols: c, rows: r }] if *pane == id && (*c, *r) == (cols, rows)), "{reports:?}");
+        a.actions.clear();
+        // A resize: the stream first, then the report with the new size; panes without the mode get none.
+        a.set_screen(rect(0, 0, 80, 20));
+        let (cols, rows) = a.slots[&id].size;
+        let i = a.actions.iter().position(|x| matches!(x, Action::Resize { pane, .. } if *pane == id)).unwrap();
+        assert!(matches!(a.actions.get(i + 1), Some(Action::SizeReport { pane, cols: c, rows: r }) if *pane == id && (*c, *r) == (cols, rows)), "{:?}", a.actions);
+        assert_eq!(a.actions.iter().filter(|x| matches!(x, Action::SizeReport { .. })).count(), 1);
     }
 
     #[test]

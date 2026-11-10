@@ -168,6 +168,12 @@ async fn event_loop(
                         let _ = h.cmd.send(PaneCmd::Resize(cols, rows));
                     }
                 }
+                // After any resize on the same channel, so the terminal has the size first.
+                Action::SizeReport { pane, cols, rows } => {
+                    if let Some(h) = handles.get(&pane) {
+                        let _ = h.cmd.send(PaneCmd::Input(format!("\x1b[48;{rows};{cols};0;0t").into_bytes()));
+                    }
+                }
                 Action::LoadDoc => {
                     if let Some(c) = &client {
                         let (c, tx) = (c.clone(), tx.clone());

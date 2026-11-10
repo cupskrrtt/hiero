@@ -7,6 +7,7 @@ const MODE_APPLICATION_CURSOR: u8 = 0b0000_0010;
 const MODE_HIDE_CURSOR: u8 = 0b0000_0100;
 const MODE_ALTERNATE_SCREEN: u8 = 0b0000_1000;
 const MODE_BRACKETED_PASTE: u8 = 0b0001_0000;
+const MODE_IN_BAND_RESIZE: u8 = 0b0010_0000;
 
 /// The xterm mouse handling mode currently in use.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
@@ -708,6 +709,15 @@ impl Screen {
         self.mode(MODE_BRACKETED_PASTE)
     }
 
+    /// Returns whether the program asked for in-band resize notifications
+    /// (`CSI ? 2048 h`): the terminal then reports every new size with
+    /// `CSI 48 ; rows ; cols ; height_px ; width_px t`, and the program may
+    /// stop listening for SIGWINCH (neovim does).
+    #[must_use]
+    pub fn in_band_resize(&self) -> bool {
+        self.mode(MODE_IN_BAND_RESIZE)
+    }
+
     /// Returns the currently active [`MouseProtocolMode`].
     #[must_use]
     pub fn mouse_protocol_mode(&self) -> MouseProtocolMode {
@@ -1404,6 +1414,7 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                     self.screen.enter_alternate_grid();
                 }
                 [2004] => screen.set_mode(MODE_BRACKETED_PASTE),
+                [2048] => screen.set_mode(MODE_IN_BAND_RESIZE),
                 _ => unhandled(self),
             }
         }
@@ -1446,6 +1457,7 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                     self.decrc();
                 }
                 [2004] => screen.clear_mode(MODE_BRACKETED_PASTE),
+                [2048] => screen.clear_mode(MODE_IN_BAND_RESIZE),
                 _ => unhandled(self),
             }
         }
