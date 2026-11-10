@@ -259,6 +259,27 @@ hiero debug vtcompare t4 [--secs 20]   # compare Hiero's emulator with herdr-cor
 
 Projects and workspaces are named exactly on the command line. Folders must exist.
 
+## Debugging with nvim-dap
+
+`nvim/lua/hiero/dap.lua` sends the debugged program's output to a Hiero pane next to nvim instead
+of a window inside it. Most debug adapters (delve, netcoredbg) send the output as DAP events; it is
+written to a file under `stdpath("run")` and the pane follows it with `tail -F`. stderr shows red.
+
+```lua
+vim.opt.rtp:append(vim.fn.expand("~/path/to/hiero/nvim"))
+require("hiero.dap").setup({
+  dir = "down",          -- or "right"
+  size = 30,             -- percent of the split
+  focus = false,         -- keep the focus in nvim
+  close_on_end = false,  -- keep the pane until the next run
+  categories = { stdout = true, stderr = true, console = false },  -- console: the adapter's own messages
+})
+```
+
+Every session starts a fresh file and reuses the pane (`dap output <id>`, one per nvim pane).
+`:HieroDapOutput` opens it by hand, `:HieroDapOutputClose` closes it. Outside Hiero it does nothing.
+The program has no stdin there.
+
 ## Environment variables
 
 | Variable | Meaning |
