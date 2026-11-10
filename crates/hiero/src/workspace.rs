@@ -188,6 +188,11 @@ impl Workspace {
     pub fn panes(&self) -> Vec<&Pane> {
         self.tabs.iter().flat_map(|t| t.layout.panes()).collect()
     }
+
+    /// The first pane (in any tab) with this name.
+    pub fn pane_by_name(&self, name: &str) -> Option<&Pane> {
+        self.panes().into_iter().find(|p| p.name.as_deref() == Some(name))
+    }
 }
 
 /// Up or down in the sidebar order.
@@ -841,6 +846,100 @@ pub fn new_id(prefix: &str) -> String {
         .unwrap_or(0) as u32;
     let n = N.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}-{:08x}", nanos.wrapping_mul(2_654_435_761).wrapping_add(n.wrapping_mul(0x9e37_79b1)))
+}
+
+/// What `hiero pane split` asks for.
+#[derive(Debug, Clone)]
+pub struct SplitRequest {
+    pub dir: Dir,
+    /// The new pane's share (1..=90 percent) of the split it lands in.
+    pub size: Option<u16>,
+    pub name: Option<String>,
+    /// What to run (a shell line); `None` is a shell.
+    pub command: Option<String>,
+    /// Leave the focus where it was.
+    pub no_focus: bool,
+    /// With a name: reuse the pane of that name in the workspace instead of splitting.
+    pub reuse: bool,
+}
+
+/// The ops for `hiero pane split` next to `target`, the id of the pane they
+/// leave running the command, and the terminal of a reused pane that must
+/// be ended. Nothing is applied; the ops are checked against a copy.
+pub fn plan_split(doc: &WsDoc, target: &str, new_id: &str, r: &SplitRequest) -> Result<(Vec<WsOp>, String, Option<String>), String> {
+    let (ws, tab, _) = doc.pane(target).ok_or_else(|| format!("no pane {target}"))?;
+    let name = match r.name.as_deref().map(str::trim) {
+        Some("") => return Err("the name can't be empty".into()),
+        n => n,
+    };
+    if r.reuse && name.is_none() {
+        return Err("--reuse needs --name".into());
+    }
+    if r.size.is_some_and(|s| !(1..=90).contains(&s)) {
+        return Err("--size must be between 1 and 90".into());
+    }
+    let set_command = |pane: &str| WsOp::SetCommand { pane: pane.to_string(), command: r.command.clone() };
+    if let Some(old) = name.filter(|_| r.reuse).and_then(|n| ws.pane_by_name(n)) {
+        // The restore rule starts the pane again once it has no terminal.
+        let ops = vec![set_command(&old.id), WsOp::SetTerminal { pane: old.id.clone(), terminal: None }];
+        return Ok((ops, old.id.clone(), old.terminal.clone()));
+    }
+    let mut ops = vec![WsOp::SplitPane { pane: target.to_string(), dir: r.dir, new_id: new_id.to_string() }];
+    if r.command.is_some() {
+        ops.push(set_command(new_id));
+    }
+    if let Some(n) = name {
+        ops.push(WsOp::RenamePane { pane: new_id.to_string(), name: Some(n.to_string()) });
+    }
+    if let Some(pct) = r.size {
+        let mut scratch = doc.clone();
+        apply(&mut scratch, &ops[0])?;
+        let (_, t, _) = scratch.pane(new_id).ok_or("the split lost the new pane")?;
+        if let Some((path, i, sizes)) = parent_split(&t.layout, new_id, &mut vec![]) {
+            ops.push(WsOp::SetSizes { tab: t.id.clone(), path, sizes: share_for(&sizes, i, pct) });
+        }
+    }
+    if r.no_focus && !tab.focus.is_empty() {
+        ops.push(WsOp::SetFocus { pane: tab.focus.clone() });
+    }
+    let mut scratch = doc.clone();
+    ops.iter().try_for_each(|op| apply(&mut scratch, op))?;
+    Ok((ops, new_id.to_string(), None))
+}
+
+/// The split directly above pane `id`: its path from the root, the pane's
+/// index in it, and the weights (one per child, a missing or zero one as 1).
+fn parent_split(l: &Layout, id: &str, path: &mut Vec<usize>) -> Option<(Vec<usize>, usize, Vec<u16>)> {
+    let Layout::Split { children, sizes, .. } = l else { return None };
+    if let Some(i) = children.iter().position(|c| matches!(c, Layout::Pane(p) if p.id == id)) {
+        let w = (0..children.len()).map(|k| sizes.get(k).copied().filter(|&x| x > 0).unwrap_or(1)).collect();
+        return Some((path.clone(), i, w));
+    }
+    for (k, c) in children.iter().enumerate() {
+        path.push(k);
+        if let Some(found) = parent_split(c, id, path) {
+            return Some(found);
+        }
+        path.pop();
+    }
+    None
+}
+
+/// Weights where child `i` gets `pct` percent and the others keep their proportions.
+fn share_for(weights: &[u16], i: usize, pct: u16) -> Vec<u16> {
+    fn gcd(a: u64, b: u64) -> u64 {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+    let others: u64 = weights.iter().enumerate().filter(|&(k, _)| k != i).map(|(_, &w)| w as u64).sum();
+    let pct = pct as u64;
+    // The others scale by (100 - pct), the new one is `others * pct`.
+    let mut v: Vec<u64> =
+        weights.iter().enumerate().map(|(k, &w)| if k == i { others * pct } else { w as u64 * (100 - pct) }).collect();
+    let g = v.iter().fold(0, |g, &x| gcd(g, x)).max(1);
+    v.iter_mut().for_each(|x| *x /= g);
+    let big = v.iter().copied().max().unwrap_or(1);
+    let cap = u16::MAX as u64;
+    v.into_iter().map(|x| (if big > cap { x * cap / big } else { x }).max(1) as u16).collect()
 }
 
 /// The tree as text, for `hiero ws list`.
@@ -1779,5 +1878,120 @@ mod tests {
         assert!(t.contains("split horizontal [1:1]"));
         assert!(t.contains("pane b  nvim  terminal t3 *"));
         assert!(render_tree(&WsDoc::default()).contains("no projects"));
+    }
+
+    fn req(dir: Dir) -> SplitRequest {
+        SplitRequest { dir, size: None, name: None, command: None, no_focus: false, reuse: false }
+    }
+
+    fn planned(d: &mut WsDoc, target: &str, new_id: &str, r: &SplitRequest) -> (String, Option<String>) {
+        let (ops, id, old) = plan_split(d, target, new_id, r).unwrap();
+        for op in &ops {
+            apply(d, op).unwrap();
+        }
+        (id, old)
+    }
+
+    #[test]
+    fn pane_split_sets_command_name_and_focuses_the_new_pane() {
+        let mut d = base();
+        let r = SplitRequest { name: Some(s(" out ")), command: Some(s("make run")), ..req(Dir::Vertical) };
+        let (id, old) = planned(&mut d, "w1-p", "b", &r);
+        assert_eq!((id.as_str(), old), ("b", None));
+        let p = d.pane("b").unwrap().2;
+        assert_eq!((p.name.as_deref(), p.command.as_deref()), (Some("out"), Some("make run")));
+        assert_eq!(d.tab("w1-t").unwrap().1.focus, "b");
+        let Layout::Split { dir, .. } = &d.tab("w1-t").unwrap().1.layout else { panic!() };
+        assert_eq!(*dir, Dir::Vertical);
+    }
+
+    #[test]
+    fn pane_split_no_focus_keeps_the_previous_focus() {
+        let mut d = base();
+        ok(&mut d, split_op("w1-p", Dir::Horizontal, "a"));
+        ok(&mut d, WsOp::SetFocus { pane: s("w1-p") });
+        planned(&mut d, "a", "b", &SplitRequest { no_focus: true, ..req(Dir::Horizontal) });
+        assert_eq!(d.tab("w1-t").unwrap().1.focus, "w1-p");
+    }
+
+    #[test]
+    fn pane_split_size_is_the_new_panes_share() {
+        let mut d = base();
+        planned(&mut d, "w1-p", "b", &SplitRequest { size: Some(30), ..req(Dir::Horizontal) });
+        let Layout::Split { sizes, .. } = &d.tab("w1-t").unwrap().1.layout else { panic!() };
+        assert_eq!(sizes, &[7, 3]);
+        // Joining a split of three (the old split gives its panes 1 and 3): the new pane gets a quarter, the others keep their ratio.
+        let mut d = base();
+        ok(&mut d, split_op("w1-p", Dir::Horizontal, "a"));
+        ok(&mut d, WsOp::SetSizes { tab: s("w1-t"), path: vec![], sizes: vec![1, 3] });
+        planned(&mut d, "w1-p", "b", &SplitRequest { size: Some(25), ..req(Dir::Horizontal) });
+        let Layout::Split { sizes, .. } = &d.tab("w1-t").unwrap().1.layout else { panic!() };
+        assert_eq!(sizes.len(), 3);
+        let total: u32 = sizes.iter().map(|&x| x as u32).sum();
+        assert_eq!(sizes[1] as u32 * 4, total, "{sizes:?}");
+        assert_eq!(sizes[0] * 3, sizes[2], "{sizes:?}");
+        // A nested split is addressed by its path.
+        let mut d = base();
+        ok(&mut d, split_op("w1-p", Dir::Horizontal, "a"));
+        planned(&mut d, "a", "b", &SplitRequest { size: Some(10), ..req(Dir::Vertical) });
+        let Layout::Split { children, sizes, .. } = &d.tab("w1-t").unwrap().1.layout else { panic!() };
+        assert_eq!(sizes, &[1, 1], "the outer split is untouched");
+        let Layout::Split { sizes, .. } = &children[1] else { panic!() };
+        assert_eq!(sizes, &[9, 1]);
+    }
+
+    #[test]
+    fn share_for_keeps_proportions_and_fits_u16() {
+        assert_eq!(share_for(&[1, 1], 1, 50), [1, 1]);
+        assert_eq!(share_for(&[4, 2, 1], 2, 50), [2, 1, 3]);
+        let v = share_for(&[60000, 5000, 1], 2, 90);
+        assert!(v.iter().all(|&x| x >= 1));
+        assert!(v[2] > v[0], "{v:?}");
+    }
+
+    #[test]
+    fn pane_split_validation() {
+        let mut d = base();
+        let e = |d: &WsDoc, t: &str, r: &SplitRequest| plan_split(d, t, "b", r).unwrap_err();
+        assert!(e(&d, "zz", &req(Dir::Horizontal)).contains("no pane"));
+        assert!(e(&d, "w1-p", &SplitRequest { size: Some(0), ..req(Dir::Horizontal) }).contains("--size"));
+        assert!(e(&d, "w1-p", &SplitRequest { size: Some(91), ..req(Dir::Horizontal) }).contains("--size"));
+        assert!(e(&d, "w1-p", &SplitRequest { reuse: true, ..req(Dir::Horizontal) }).contains("--name"));
+        assert!(e(&d, "w1-p", &SplitRequest { name: Some(s(" ")), ..req(Dir::Horizontal) }).contains("empty"));
+        ok(&mut d, split_op("w1-p", Dir::Horizontal, "b"));
+        assert!(plan_split(&d, "w1-p", "b", &req(Dir::Horizontal)).unwrap_err().contains("already used"));
+    }
+
+    #[test]
+    fn pane_split_reuse_restarts_a_named_pane_of_the_same_workspace() {
+        let mut d = base();
+        add_ws(&mut d, "p1", "w2", "other");
+        let named = |n: &str| SplitRequest { name: Some(s(n)), command: Some(s("new cmd")), reuse: true, ..req(Dir::Horizontal) };
+        planned(&mut d, "w1-p", "b", &SplitRequest { name: Some(s("out")), command: Some(s("old")), ..req(Dir::Horizontal) });
+        ok(&mut d, WsOp::SetTerminal { pane: s("b"), terminal: Some(s("t5")) });
+        // Same name in another workspace is not a match: a normal split.
+        let (id, old) = planned(&mut d, "w2-p", "c", &named("out"));
+        assert_eq!((id.as_str(), old), ("c", None));
+        // In the same workspace the pane is reused: new command, no terminal, old one reported.
+        let panes = d.workspace("w1").unwrap().1.panes().len();
+        let (id, old) = planned(&mut d, "w1-p", "e", &named("out"));
+        assert_eq!((id.as_str(), old.as_deref()), ("b", Some("t5")));
+        let p = d.pane("b").unwrap().2;
+        assert_eq!((p.command.as_deref(), p.terminal.as_deref()), (Some("new cmd"), None));
+        assert_eq!(d.workspace("w1").unwrap().1.panes().len(), panes, "no new pane");
+        // Without a match it splits.
+        let (id, _) = planned(&mut d, "w1-p", "f", &named("dap"));
+        assert_eq!(id, "f");
+        assert_eq!(d.pane("f").unwrap().2.name.as_deref(), Some("dap"));
+    }
+
+    #[test]
+    fn pane_by_name_looks_through_all_tabs() {
+        let mut d = base();
+        ok(&mut d, WsOp::AddTab { workspace: s("w1"), id: s("t2"), name: s("x"), pane_id: s("q") });
+        ok(&mut d, WsOp::RenamePane { pane: s("q"), name: Some(s("repl")) });
+        let w = &d.workspace("w1").unwrap().1;
+        assert_eq!(w.pane_by_name("repl").map(|p| p.id.as_str()), Some("q"));
+        assert!(w.pane_by_name("nope").is_none());
     }
 }

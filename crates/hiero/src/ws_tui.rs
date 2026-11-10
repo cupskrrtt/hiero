@@ -353,7 +353,7 @@ fn send_input(handles: &HashMap<String, Handle>, app: &WsApp, bytes: Vec<u8>) {
 
 /// End a pane's program and remove its terminal from hc. A just-killed
 /// terminal may take a moment before it can be removed.
-async fn kill_and_remove(c: &Client, addr: &str) {
+pub async fn kill_and_remove(c: &Client, addr: &str) {
     let _ = c.kill(addr).await;
     for _ in 0..10 {
         match c.rm(addr).await {

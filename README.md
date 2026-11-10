@@ -184,6 +184,15 @@ anyway. Even then Hiero never attaches the terminal it runs in: that pane shows
 `ended: this is Hiero itself` rather than a picture of itself drawing itself. Older panes without
 the variables are recognised by their `hiero.pane` label. Commands like `hiero ws` work normally inside panes.
 
+**Opening panes from inside a pane.** A program in a pane (nvim, a debugger plugin) can open and
+close sibling panes of the live workspace with `hiero pane split` and `hiero pane close`. They
+edit the layout; the open Hiero starts the terminal for a new pane by the restore rule, using the
+command and folder stored on it. `--pane` defaults to `$HIERO_PANE`. `--name` names the pane, and
+with `--reuse` a pane of that name in the same workspace gets the new command (its old program is
+ended) instead of a second split. `split` prints the pane id; `close` takes an id or a `--name`.
+The new pane has the focus unless `--no-focus`. A pane is only started while a Hiero shows
+that workspace (or opens it later).
+
 **Delete.** `D` on a workspace or project asks what to do with its terminals: `y` ends them and
 deletes, `k` deletes and leaves them running, `n` or `Esc` cancels.
 
@@ -231,6 +240,10 @@ hiero ws list                          # projects > workspaces > tabs > panes
 hiero ws rename shosha frontend web    # or: rename shosha shosha-app
 hiero ws move shosha web up            # or: move shosha down
 hiero ws rm shosha web                 # or: rm shosha
+
+# panes of the live workspace, from inside a pane (prints the new pane id)
+hiero pane split [--pane ID] [--dir right|down] [--size PCT] [--name NAME] [--no-focus] [--reuse] [-- CMD ARGS...]
+hiero pane close (ID | --name NAME)
 
 hiero config [path | init | show]
 

@@ -541,7 +541,24 @@ impl WsApp {
 
     /// A fresh copy of the document (first read, reload, or after our own edit).
     pub fn on_doc(&mut self, doc: WsDoc) {
+        // Panes whose terminal the document dropped or swapped (`hiero pane
+        // split --reuse`): show the pane's new one, started if needed.
+        let mut replaced: Vec<String> = self
+            .slots
+            .iter()
+            .filter(|(id, _)| !self.starting.contains(*id))
+            .filter_map(|(id, s)| {
+                let addr = &s.view.as_ref()?.addr;
+                let (_, _, was) = self.doc.pane(id)?;
+                let (_, _, now) = doc.pane(id)?;
+                (was.terminal.as_ref() == Some(addr) && now.terminal.as_ref() != Some(addr)).then(|| id.clone())
+            })
+            .collect();
+        replaced.sort();
         self.doc = doc;
+        for pane in replaced {
+            self.restart(&pane, false, false);
+        }
         if let Some(id) = self.pending_sel.take_if(|id| self.doc.project(id).is_some()) {
             self.sel = id;
         }
@@ -2158,6 +2175,25 @@ mod tests {
         a.on_doc(doc);
         let again = opens(&mut a);
         assert!(matches!(&again[..], [Plan::Attach { addr, .. }] if addr == "t1"), "{again:?}");
+    }
+
+    #[test]
+    fn a_pane_whose_terminal_was_cleared_in_the_document_starts_again() {
+        let mut a = app();
+        open_attached(&mut a, "w1");
+        let mut doc = a.doc.clone();
+        apply(&mut doc, &WsOp::SetTerminal { pane: "n-w1".into(), terminal: Some("t-n-w1".into()) }).unwrap();
+        a.on_doc(doc.clone());
+        a.set.terminals.insert("t-n-w1".into(), terminal("t1", true));
+        a.actions.clear();
+        // From the CLI: a new command and no terminal.
+        apply(&mut doc, &WsOp::SetCommand { pane: "n-w1".into(), command: Some("make run".into()) }).unwrap();
+        apply(&mut doc, &WsOp::SetTerminal { pane: "n-w1".into(), terminal: None }).unwrap();
+        a.on_doc(doc);
+        let [Action::Detach(old), Action::Open { plan: Plan::Start { pane, params }, .. }] = &a.actions[..] else {
+            panic!("{:?}", a.actions)
+        };
+        assert_eq!((old.as_str(), pane.as_str(), params.line.as_deref()), ("n-w1", "n-w1", Some("make run")));
     }
 
     #[test]

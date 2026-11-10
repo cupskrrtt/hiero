@@ -39,6 +39,9 @@ enum Command {
     /// Workspaces: projects, named workspaces, tabs and panes.
     #[command(subcommand)]
     Ws(WsCmd),
+    /// Open and close panes of the live workspace, from inside a pane.
+    #[command(subcommand)]
+    Pane(PaneCmd),
     /// Hiero's settings file.
     Config {
         #[command(subcommand)]
@@ -79,6 +82,51 @@ enum WsCmd {
     Move {
         #[arg(num_args = 2..=3, required = true)]
         args: Vec<String>,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum PaneDir {
+    /// Side by side.
+    Right,
+    /// Stacked.
+    Down,
+}
+
+#[derive(Subcommand)]
+enum PaneCmd {
+    /// Open a pane next to another one and print its id. A command after `--` runs in it.
+    Split {
+        /// The pane to split (default: $HIERO_PANE).
+        #[arg(long)]
+        pane: Option<String>,
+        #[arg(long, value_enum, default_value = "right")]
+        dir: PaneDir,
+        /// The new pane's share of the split, in percent.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=90))]
+        size: Option<u16>,
+        /// Name the pane.
+        #[arg(long)]
+        name: Option<String>,
+        /// Keep the focus where it is.
+        #[arg(long)]
+        no_focus: bool,
+        /// Run the command in the existing pane of this name (in the same workspace) instead of splitting.
+        #[arg(long, requires = "name")]
+        reuse: bool,
+        /// The program and its arguments (default: a shell).
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Close a pane and end its program.
+    #[command(group(clap::ArgGroup::new("which").required(true)))]
+    Close {
+        /// The pane id.
+        #[arg(group = "which")]
+        id: Option<String>,
+        /// The pane with this name in the workspace of $HIERO_PANE (or $HIERO_WS).
+        #[arg(long, group = "which")]
+        name: Option<String>,
     },
 }
 
@@ -167,6 +215,7 @@ async fn main() -> Result<()> {
         Some(Command::Config { action }) => config_cmd(action, config_error),
         Some(Command::Debug(d)) => debug(d).await,
         Some(Command::Ws(w)) => ws_cmd(w).await,
+        Some(Command::Pane(p)) => pane_cmd(p).await,
     }
 }
 
@@ -300,6 +349,66 @@ async fn ws_cmd(cmd: WsCmd) -> Result<()> {
     };
     workspace::update(&hc, &[op]).await.map_err(anyhow::Error::msg)?;
     println!("ok");
+    Ok(())
+}
+
+/// `hiero pane split` and `close`: edit the document; the open UI starts and drops the terminals.
+async fn pane_cmd(cmd: PaneCmd) -> Result<()> {
+    use workspace::{Dir, SplitRequest, WsOp, new_id};
+    let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+    let hc = Client::connect().await?;
+    let doc = workspace::load(&hc).await.map_err(anyhow::Error::msg)?;
+    match cmd {
+        PaneCmd::Split { pane, dir, size, name, no_focus, reuse, command } => {
+            let own = env(ws_app::ENV_PANE);
+            let target = pane
+                .or_else(|| own.clone())
+                .ok_or_else(|| anyhow::anyhow!("not inside a Hiero pane (no ${}): pass --pane ID", ws_app::ENV_PANE))?;
+            let req = SplitRequest {
+                dir: match dir {
+                    PaneDir::Right => Dir::Horizontal,
+                    PaneDir::Down => Dir::Vertical,
+                },
+                size,
+                name,
+                command: (!command.is_empty()).then(|| paths::shell_join(&command)),
+                no_focus,
+                reuse,
+            };
+            let (ops, id, old) = workspace::plan_split(&doc, &target, &new_id("n"), &req).map_err(anyhow::Error::msg)?;
+            if old.is_some() && own.as_deref() == Some(id.as_str()) {
+                anyhow::bail!("can't reuse the pane this runs in");
+            }
+            workspace::update(&hc, &ops).await.map_err(anyhow::Error::msg)?;
+            if let Some(addr) = old {
+                ws_tui::kill_and_remove(&hc, &addr).await;
+            }
+            println!("{id}");
+        }
+        PaneCmd::Close { id, name } => {
+            let id = match (id, name) {
+                (Some(id), _) => id,
+                (None, Some(name)) => {
+                    let ws = env(ws_app::ENV_PANE)
+                        .and_then(|p| doc.pane(&p).map(|(w, ..)| w.id.clone()))
+                        .or_else(|| env(ws_app::ENV_WS))
+                        .ok_or_else(|| anyhow::anyhow!("not inside a Hiero pane (no ${}): close by id", ws_app::ENV_PANE))?;
+                    let (_, w) = doc.workspace(&ws).ok_or_else(|| anyhow::anyhow!("no workspace {ws}"))?;
+                    w.pane_by_name(&name)
+                        .map(|p| p.id.clone())
+                        .ok_or_else(|| anyhow::anyhow!("workspace \"{}\" has no pane named \"{name}\"", w.name))?
+                }
+                (None, None) => unreachable!("clap wants an id or --name"),
+            };
+            let term = doc.pane(&id).and_then(|(_, _, p)| p.terminal.clone());
+            workspace::update(&hc, &[WsOp::ClosePane { pane: id }]).await.map_err(anyhow::Error::msg)?;
+            println!("ok");
+            // Last: closing the pane this runs in ends this process too.
+            if let Some(addr) = term {
+                ws_tui::kill_and_remove(&hc, &addr).await;
+            }
+        }
+    }
     Ok(())
 }
 
