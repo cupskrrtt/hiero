@@ -3,7 +3,7 @@
 -- * output: most debug adapters (delve, netcoredbg, ...) send the program's
 --   output as DAP `output` events. They go to a file that a pane next to this
 --   nvim follows with `hiero pane follow` (Linux and Windows).
--- * panels (repl, ...): each is a small `nvim --clean` in its own pane that
+-- * panels (repl, ...): each is a small `nvim --clean -u hiero/start.lua` in its own pane that
 --   talks to this nvim over RPC (see hiero/panel.lua). This nvim keeps the
 --   session; a panel asks it to evaluate, and gets told when the program stops.
 --
@@ -44,8 +44,8 @@ local function log_path()
   return vim.fn.stdpath("run") .. "/hiero-dap-" .. own_pane() .. ".log"
 end
 
--- This file is <root>/lua/hiero/dap.lua; the panels start from <root>/panel.lua.
-local root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h:h:h")
+-- The panels start from start.lua, next to this file.
+local start_file = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h") .. "/start.lua"
 
 local function hiero(args, on_ok)
   local argv = vim.list_extend({ M.config.cmd, "pane" }, args)
@@ -338,7 +338,7 @@ end
 local function panel_args(kind, where)
   local args = { "split", "--reuse", "--name", pane_name(kind), "--no-focus" }
   vim.list_extend(args, where)
-  vim.list_extend(args, { "--", vim.v.progpath, "--clean", "-u", root .. "/panel.lua", "--", kind, vim.v.servername })
+  vim.list_extend(args, { "--", vim.v.progpath, "--clean", "-u", start_file, "--", kind, vim.v.servername })
   return args
 end
 
