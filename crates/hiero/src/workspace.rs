@@ -242,6 +242,10 @@ pub enum WsOp {
     /// Name a pane; `None` or blank brings back the automatic title.
     RenamePane { pane: String, name: Option<String> },
     SetTerminal { pane: String, terminal: Option<String> },
+    /// Put back a tab layout saved earlier (`hiero pane layout`), only when it
+    /// holds exactly the panes the tab has now. The panes keep what they have
+    /// now (name, command, terminal); the arrangement and sizes come back.
+    SetLayout { tab: String, layout: Layout },
 }
 
 fn clean_name(what: &str, name: &str) -> Result<String, String> {
@@ -454,6 +458,25 @@ pub fn apply(doc: &mut WsDoc, op: &WsOp) -> Result<(), String> {
                 let at = before.iter().position(|p| p == pane).unwrap_or(0);
                 let after = tab.layout.panes();
                 tab.focus = after[at.min(after.len() - 1)].id.clone();
+            }
+        }
+        WsOp::SetLayout { tab, layout } => {
+            let (pi, wi, ti) = tab_ix(doc, tab)?;
+            let t = &mut doc.projects[pi].workspaces[wi].tabs[ti];
+            let ids = |l: &Layout| {
+                let mut v: Vec<String> = l.panes().iter().map(|p| p.id.clone()).collect();
+                v.sort();
+                v
+            };
+            if ids(&t.layout) != ids(layout) {
+                return Err(format!("the panes of tab {tab} changed since its layout was saved"));
+            }
+            let mut new = layout.clone();
+            refresh_panes(&mut new, &t.layout);
+            normalize(&mut new);
+            t.layout = new;
+            if t.layout.find(&t.focus).is_none() {
+                t.focus = t.layout.panes()[0].id.clone();
             }
         }
         WsOp::SetFocus { pane } => {
@@ -940,6 +963,18 @@ fn share_for(weights: &[u16], i: usize, pct: u16) -> Vec<u16> {
     let big = v.iter().copied().max().unwrap_or(1);
     let cap = u16::MAX as u64;
     v.into_iter().map(|x| (if big > cap { x * cap / big } else { x }).max(1) as u16).collect()
+}
+
+/// Replace every pane in `l` with the pane of the same id in `from`.
+fn refresh_panes(l: &mut Layout, from: &Layout) {
+    match l {
+        Layout::Pane(p) => {
+            if let Some(now) = from.find(&p.id) {
+                *p = now.clone();
+            }
+        }
+        Layout::Split { children, .. } => children.iter_mut().for_each(|c| refresh_panes(c, from)),
+    }
 }
 
 /// The tree as text, for `hiero ws list`.
@@ -1878,6 +1913,30 @@ mod tests {
         assert!(t.contains("split horizontal [1:1]"));
         assert!(t.contains("pane b  nvim  terminal t3 *"));
         assert!(render_tree(&WsDoc::default()).contains("no projects"));
+    }
+
+    #[test]
+    fn set_layout_puts_back_a_saved_layout_with_its_sizes() {
+        let mut d = base();
+        ok(&mut d, split_op("w1-p", Dir::Horizontal, "a"));
+        ok(&mut d, WsOp::SetSizes { tab: s("w1-t"), path: vec![], sizes: vec![4, 3] });
+        ok(&mut d, WsOp::RenamePane { pane: s("a"), name: Some(s("old")) });
+        let saved = d.tab("w1-t").unwrap().1.layout.clone();
+        // A debug pane comes and goes; the sizes don't come back by themselves.
+        ok(&mut d, split_op("a", Dir::Vertical, "dbg"));
+        ok(&mut d, split_op("w1-p", Dir::Horizontal, "dbg2"));
+        ok(&mut d, WsOp::RenamePane { pane: s("a"), name: Some(s("new")) });
+        ok(&mut d, WsOp::ClosePane { pane: s("dbg") });
+        ok(&mut d, WsOp::ClosePane { pane: s("dbg2") });
+        assert_ne!(d.tab("w1-t").unwrap().1.layout, saved);
+        ok(&mut d, WsOp::SetLayout { tab: s("w1-t"), layout: saved.clone() });
+        let Layout::Split { sizes, .. } = &d.tab("w1-t").unwrap().1.layout else { panic!() };
+        assert_eq!(sizes, &[4, 3]);
+        // The panes keep what they have now.
+        assert_eq!(d.pane("a").unwrap().2.name.as_deref(), Some("new"));
+        // Not with other panes than the tab has.
+        ok(&mut d, split_op("a", Dir::Vertical, "extra"));
+        assert!(err(&mut d, WsOp::SetLayout { tab: s("w1-t"), layout: saved }).contains("changed"));
     }
 
     fn req(dir: Dir) -> SplitRequest {

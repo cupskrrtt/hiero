@@ -121,15 +121,28 @@ enum PaneCmd {
     /// Print a file and what is added to it, like `tail -F` (also on Windows):
     /// it waits for the file to appear and starts over when it is truncated.
     Follow { file: std::path::PathBuf },
-    /// Close a pane and end its program.
-    #[command(group(clap::ArgGroup::new("which").required(true)))]
+    /// Close panes and end their programs.
+    #[command(group(clap::ArgGroup::new("which").required(true).multiple(true)))]
     Close {
-        /// The pane id.
+        /// Pane ids.
         #[arg(group = "which")]
-        id: Option<String>,
-        /// The pane with this name in the workspace of $HIERO_PANE (or $HIERO_WS).
-        #[arg(long, group = "which")]
-        name: Option<String>,
+        ids: Vec<String>,
+        /// Panes with this name in the workspace of $HIERO_PANE (or $HIERO_WS); repeatable.
+        #[arg(long = "name", group = "which")]
+        names: Vec<String>,
+        /// Skip names no pane has instead of failing.
+        #[arg(long)]
+        missing_ok: bool,
+    },
+    /// Print the layout of a pane's tab as JSON, or put one back with --restore
+    /// (only when the tab still has exactly those panes; otherwise it is kept).
+    Layout {
+        /// A pane of the tab (default: $HIERO_PANE).
+        #[arg(long)]
+        pane: Option<String>,
+        /// A layout printed earlier.
+        #[arg(long)]
+        restore: Option<String>,
     },
 }
 
@@ -392,27 +405,59 @@ async fn pane_cmd(cmd: PaneCmd) -> Result<()> {
             println!("{id}");
         }
         PaneCmd::Follow { .. } => unreachable!("handled above"),
-        PaneCmd::Close { id, name } => {
-            let id = match (id, name) {
-                (Some(id), _) => id,
-                (None, Some(name)) => {
-                    let ws = env(ws_app::ENV_PANE)
-                        .and_then(|p| doc.pane(&p).map(|(w, ..)| w.id.clone()))
-                        .or_else(|| env(ws_app::ENV_WS))
-                        .ok_or_else(|| anyhow::anyhow!("not inside a Hiero pane (no ${}): close by id", ws_app::ENV_PANE))?;
-                    let (_, w) = doc.workspace(&ws).ok_or_else(|| anyhow::anyhow!("no workspace {ws}"))?;
-                    w.pane_by_name(&name)
-                        .map(|p| p.id.clone())
-                        .ok_or_else(|| anyhow::anyhow!("workspace \"{}\" has no pane named \"{name}\"", w.name))?
+        PaneCmd::Close { ids, names, missing_ok } => {
+            let mut ids = ids;
+            if !names.is_empty() {
+                let ws = env(ws_app::ENV_PANE)
+                    .and_then(|p| doc.pane(&p).map(|(w, ..)| w.id.clone()))
+                    .or_else(|| env(ws_app::ENV_WS))
+                    .ok_or_else(|| anyhow::anyhow!("not inside a Hiero pane (no ${}): close by id", ws_app::ENV_PANE))?;
+                let (_, w) = doc.workspace(&ws).ok_or_else(|| anyhow::anyhow!("no workspace {ws}"))?;
+                for name in &names {
+                    match w.pane_by_name(name) {
+                        Some(p) => ids.push(p.id.clone()),
+                        None if missing_ok => {}
+                        None => anyhow::bail!("workspace \"{}\" has no pane named \"{name}\"", w.name),
+                    }
                 }
-                (None, None) => unreachable!("clap wants an id or --name"),
-            };
-            let term = doc.pane(&id).and_then(|(_, _, p)| p.terminal.clone());
-            workspace::update(&hc, &[WsOp::ClosePane { pane: id }]).await.map_err(anyhow::Error::msg)?;
+            }
+            let own = env(ws_app::ENV_PANE);
+            // The pane this runs in last: closing it ends this process too.
+            ids.sort_by_key(|id| own.as_deref() == Some(id.as_str()));
+            ids.dedup();
+            let terms: Vec<String> = ids.iter().filter_map(|id| doc.pane(id).and_then(|(_, _, p)| p.terminal.clone())).collect();
+            if !ids.is_empty() {
+                let ops: Vec<WsOp> = ids.iter().map(|id| WsOp::ClosePane { pane: id.clone() }).collect();
+                workspace::update(&hc, &ops).await.map_err(anyhow::Error::msg)?;
+            }
             println!("ok");
-            // Last: closing the pane this runs in ends this process too.
-            if let Some(addr) = term {
+            for addr in terms {
                 ws_tui::kill_and_remove(&hc, &addr).await;
+            }
+        }
+        PaneCmd::Layout { pane, restore } => {
+            let target = pane
+                .or_else(|| env(ws_app::ENV_PANE))
+                .ok_or_else(|| anyhow::anyhow!("not inside a Hiero pane (no ${}): pass --pane ID", ws_app::ENV_PANE))?;
+            match restore {
+                None => {
+                    let (_, tab, _) = doc.pane(&target).ok_or_else(|| anyhow::anyhow!("no pane {target}"))?;
+                    println!("{}", serde_json::json!({ "tab": tab.id, "layout": tab.layout }));
+                }
+                Some(json) => {
+                    #[derive(serde::Deserialize)]
+                    struct Saved {
+                        tab: String,
+                        layout: workspace::Layout,
+                    }
+                    let saved: Saved = serde_json::from_str(&json).map_err(|e| anyhow::anyhow!("not a saved layout: {e}"))?;
+                    match workspace::update(&hc, &[WsOp::SetLayout { tab: saved.tab, layout: saved.layout }]).await {
+                        Ok(_) => println!("ok"),
+                        // The person changed the tab meanwhile: leave it as it is.
+                        Err(e) if e.contains("changed since") => println!("kept: {e}"),
+                        Err(e) => anyhow::bail!(e),
+                    }
+                }
             }
         }
     }

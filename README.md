@@ -243,7 +243,8 @@ hiero ws rm shosha web                 # or: rm shosha
 
 # panes of the live workspace, from inside a pane (prints the new pane id)
 hiero pane split [--pane ID] [--dir right|down] [--size PCT] [--name NAME] [--no-focus] [--reuse] [-- CMD ARGS...]
-hiero pane close (ID | --name NAME)
+hiero pane close (ID... | --name NAME...) [--missing-ok]
+hiero pane layout [--pane ID] [--restore JSON]   # print a tab's layout, or put it back if its panes are the same
 hiero pane follow FILE                 # print a file and what is added to it (like tail -F)
 
 hiero config [path | init | show]
@@ -305,18 +306,20 @@ hiero.setup({
   dir = "down",                -- the output pane: "down" or "right" of nvim
   size = 30,                   -- percent of the split
   focus = false,               -- keep the focus in nvim
-  close_on_end = false,        -- keep the output pane until the next run
+  close_on_end = true,         -- close everything when the session ends and put the layout back
   categories = { stdout = true, stderr = true, console = false },  -- console: the adapter's own messages
   panels = { "repl", "watches", "variables", "stack", "breakpoints" },  -- {} for none
-  close_panels_on_end = true,
   column_size = 30,            -- percent width of the right column
 })
 vim.keymap.set("n", "<F7>", hiero.toggle_panels)
 ```
 
-Every session starts a fresh output file and reuses the panes (`dap output <id>`, `dap repl <id>`, ...,
-one set per nvim pane). `:HieroDapOutput` / `:HieroDapOutputClose` and `:HieroDapPanels` /
-`:HieroDapPanelsClose` open and close them by hand. Outside Hiero it does nothing, so a config can
+When a session starts, the tab's layout is saved (`hiero pane layout`) and the panes open; when it
+ends (or `<F7>` closes them) they all close and the layout comes back exactly, sizes included. If you
+changed the tab meanwhile (a split of your own, a closed pane), it is left as it is. Each session
+starts a fresh output file. The panes are named `dap output <id>`, `dap repl <id>`, ..., one set per
+nvim pane. `:HieroDap`, `:HieroDapClose` and `:HieroDapToggle` do the same by hand. Outside Hiero it
+does nothing, so a config can
 keep dap-ui for nvim outside Hiero:
 
 ```lua
