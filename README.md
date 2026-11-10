@@ -196,6 +196,13 @@ that workspace (or opens it later).
 **Delete.** `D` on a workspace or project asks what to do with its terminals: `y` ends them and
 deletes, `k` deletes and leaves them running, `n` or `Esc` cancels.
 
+**Nothing left running without a pane.** Closing a pane or tab, deleting with `y` and `hiero ws rm`
+end the programs, also ones the document lost track of (found by their `hiero.pane` / `hiero.ws`
+labels). A program labelled with a pane that its workspace no longer has (on screen or hidden) is
+ended after 5 seconds while Hiero is open. Programs of a deleted workspace are left alone, since
+`k` keeps them on purpose. Hidden panes (`hiero pane hide-others`) are kept in their tab; closing
+the pane that hid them brings them back.
+
 **Status dots.** The sidebar shows `●` working, `◐` needs you, `✓` done, `○` idle, `·` no terminal,
 per workspace and on a collapsed project. The bottom bar names a workspace that needs you, also
 when the sidebar is hidden. Changes to needs-you or done ring the bell and notify, following the
@@ -239,13 +246,14 @@ hiero ws add shosha frontend --folder ~/code/shosha/web   # folder defaults to t
 hiero ws list                          # projects > workspaces > tabs > panes
 hiero ws rename shosha frontend web    # or: rename shosha shosha-app
 hiero ws move shosha web up            # or: move shosha down
-hiero ws rm shosha web                 # or: rm shosha
+hiero ws rm shosha web                 # or: rm shosha; ends their programs (--keep leaves them running)
 
 # panes of the live workspace, from inside a pane (prints the new pane id)
 hiero pane split [--pane ID] [--dir right|down] [--size PCT] [--name NAME] [--no-focus] [--reuse] [-- CMD ARGS...]
 hiero pane close (ID... | --name NAME...) [--missing-ok]
 hiero pane layout [--pane ID] [--restore JSON]   # print a tab's layout, or put it back (hidden panes too)
 hiero pane hide-others [--pane ID]     # take the tab's other panes away; their programs keep running
+hiero pane unhide [--pane ID] [--mine] # put a tab's hidden panes back
 hiero pane follow FILE                 # print a file and what is added to it (like tail -F)
 
 hiero config [path | init | show]
@@ -320,7 +328,9 @@ When a session starts, the tab's layout is saved (`hiero pane layout`), the tab'
 aside (`hiero pane hide-others`: off the screen, their programs keep running) and the debug panes
 open. When it ends (or `<F7>` closes them) they all close and the layout comes back exactly, sizes
 included, with the panes that stepped aside attached to their programs again. One whose program
-ended meanwhile stays gone; panes you added during the session stay, next to the restored layout. Each session
+ended meanwhile stays gone; panes you added during the session stay, next to the restored layout.
+If nvim quits during a session the layout comes back before it exits; if it dies, the next nvim
+started in that pane puts it back. Each session
 starts a fresh output file. The panes are named `dap output <id>`, `dap repl <id>`, ..., one set per
 nvim pane. `:HieroDap`, `:HieroDapClose` and `:HieroDapToggle` do the same by hand. Outside Hiero it
 does nothing, so a config can

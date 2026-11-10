@@ -73,10 +73,14 @@ enum WsCmd {
         #[arg(num_args = 2..=3, required = true)]
         args: Vec<String>,
     },
-    /// Remove a project (`<project>`) or a workspace (`<project> <workspace>`).
+    /// Remove a project (`<project>`) or a workspace (`<project> <workspace>`)
+    /// and end the programs in it.
     Rm {
         #[arg(num_args = 1..=2, required = true)]
         args: Vec<String>,
+        /// Leave the programs running.
+        #[arg(long)]
+        keep: bool,
     },
     /// Move a project (`<project> up|down`) or a workspace (`<project> <workspace> up|down`).
     Move {
@@ -135,11 +139,21 @@ enum PaneCmd {
         missing_ok: bool,
     },
     /// Take every other pane out of a pane's tab; their programs keep running.
-    /// A layout saved before (`hiero pane layout`) brings them back.
+    /// A layout saved before (`hiero pane layout`) brings them back, and so
+    /// does closing this pane.
     HideOthers {
         /// The pane that stays (default: $HIERO_PANE).
         #[arg(long)]
         pane: Option<String>,
+    },
+    /// Put a tab's hidden panes back, beside what is there.
+    Unhide {
+        /// A pane of the tab (default: $HIERO_PANE).
+        #[arg(long)]
+        pane: Option<String>,
+        /// Only when this pane is the one that hid them.
+        #[arg(long)]
+        mine: bool,
     },
     /// Print the layout of a pane's tab as JSON, or put one back with --restore
     /// (only when the tab still has exactly those panes; otherwise it is kept).
@@ -348,13 +362,36 @@ async fn ws_cmd(cmd: WsCmd) -> Result<()> {
                 _ => unreachable!("clap allows 2 or 3 arguments"),
             }
         }
-        WsCmd::Rm { args } => {
+        WsCmd::Rm { args, keep } => {
             let p = project(&args[0])?;
-            match &args[..] {
-                [_] => WsOp::DeleteProject { id: p.id.clone() },
-                [_, w] => WsOp::DeleteWorkspace { id: find_ws(p, w)? },
+            let (op, wss): (WsOp, Vec<&workspace::Workspace>) = match &args[..] {
+                [_] => (WsOp::DeleteProject { id: p.id.clone() }, p.workspaces.iter().collect()),
+                [_, w] => {
+                    let id = find_ws(p, w)?;
+                    let w = p.workspaces.iter().find(|x| x.id == id).expect("found above");
+                    (WsOp::DeleteWorkspace { id }, vec![w])
+                }
                 _ => unreachable!("clap allows 1 or 2 arguments"),
+            };
+            // Its programs: the ones the document knows, and any labelled with it.
+            let mut terms: Vec<String> = Vec::new();
+            if !keep {
+                for w in &wss {
+                    terms.extend(w.all_panes().iter().filter_map(|p| p.terminal.clone()));
+                    let labels = hc_client::Labels::from([(ws_app::LABEL_WS.to_string(), w.id.clone())]);
+                    if let Ok(list) = hc.list(false, &labels).await {
+                        terms.extend(list.terminals.into_iter().map(|t| t.address));
+                    }
+                }
+                terms.sort();
+                terms.dedup();
             }
+            workspace::update(&hc, &[op]).await.map_err(anyhow::Error::msg)?;
+            println!("ok");
+            for addr in terms {
+                ws_tui::kill_and_remove(&hc, &addr).await;
+            }
+            return Ok(());
         }
         WsCmd::Move { args } => {
             let p = project(&args[0])?;
@@ -457,13 +494,20 @@ async fn pane_cmd(cmd: PaneCmd) -> Result<()> {
             let target = pane
                 .or_else(|| env(ws_app::ENV_PANE))
                 .ok_or_else(|| anyhow::anyhow!("not inside a Hiero pane (no ${}): pass --pane ID", ws_app::ENV_PANE))?;
-            let (_, tab, _) = doc.pane(&target).ok_or_else(|| anyhow::anyhow!("no pane {target}"))?;
-            let ops: Vec<WsOp> =
-                tab.layout.panes().iter().filter(|p| p.id != target).map(|p| WsOp::ClosePane { pane: p.id.clone() }).collect();
-            if !ops.is_empty() {
-                workspace::update(&hc, &ops).await.map_err(anyhow::Error::msg)?;
-            }
+            workspace::update(&hc, &[WsOp::HideOthers { pane: target }]).await.map_err(anyhow::Error::msg)?;
             println!("ok");
+        }
+        PaneCmd::Unhide { pane, mine } => {
+            let target = pane
+                .or_else(|| env(ws_app::ENV_PANE))
+                .ok_or_else(|| anyhow::anyhow!("not inside a Hiero pane (no ${}): pass --pane ID", ws_app::ENV_PANE))?;
+            let (_, tab, _) = doc.pane(&target).ok_or_else(|| anyhow::anyhow!("no pane {target}"))?;
+            if tab.hidden.is_empty() || (mine && tab.hidden_by.as_deref() != Some(target.as_str())) {
+                println!("nothing hidden");
+            } else {
+                workspace::update(&hc, &[WsOp::Unhide { tab: tab.id.clone() }]).await.map_err(anyhow::Error::msg)?;
+                println!("ok");
+            }
         }
         PaneCmd::Layout { pane, restore } => {
             let target = pane

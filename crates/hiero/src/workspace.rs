@@ -92,6 +92,23 @@ pub struct Tab {
     /// Id of the pane that has the keyboard.
     #[serde(default)]
     pub focus: String,
+    /// Panes taken off the screen by `hiero pane hide-others` (a debug
+    /// session); their programs keep running. They come back with the saved
+    /// layout, or by themselves when `hidden_by` closes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden: Vec<Pane>,
+    /// The pane that hid them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden_by: Option<String>,
+}
+
+impl Tab {
+    /// The panes on screen and the hidden ones.
+    pub fn all_panes(&self) -> Vec<&Pane> {
+        let mut v = self.layout.panes();
+        v.extend(self.hidden.iter());
+        v
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,7 +188,7 @@ impl WsDoc {
         self.projects.iter().any(|p| {
             p.id == id
                 || p.workspaces.iter().any(|w| {
-                    w.id == id || w.tabs.iter().any(|t| t.id == id || t.layout.find(id).is_some())
+                    w.id == id || w.tabs.iter().any(|t| t.id == id || t.all_panes().iter().any(|p| p.id == id))
                 })
         })
     }
@@ -187,6 +204,11 @@ impl Workspace {
     /// Every pane in every tab.
     pub fn panes(&self) -> Vec<&Pane> {
         self.tabs.iter().flat_map(|t| t.layout.panes()).collect()
+    }
+
+    /// Every pane, hidden ones too.
+    pub fn all_panes(&self) -> Vec<&Pane> {
+        self.tabs.iter().flat_map(|t| t.all_panes()).collect()
     }
 
     /// The first pane (in any tab) with this name.
@@ -248,6 +270,11 @@ pub enum WsOp {
     /// arrangement and sizes come back, and so do panes that were taken out
     /// (`hiero pane hide-others`), as they were saved, if no tab has them now.
     SetLayout { tab: String, layout: Layout },
+    /// Take every other pane of `pane`'s tab off the screen, into its hidden
+    /// list; their programs keep running.
+    HideOthers { pane: String },
+    /// Put a tab's hidden panes back on the screen, beside what is there.
+    Unhide { tab: String },
 }
 
 fn clean_name(what: &str, name: &str) -> Result<String, String> {
@@ -316,7 +343,14 @@ fn shift<T>(v: &mut [T], i: usize, dir: Move) {
 }
 
 fn new_tab(id: &str, name: &str, pane_id: &str) -> Tab {
-    Tab { id: id.into(), name: name.into(), layout: Layout::Pane(Pane::shell(pane_id)), focus: pane_id.into() }
+    Tab {
+        id: id.into(),
+        name: name.into(),
+        layout: Layout::Pane(Pane::shell(pane_id)),
+        focus: pane_id.into(),
+        hidden: vec![],
+        hidden_by: None,
+    }
 }
 
 pub fn apply(doc: &mut WsDoc, op: &WsOp) -> Result<(), String> {
@@ -448,6 +482,10 @@ pub fn apply(doc: &mut WsDoc, op: &WsOp) -> Result<(), String> {
         WsOp::ClosePane { pane } => {
             let (pi, wi, ti) = pane_tab_ix(doc, pane)?;
             let w = &mut doc.projects[pi].workspaces[wi];
+            // The pane that hid the others goes: they come back first.
+            if w.tabs[ti].hidden_by.as_deref() == Some(pane.as_str()) {
+                unhide(&mut w.tabs[ti]);
+            }
             if w.tabs[ti].layout.panes().len() == 1 {
                 return remove_tab(w, ti);
             }
@@ -475,11 +513,34 @@ pub fn apply(doc: &mut WsDoc, op: &WsOp) -> Result<(), String> {
             let t = &mut doc.projects[pi].workspaces[wi].tabs[ti];
             let mut new = layout.clone();
             refresh_panes(&mut new, &t.layout);
+            // A pane coming back from the hidden list keeps what it has there.
+            for h in &t.hidden {
+                replace_pane(&mut new, h);
+            }
             normalize(&mut new);
             t.layout = new;
+            let layout = &t.layout;
+            t.hidden.retain(|h| layout.find(&h.id).is_none());
+            if t.hidden.is_empty() {
+                t.hidden_by = None;
+            }
             if t.layout.find(&t.focus).is_none() {
                 t.focus = t.layout.panes()[0].id.clone();
             }
+        }
+        WsOp::HideOthers { pane } => {
+            let (pi, wi, ti) = pane_tab_ix(doc, pane)?;
+            let t = &mut doc.projects[pi].workspaces[wi].tabs[ti];
+            let keep = t.layout.find(pane).cloned().ok_or_else(|| format!("no pane {pane}"))?;
+            let others: Vec<Pane> = t.layout.panes().into_iter().filter(|p| p.id != *pane).cloned().collect();
+            t.hidden.extend(others);
+            t.hidden_by = Some(pane.clone());
+            t.layout = Layout::Pane(keep);
+            t.focus = pane.clone();
+        }
+        WsOp::Unhide { tab } => {
+            let (pi, wi, ti) = tab_ix(doc, tab)?;
+            unhide(&mut doc.projects[pi].workspaces[wi].tabs[ti]);
         }
         WsOp::SetFocus { pane } => {
             let (pi, wi, ti) = pane_tab_ix(doc, pane)?;
@@ -981,6 +1042,36 @@ pub fn without_pane(l: &Layout, id: &str) -> Layout {
         normalize(&mut l);
     }
     l
+}
+
+/// Put `p` in place of the pane with its id in `l`, if there is one.
+fn replace_pane(l: &mut Layout, p: &Pane) {
+    match l {
+        Layout::Pane(q) if q.id == p.id => *q = p.clone(),
+        Layout::Pane(_) => {}
+        Layout::Split { children, .. } => children.iter_mut().for_each(|c| replace_pane(c, p)),
+    }
+}
+
+/// Bring a tab's hidden panes back, beside its layout: across the direction
+/// of its top split (one of the same direction would merge and lose its
+/// sizes), the layout keeping the larger share.
+fn unhide(t: &mut Tab) {
+    t.hidden_by = None;
+    if t.hidden.is_empty() {
+        return;
+    }
+    let back: Vec<Layout> = std::mem::take(&mut t.hidden).into_iter().map(Layout::Pane).collect();
+    let dir = match &t.layout {
+        Layout::Split { dir: Dir::Horizontal, .. } => Dir::Vertical,
+        _ => Dir::Horizontal,
+    };
+    let mut sizes = vec![3 * back.len() as u16];
+    sizes.extend(std::iter::repeat_n(1, back.len()));
+    let mut children = vec![std::mem::replace(&mut t.layout, Layout::Pane(Pane::shell("")))];
+    children.extend(back);
+    t.layout = Layout::Split { dir, children, sizes };
+    normalize(&mut t.layout);
 }
 
 /// Replace every pane in `l` with the pane of the same id in `from`.
@@ -1966,12 +2057,15 @@ mod tests {
         ok(&mut d, WsOp::SetFocus { pane: s("w1-p") });
         let saved = d.tab("w1-t").unwrap().1.layout.clone();
         // Hidden for a debug session: out of the tab, its terminal untouched.
-        ok(&mut d, WsOp::ClosePane { pane: s("shell") });
+        ok(&mut d, WsOp::HideOthers { pane: s("w1-p") });
+        let t = d.tab("w1-t").unwrap().1;
+        assert_eq!((t.layout.panes().len(), t.hidden.len(), t.hidden_by.as_deref()), (1, 1, Some("w1-p")));
         ok(&mut d, split_op("w1-p", Dir::Vertical, "dbg"));
         ok(&mut d, WsOp::ClosePane { pane: s("dbg") });
         ok(&mut d, WsOp::SetLayout { tab: s("w1-t"), layout: saved.clone() });
         let t = d.tab("w1-t").unwrap().1;
         assert_eq!(t.layout, saved);
+        assert!(t.hidden.is_empty() && t.hidden_by.is_none());
         assert_eq!(d.pane("shell").unwrap().2.terminal.as_deref(), Some("t9"));
         assert_eq!(t.focus, "w1-p");
         // Not when a pane of the layout lives in another tab now.
@@ -1984,6 +2078,31 @@ mod tests {
         assert!(err(&mut d, WsOp::SetLayout { tab: s("w1-t"), layout: other }).contains("another tab"));
         // without_pane drops one and keeps the rest.
         assert_eq!(without_pane(&saved, "shell").panes().len(), 1);
+    }
+
+    #[test]
+    fn hidden_panes_come_back_when_the_pane_that_hid_them_closes() {
+        let mut d = base();
+        ok(&mut d, split_op("w1-p", Dir::Horizontal, "shell"));
+        ok(&mut d, split_op("shell", Dir::Vertical, "logs"));
+        ok(&mut d, WsOp::SetTerminal { pane: s("logs"), terminal: Some(s("t5")) });
+        ok(&mut d, WsOp::HideOthers { pane: s("w1-p") });
+        assert_eq!(pane_ids(&d, "w1-t"), vec!["w1-p"]);
+        // Their ids stay taken while hidden.
+        assert!(err(&mut d, split_op("w1-p", Dir::Horizontal, "logs")).contains("logs"));
+        // nvim's pane closes (it was the only one on screen): the tab stays, with them.
+        ok(&mut d, WsOp::ClosePane { pane: s("w1-p") });
+        let t = d.tab("w1-t").unwrap().1;
+        assert_eq!(pane_ids(&d, "w1-t"), vec!["shell", "logs"]);
+        assert!(t.hidden.is_empty() && t.hidden_by.is_none());
+        assert_eq!(d.pane("logs").unwrap().2.terminal.as_deref(), Some("t5"));
+        // Unhide puts them beside what is on screen, across its direction.
+        ok(&mut d, split_op("shell", Dir::Horizontal, "x"));
+        ok(&mut d, WsOp::HideOthers { pane: s("x") });
+        ok(&mut d, split_op("x", Dir::Horizontal, "dbg"));
+        ok(&mut d, WsOp::Unhide { tab: s("w1-t") });
+        let Layout::Split { dir, children, .. } = &d.tab("w1-t").unwrap().1.layout else { panic!() };
+        assert_eq!((*dir, children.len()), (Dir::Vertical, 3));
     }
 
     fn req(dir: Dir) -> SplitRequest {

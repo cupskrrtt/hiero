@@ -17,6 +17,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 pub const LABEL_WS: &str = "hiero.ws";
+/// How long a program may run without its pane before it is ended.
+const ORPHAN_AFTER: Duration = Duration::from_secs(5);
 pub const LABEL_PANE: &str = "hiero.pane";
 /// Set in every pane's environment, so a `hiero` started inside a pane can
 /// tell it would be nesting.
@@ -312,6 +314,9 @@ pub struct WsApp {
     recent: HashMap<String, String>,
     /// Background starts that failed; they are not retried until the pane is opened.
     failed: HashSet<String>,
+    /// Live programs labelled with a pane their workspace no longer has, and
+    /// since when (see `sweep_orphans`).
+    orphans: HashMap<String, Instant>,
     /// `[workspace] restore`: start missing terminals without being asked.
     pub auto_restore: bool,
     next_attempt: u64,
@@ -362,6 +367,7 @@ impl WsApp {
             slots: HashMap::new(),
             starting: HashSet::new(),
             recent: HashMap::new(),
+            orphans: HashMap::new(),
             failed: HashSet::new(),
             auto_restore: true,
             next_attempt: 0,
@@ -688,7 +694,53 @@ impl WsApp {
     pub fn on_tick(&mut self) {
         if self.client_up && self.disconnected.is_none() {
             self.recover_lost(false);
+            self.sweep_orphans(Instant::now());
         }
+    }
+
+    /// End programs labelled with a pane that their (still existing) workspace
+    /// no longer has, on screen or hidden, once they have been like that for
+    /// `ORPHAN_AFTER`: a pane closed while the document never recorded its
+    /// terminal, for one. A workspace that is gone is left alone: deleting one
+    /// can keep its programs on purpose.
+    fn sweep_orphans(&mut self, now: Instant) {
+        if !self.synced || self.reconnected {
+            return;
+        }
+        let mut still = HashMap::new();
+        let mut kill = vec![];
+        for t in self.set.terminals.values() {
+            if t.state != hc_client::TerminalState::Live || self.self_addr.as_deref() == Some(t.address.as_str()) {
+                continue;
+            }
+            let (Some(ws), Some(pane)) = (t.labels.get(LABEL_WS), t.labels.get(LABEL_PANE)) else { continue };
+            let Some((_, w)) = self.doc.workspace(ws) else { continue };
+            if w.all_panes().iter().any(|p| &p.id == pane) {
+                continue;
+            }
+            let since = self.orphans.get(&t.address).copied().unwrap_or(now);
+            if now.duration_since(since) >= ORPHAN_AFTER {
+                kill.push(t.address.clone());
+            } else {
+                still.insert(t.address.clone(), since);
+            }
+        }
+        self.orphans = still;
+        if !kill.is_empty() {
+            tracing::info!("ending programs whose pane is gone: {kill:?}");
+            self.actions.push(Action::Kill(kill));
+        }
+    }
+
+    /// Live programs labelled `key` = one of `values`: also the ones the
+    /// document lost track of.
+    fn labelled(&self, key: &str, values: &[String]) -> Vec<String> {
+        self.set
+            .terminals
+            .values()
+            .filter(|t| t.state == hc_client::TerminalState::Live && t.labels.get(key).is_some_and(|v| values.contains(v)))
+            .map(|t| t.address.clone())
+            .collect()
     }
 
     /// A connection that can send requests is up (also again after a restart).
@@ -1643,7 +1695,12 @@ impl WsApp {
             Some(p) => p.workspaces.iter().collect(),
             None => self.doc.workspace(id).map(|(_, w)| w).into_iter().collect(),
         };
-        ws.iter().flat_map(|w| w.panes()).filter_map(|p| p.terminal.clone()).collect()
+        let mut v: Vec<String> = ws.iter().flat_map(|w| w.all_panes()).filter_map(|p| p.terminal.clone()).collect();
+        let ids: Vec<String> = ws.iter().map(|w| w.id.clone()).collect();
+        v.extend(self.labelled(LABEL_WS, &ids));
+        v.sort();
+        v.dedup();
+        v
     }
 
     fn delete_confirm(&mut self) {
@@ -1713,14 +1770,23 @@ impl WsApp {
         match kind {
             ConfirmKind::Delete(id) => self.delete(id, true),
             ConfirmKind::ClosePane(pane) => {
-                let terminals: Vec<String> = self.terminal_of(&pane).into_iter().collect();
+                let mut terminals: Vec<String> = self.terminal_of(&pane).into_iter().collect();
+                terminals.extend(self.labelled(LABEL_PANE, std::slice::from_ref(&pane)));
+                terminals.sort();
+                terminals.dedup();
                 self.close_with(terminals, WsOp::ClosePane { pane });
             }
             ConfirmKind::CloseTab(id) => {
-                let terminals = match self.doc.tab(&id) {
-                    Some((_, t)) => t.layout.panes().iter().filter_map(|p| p.terminal.clone()).collect(),
-                    None => vec![],
+                let (mut terminals, ids): (Vec<String>, Vec<String>) = match self.doc.tab(&id) {
+                    Some((_, t)) => (
+                        t.all_panes().iter().filter_map(|p| p.terminal.clone()).collect(),
+                        t.all_panes().iter().map(|p| p.id.clone()).collect(),
+                    ),
+                    None => (vec![], vec![]),
                 };
+                terminals.extend(self.labelled(LABEL_PANE, &ids));
+                terminals.sort();
+                terminals.dedup();
                 self.close_with(terminals, WsOp::CloseTab { id });
             }
         }
@@ -1889,6 +1955,37 @@ mod tests {
             "state": if live { "live" } else { "finished" },
         }))
         .unwrap()
+    }
+
+    fn labelled_terminal(addr: &str, ws: &str, pane: &str) -> Terminal {
+        serde_json::from_value(serde_json::json!({
+            "address": addr,
+            "state": "live",
+            "labels": { "hiero.ws": ws, "hiero.pane": pane },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn programs_whose_pane_is_gone_are_ended_after_a_while() {
+        let mut a = app();
+        open_attached(&mut a, "w1");
+        // Its pane is gone; a hidden pane's program; one of a deleted workspace; the open pane's own.
+        a.set.terminals.insert("t-orphan".into(), labelled_terminal("t-orphan", "w1", "n-gone"));
+        a.set.terminals.insert("t-kept".into(), labelled_terminal("t-kept", "w-deleted", "n-x"));
+        a.set.terminals.insert("t-mine".into(), labelled_terminal("t-mine", "w1", "n-w1"));
+        let mut doc = a.doc.clone();
+        apply(&mut doc, &WsOp::SplitPane { pane: "n-w1".into(), dir: Dir::Horizontal, new_id: "n-hid".into() }).unwrap();
+        apply(&mut doc, &WsOp::HideOthers { pane: "n-w1".into() }).unwrap();
+        a.on_doc(doc);
+        a.set.terminals.insert("t-hidden".into(), labelled_terminal("t-hidden", "w1", "n-hid"));
+        a.actions.clear();
+        let t0 = Instant::now();
+        a.sweep_orphans(t0);
+        assert!(!a.actions.iter().any(|x| matches!(x, Action::Kill(_))), "not at once: {:?}", a.actions);
+        a.sweep_orphans(t0 + ORPHAN_AFTER);
+        let kills: Vec<_> = a.actions.iter().filter_map(|x| if let Action::Kill(v) = x { Some(v.clone()) } else { None }).collect();
+        assert_eq!(kills, vec![vec!["t-orphan".to_string()]]);
     }
 
     fn finished(addr: &str, reason: &str, code: Option<i32>) -> Terminal {
