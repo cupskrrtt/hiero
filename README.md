@@ -244,6 +244,7 @@ hiero ws rm shosha web                 # or: rm shosha
 # panes of the live workspace, from inside a pane (prints the new pane id)
 hiero pane split [--pane ID] [--dir right|down] [--size PCT] [--name NAME] [--no-focus] [--reuse] [-- CMD ARGS...]
 hiero pane close (ID | --name NAME)
+hiero pane follow FILE                 # print a file and what is added to it (like tail -F)
 
 hiero config [path | init | show]
 
@@ -263,7 +264,8 @@ Projects and workspaces are named exactly on the command line. Folders must exis
 
 `nvim/lua/hiero/dap.lua` sends the debugged program's output to a Hiero pane next to nvim instead
 of a window inside it. Most debug adapters (delve, netcoredbg) send the output as DAP events; it is
-written to a file under `stdpath("run")` and the pane follows it with `tail -F`. stderr shows red.
+written to a file under `stdpath("run")` and the pane follows it with `hiero pane follow` (Linux and
+Windows). stderr shows red.
 
 ```lua
 vim.opt.rtp:append(vim.fn.expand("~/path/to/hiero/nvim"))

@@ -118,6 +118,9 @@ enum PaneCmd {
         #[arg(last = true)]
         command: Vec<String>,
     },
+    /// Print a file and what is added to it, like `tail -F` (also on Windows):
+    /// it waits for the file to appear and starts over when it is truncated.
+    Follow { file: std::path::PathBuf },
     /// Close a pane and end its program.
     #[command(group(clap::ArgGroup::new("which").required(true)))]
     Close {
@@ -355,6 +358,9 @@ async fn ws_cmd(cmd: WsCmd) -> Result<()> {
 /// `hiero pane split` and `close`: edit the document; the open UI starts and drops the terminals.
 async fn pane_cmd(cmd: PaneCmd) -> Result<()> {
     use workspace::{Dir, SplitRequest, WsOp, new_id};
+    if let PaneCmd::Follow { file } = &cmd {
+        return follow(file);
+    }
     let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
     let hc = Client::connect().await?;
     let doc = workspace::load(&hc).await.map_err(anyhow::Error::msg)?;
@@ -385,6 +391,7 @@ async fn pane_cmd(cmd: PaneCmd) -> Result<()> {
             }
             println!("{id}");
         }
+        PaneCmd::Follow { .. } => unreachable!("handled above"),
         PaneCmd::Close { id, name } => {
             let id = match (id, name) {
                 (Some(id), _) => id,
@@ -410,6 +417,72 @@ async fn pane_cmd(cmd: PaneCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `hiero pane follow`: poll the file, print what was added. Never returns on its own.
+fn follow(path: &std::path::Path) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    #[cfg(windows)]
+    let _ = crossterm::ansi_support::supports_ansi(); // turns on VT processing for the colours
+    let mut out = std::io::stdout().lock();
+    let (mut pos, mut pending, mut buf) = (0u64, Vec::new(), vec![0u8; 64 * 1024]);
+    loop {
+        // Opened anew each time: a short-lived handle never blocks the writer
+        // (Windows) and a replaced file is picked up.
+        match std::fs::File::open(path) {
+            Ok(mut f) => {
+                let len = f.metadata()?.len();
+                if len < pos {
+                    (pos, pending) = (0, Vec::new());
+                    out.write_all(b"\x1b[2J\x1b[H")?;
+                }
+                if len > pos {
+                    f.seek(SeekFrom::Start(pos))?;
+                    loop {
+                        let n = f.read(&mut buf)?;
+                        if n == 0 {
+                            break;
+                        }
+                        pos += n as u64;
+                        pending.extend_from_slice(&buf[..n]);
+                        write_utf8(&mut out, &mut pending)?;
+                    }
+                    out.flush()?;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow::anyhow!("{}: {e}", path.display())),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Write the UTF-8 in `pending` (bad bytes as U+FFFD, which the Windows console
+/// needs) and keep a character cut off at the end for the next read.
+fn write_utf8(out: &mut impl std::io::Write, pending: &mut Vec<u8>) -> std::io::Result<()> {
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(s) => {
+                out.write_all(s.as_bytes())?;
+                pending.clear();
+                return Ok(());
+            }
+            Err(e) => {
+                let good = e.valid_up_to();
+                out.write_all(&pending[..good])?;
+                match e.error_len() {
+                    None => {
+                        pending.drain(..good);
+                        return Ok(());
+                    }
+                    Some(bad) => {
+                        out.write_all("\u{FFFD}".as_bytes())?;
+                        pending.drain(..good + bad);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn find_ws(p: &workspace::Project, name: &str) -> Result<String> {
@@ -725,5 +798,22 @@ fn summarize(d: &hc_client::EventData) -> String {
         Foreground(None) => "fg       -".into(),
         Doc { name, version } => format!("doc      {name} v{version}"),
         Unknown { kind, .. } => format!("{kind} (unknown)"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_utf8;
+
+    #[test]
+    fn write_utf8_keeps_a_cut_character_and_replaces_bad_bytes() {
+        let (mut out, mut pending) = (Vec::new(), "a─".as_bytes()[..3].to_vec());
+        write_utf8(&mut out, &mut pending).unwrap();
+        assert_eq!((out.as_slice(), pending.len()), (&b"a"[..], 2));
+        pending.extend_from_slice(&"─".as_bytes()[2..]);
+        pending.extend_from_slice(b"\xffb");
+        write_utf8(&mut out, &mut pending).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "a─\u{FFFD}b");
+        assert!(pending.is_empty());
     }
 }

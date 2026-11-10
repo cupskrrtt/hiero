@@ -2,7 +2,8 @@
 --
 -- Most debug adapters (delve, netcoredbg, ...) send the program's output as
 -- DAP `output` events instead of running it in a terminal. This writes those
--- events to a file, and a Hiero pane next to this nvim follows the file.
+-- events to a file, and a Hiero pane next to this nvim follows it with
+-- `hiero pane follow` (Linux and Windows).
 --
 --   require("hiero.dap").setup({ dir = "down", size = 30 })
 --
@@ -79,7 +80,7 @@ function M.open(title)
   if not M.config.focus then
     table.insert(args, "--no-focus")
   end
-  vim.list_extend(args, { "--", "tail", "-n", "+1", "-F", state.path })
+  vim.list_extend(args, { "--", M.config.cmd, "pane", "follow", state.path })
   hiero(args, function(id)
     state.pane = id
   end)
