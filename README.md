@@ -262,25 +262,33 @@ Projects and workspaces are named exactly on the command line. Folders must exis
 
 ## Debugging with nvim-dap
 
-`nvim/lua/hiero/dap.lua` sends the debugged program's output to a Hiero pane next to nvim instead
-of a window inside it. Most debug adapters (delve, netcoredbg) send the output as DAP events; it is
-written to a file under `stdpath("run")` and the pane follows it with `hiero pane follow` (Linux and
-Windows). stderr shows red.
+`nvim/lua/hiero/dap.lua` puts a debug session's views in Hiero panes next to nvim instead of windows
+inside it. nvim-dap still does the debugging; nvim stays an editor.
+
+- **Output.** Most debug adapters (delve, netcoredbg) send the program's output as DAP events. It is
+  written to a file under `stdpath("run")` and a pane follows it with `hiero pane follow` (Linux and
+  Windows). stderr shows red. The program has no stdin there.
+- **Panels.** Each panel is a small `nvim --clean` in its own pane that talks to your nvim over RPC
+  (`v:servername`). `repl`: type an expression, Enter evaluates it in the current frame (the type is
+  shown after the result); Up/Down go through what you typed; stops (`● breakpoint at main.go:12`)
+  and the end of the session are logged. Move to it with the prefix and `hjkl` like any pane.
 
 ```lua
 vim.opt.rtp:append(vim.fn.expand("~/path/to/hiero/nvim"))
 require("hiero.dap").setup({
-  dir = "down",          -- or "right"
-  size = 30,             -- percent of the split
-  focus = false,         -- keep the focus in nvim
-  close_on_end = false,  -- keep the pane until the next run
+  dir = "down",                -- the output pane: "down" or "right" of nvim
+  size = 30,                   -- percent of the split
+  focus = false,               -- keep the focus in nvim
+  close_on_end = false,        -- keep the output pane until the next run
   categories = { stdout = true, stderr = true, console = false },  -- console: the adapter's own messages
+  panels = { "repl" },         -- opened beside the output pane; {} for none
+  close_panels_on_end = true,
 })
 ```
 
-Every session starts a fresh file and reuses the pane (`dap output <id>`, one per nvim pane).
-`:HieroDapOutput` opens it by hand, `:HieroDapOutputClose` closes it. Outside Hiero it does nothing.
-The program has no stdin there.
+Every session starts a fresh output file and reuses the panes (`dap output <id>`, `dap repl <id>`, one
+set per nvim pane). `:HieroDapOutput` / `:HieroDapOutputClose` and `:HieroDapPanels` /
+`:HieroDapPanelsClose` open and close them by hand. Outside Hiero it does nothing.
 
 ## Environment variables
 
