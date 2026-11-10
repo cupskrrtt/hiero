@@ -134,6 +134,13 @@ enum PaneCmd {
         #[arg(long)]
         missing_ok: bool,
     },
+    /// Take every other pane out of a pane's tab; their programs keep running.
+    /// A layout saved before (`hiero pane layout`) brings them back.
+    HideOthers {
+        /// The pane that stays (default: $HIERO_PANE).
+        #[arg(long)]
+        pane: Option<String>,
+    },
     /// Print the layout of a pane's tab as JSON, or put one back with --restore
     /// (only when the tab still has exactly those panes; otherwise it is kept).
     Layout {
@@ -422,10 +429,21 @@ async fn pane_cmd(cmd: PaneCmd) -> Result<()> {
                 }
             }
             let own = env(ws_app::ENV_PANE);
+            let own_terminal = own.as_deref().and_then(|p| doc.pane(p)).and_then(|(_, _, p)| p.terminal.clone());
             // The pane this runs in last: closing it ends this process too.
             ids.sort_by_key(|id| own.as_deref() == Some(id.as_str()));
             ids.dedup();
-            let terms: Vec<String> = ids.iter().filter_map(|id| doc.pane(id).and_then(|(_, _, p)| p.terminal.clone())).collect();
+            // The pane's terminal from the document, and any live one labelled
+            // with the pane (in case the document never got to record it).
+            let mut terms: Vec<String> = ids.iter().filter_map(|id| doc.pane(id).and_then(|(_, _, p)| p.terminal.clone())).collect();
+            for id in &ids {
+                let labels = hc_client::Labels::from([(ws_app::LABEL_PANE.to_string(), id.clone())]);
+                if let Ok(list) = hc.list(false, &labels).await {
+                    terms.extend(list.terminals.into_iter().map(|t| t.address));
+                }
+            }
+            terms.sort_by_key(|a| own_terminal.as_deref() == Some(a.as_str()));
+            terms.dedup();
             if !ids.is_empty() {
                 let ops: Vec<WsOp> = ids.iter().map(|id| WsOp::ClosePane { pane: id.clone() }).collect();
                 workspace::update(&hc, &ops).await.map_err(anyhow::Error::msg)?;
@@ -434,6 +452,18 @@ async fn pane_cmd(cmd: PaneCmd) -> Result<()> {
             for addr in terms {
                 ws_tui::kill_and_remove(&hc, &addr).await;
             }
+        }
+        PaneCmd::HideOthers { pane } => {
+            let target = pane
+                .or_else(|| env(ws_app::ENV_PANE))
+                .ok_or_else(|| anyhow::anyhow!("not inside a Hiero pane (no ${}): pass --pane ID", ws_app::ENV_PANE))?;
+            let (_, tab, _) = doc.pane(&target).ok_or_else(|| anyhow::anyhow!("no pane {target}"))?;
+            let ops: Vec<WsOp> =
+                tab.layout.panes().iter().filter(|p| p.id != target).map(|p| WsOp::ClosePane { pane: p.id.clone() }).collect();
+            if !ops.is_empty() {
+                workspace::update(&hc, &ops).await.map_err(anyhow::Error::msg)?;
+            }
+            println!("ok");
         }
         PaneCmd::Layout { pane, restore } => {
             let target = pane
@@ -451,11 +481,48 @@ async fn pane_cmd(cmd: PaneCmd) -> Result<()> {
                         layout: workspace::Layout,
                     }
                     let saved: Saved = serde_json::from_str(&json).map_err(|e| anyhow::anyhow!("not a saved layout: {e}"))?;
-                    match workspace::update(&hc, &[WsOp::SetLayout { tab: saved.tab, layout: saved.layout }]).await {
-                        Ok(_) => println!("ok"),
-                        // The person changed the tab meanwhile: leave it as it is.
-                        Err(e) if e.contains("changed since") => println!("kept: {e}"),
-                        Err(e) => anyhow::bail!(e),
+                    // A hidden pane comes back only while its program still runs;
+                    // one you ended meanwhile stays gone.
+                    let mut layout = saved.layout;
+                    for p in layout.panes().into_iter().cloned().collect::<Vec<_>>() {
+                        if doc.pane(&p.id).is_some() {
+                            continue;
+                        }
+                        let live = match &p.terminal {
+                            Some(addr) => hc.get(addr).await.is_ok_and(|t| t.state == hc_client::TerminalState::Live),
+                            None => false,
+                        };
+                        if !live {
+                            layout = workspace::without_pane(&layout, &p.id);
+                        }
+                    }
+                    // Panes added to the tab since go next to the saved layout, so
+                    // it comes back and nothing is lost: across its own direction
+                    // (a split of the same direction would merge and lose its sizes).
+                    let extra: Vec<workspace::Layout> = doc
+                        .tab(&saved.tab)
+                        .map(|(_, t)| t.layout.panes().into_iter().filter(|p| layout.find(&p.id).is_none()).cloned().collect::<Vec<_>>())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(workspace::Layout::Pane)
+                        .collect();
+                    let added = extra.len();
+                    if added > 0 {
+                        let dir = match &layout {
+                            workspace::Layout::Split { dir: workspace::Dir::Horizontal, .. } => workspace::Dir::Vertical,
+                            _ => workspace::Dir::Horizontal,
+                        };
+                        let mut sizes = vec![3 * added as u16];
+                        sizes.extend(std::iter::repeat_n(1, added));
+                        let mut children = vec![layout];
+                        children.extend(extra);
+                        layout = workspace::Layout::Split { dir, children, sizes };
+                    }
+                    workspace::update(&hc, &[WsOp::SetLayout { tab: saved.tab, layout }]).await.map_err(anyhow::Error::msg)?;
+                    if added > 0 {
+                        println!("ok, {added} pane(s) added meanwhile kept beside it");
+                    } else {
+                        println!("ok");
                     }
                 }
             }

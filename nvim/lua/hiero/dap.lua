@@ -19,6 +19,7 @@ M.config = {
   size = 30, -- its share of the split, in percent
   focus = false, -- move the focus to it
   close_on_end = true, -- close the output pane with the panels when the session ends, and put the tab's layout back
+  hide_others = true, -- while debugging, take the tab's other panes away (their programs keep running)
   categories = { stdout = true, stderr = true, console = false }, -- DAP output categories to show
   -- Panel panes opened with a session; {} for none. repl and watches go in a
   -- row beside the output pane; variables, stack and breakpoints in a column
@@ -437,12 +438,17 @@ local function open_all(title, keep)
   state.open = true
   hiero({ "layout" }, function(json)
     state.saved = json
-    go()
+    if M.config.hide_others then
+      -- Only once the layout is saved: it is what brings them back.
+      hiero({ "hide-others" }, go, go)
+    else
+      go()
+    end
   end, go)
 end
 
---- Close the output pane and the panels in one go, then put back the layout.
---- If you changed the tab meanwhile (another split, a closed pane), it stays as it is.
+--- Close the output pane and the panels in one go, then put back the layout,
+--- with the panes that were hidden. Panes you added meanwhile stay, beside it.
 local function close_all()
   state.open, state.pane = false, nil
   local args = { "close", "--missing-ok", "--name", pane_name("output") }
