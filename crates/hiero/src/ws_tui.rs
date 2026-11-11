@@ -168,6 +168,12 @@ async fn event_loop(
                         let _ = h.cmd.send(PaneCmd::Resize(cols, rows));
                     }
                 }
+                // After any resize on the same channel, so the terminal has the size first.
+                Action::SizeReport { pane, cols, rows } => {
+                    if let Some(h) = handles.get(&pane) {
+                        let _ = h.cmd.send(PaneCmd::Input(format!("\x1b[48;{rows};{cols};0;0t").into_bytes()));
+                    }
+                }
                 Action::LoadDoc => {
                     if let Some(c) = &client {
                         let (c, tx) = (c.clone(), tx.clone());
@@ -353,7 +359,7 @@ fn send_input(handles: &HashMap<String, Handle>, app: &WsApp, bytes: Vec<u8>) {
 
 /// End a pane's program and remove its terminal from hc. A just-killed
 /// terminal may take a moment before it can be removed.
-async fn kill_and_remove(c: &Client, addr: &str) {
+pub async fn kill_and_remove(c: &Client, addr: &str) {
     let _ = c.kill(addr).await;
     for _ in 0..10 {
         match c.rm(addr).await {

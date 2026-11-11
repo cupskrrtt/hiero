@@ -39,6 +39,9 @@ enum Command {
     /// Workspaces: projects, named workspaces, tabs and panes.
     #[command(subcommand)]
     Ws(WsCmd),
+    /// Open and close panes of the live workspace, from inside a pane.
+    #[command(subcommand)]
+    Pane(PaneCmd),
     /// Hiero's settings file.
     Config {
         #[command(subcommand)]
@@ -70,15 +73,97 @@ enum WsCmd {
         #[arg(num_args = 2..=3, required = true)]
         args: Vec<String>,
     },
-    /// Remove a project (`<project>`) or a workspace (`<project> <workspace>`).
+    /// Remove a project (`<project>`) or a workspace (`<project> <workspace>`)
+    /// and end the programs in it.
     Rm {
         #[arg(num_args = 1..=2, required = true)]
         args: Vec<String>,
+        /// Leave the programs running.
+        #[arg(long)]
+        keep: bool,
     },
     /// Move a project (`<project> up|down`) or a workspace (`<project> <workspace> up|down`).
     Move {
         #[arg(num_args = 2..=3, required = true)]
         args: Vec<String>,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum PaneDir {
+    /// Side by side.
+    Right,
+    /// Stacked.
+    Down,
+}
+
+#[derive(Subcommand)]
+enum PaneCmd {
+    /// Open a pane next to another one and print its id. A command after `--` runs in it.
+    Split {
+        /// The pane to split (default: $HIERO_PANE).
+        #[arg(long)]
+        pane: Option<String>,
+        #[arg(long, value_enum, default_value = "right")]
+        dir: PaneDir,
+        /// The new pane's share of the split, in percent.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=90))]
+        size: Option<u16>,
+        /// Name the pane.
+        #[arg(long)]
+        name: Option<String>,
+        /// Keep the focus where it is.
+        #[arg(long)]
+        no_focus: bool,
+        /// Run the command in the existing pane of this name (in the same workspace) instead of splitting.
+        #[arg(long, requires = "name")]
+        reuse: bool,
+        /// The program and its arguments (default: a shell).
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Print a file and what is added to it, like `tail -F` (also on Windows):
+    /// it waits for the file to appear and starts over when it is truncated.
+    Follow { file: std::path::PathBuf },
+    /// Close panes and end their programs.
+    #[command(group(clap::ArgGroup::new("which").required(true).multiple(true)))]
+    Close {
+        /// Pane ids.
+        #[arg(group = "which")]
+        ids: Vec<String>,
+        /// Panes with this name in the workspace of $HIERO_PANE (or $HIERO_WS); repeatable.
+        #[arg(long = "name", group = "which")]
+        names: Vec<String>,
+        /// Skip names no pane has instead of failing.
+        #[arg(long)]
+        missing_ok: bool,
+    },
+    /// Take every other pane out of a pane's tab; their programs keep running.
+    /// A layout saved before (`hiero pane layout`) brings them back, and so
+    /// does closing this pane.
+    HideOthers {
+        /// The pane that stays (default: $HIERO_PANE).
+        #[arg(long)]
+        pane: Option<String>,
+    },
+    /// Put a tab's hidden panes back, beside what is there.
+    Unhide {
+        /// A pane of the tab (default: $HIERO_PANE).
+        #[arg(long)]
+        pane: Option<String>,
+        /// Only when this pane is the one that hid them.
+        #[arg(long)]
+        mine: bool,
+    },
+    /// Print the layout of a pane's tab as JSON, or put one back with --restore
+    /// (only when the tab still has exactly those panes; otherwise it is kept).
+    Layout {
+        /// A pane of the tab (default: $HIERO_PANE).
+        #[arg(long)]
+        pane: Option<String>,
+        /// A layout printed earlier.
+        #[arg(long)]
+        restore: Option<String>,
     },
 }
 
@@ -167,6 +252,7 @@ async fn main() -> Result<()> {
         Some(Command::Config { action }) => config_cmd(action, config_error),
         Some(Command::Debug(d)) => debug(d).await,
         Some(Command::Ws(w)) => ws_cmd(w).await,
+        Some(Command::Pane(p)) => pane_cmd(p).await,
     }
 }
 
@@ -276,13 +362,36 @@ async fn ws_cmd(cmd: WsCmd) -> Result<()> {
                 _ => unreachable!("clap allows 2 or 3 arguments"),
             }
         }
-        WsCmd::Rm { args } => {
+        WsCmd::Rm { args, keep } => {
             let p = project(&args[0])?;
-            match &args[..] {
-                [_] => WsOp::DeleteProject { id: p.id.clone() },
-                [_, w] => WsOp::DeleteWorkspace { id: find_ws(p, w)? },
+            let (op, wss): (WsOp, Vec<&workspace::Workspace>) = match &args[..] {
+                [_] => (WsOp::DeleteProject { id: p.id.clone() }, p.workspaces.iter().collect()),
+                [_, w] => {
+                    let id = find_ws(p, w)?;
+                    let w = p.workspaces.iter().find(|x| x.id == id).expect("found above");
+                    (WsOp::DeleteWorkspace { id }, vec![w])
+                }
                 _ => unreachable!("clap allows 1 or 2 arguments"),
+            };
+            // Its programs: the ones the document knows, and any labelled with it.
+            let mut terms: Vec<String> = Vec::new();
+            if !keep {
+                for w in &wss {
+                    terms.extend(w.all_panes().iter().filter_map(|p| p.terminal.clone()));
+                    let labels = hc_client::Labels::from([(ws_app::LABEL_WS.to_string(), w.id.clone())]);
+                    if let Ok(list) = hc.list(false, &labels).await {
+                        terms.extend(list.terminals.into_iter().map(|t| t.address));
+                    }
+                }
+                terms.sort();
+                terms.dedup();
             }
+            workspace::update(&hc, &[op]).await.map_err(anyhow::Error::msg)?;
+            println!("ok");
+            for addr in terms {
+                ws_tui::kill_and_remove(&hc, &addr).await;
+            }
+            return Ok(());
         }
         WsCmd::Move { args } => {
             let p = project(&args[0])?;
@@ -301,6 +410,235 @@ async fn ws_cmd(cmd: WsCmd) -> Result<()> {
     workspace::update(&hc, &[op]).await.map_err(anyhow::Error::msg)?;
     println!("ok");
     Ok(())
+}
+
+/// `hiero pane split` and `close`: edit the document; the open UI starts and drops the terminals.
+async fn pane_cmd(cmd: PaneCmd) -> Result<()> {
+    use workspace::{Dir, SplitRequest, WsOp, new_id};
+    if let PaneCmd::Follow { file } = &cmd {
+        return follow(file);
+    }
+    let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+    let hc = Client::connect().await?;
+    let doc = workspace::load(&hc).await.map_err(anyhow::Error::msg)?;
+    match cmd {
+        PaneCmd::Split { pane, dir, size, name, no_focus, reuse, command } => {
+            let own = env(ws_app::ENV_PANE);
+            let target = pane
+                .or_else(|| own.clone())
+                .ok_or_else(|| anyhow::anyhow!("not inside a Hiero pane (no ${}): pass --pane ID", ws_app::ENV_PANE))?;
+            let req = SplitRequest {
+                dir: match dir {
+                    PaneDir::Right => Dir::Horizontal,
+                    PaneDir::Down => Dir::Vertical,
+                },
+                size,
+                name,
+                command: (!command.is_empty()).then(|| paths::shell_join(&command)),
+                no_focus,
+                reuse,
+            };
+            let (ops, id, old) = workspace::plan_split(&doc, &target, &new_id("n"), &req).map_err(anyhow::Error::msg)?;
+            if old.is_some() && own.as_deref() == Some(id.as_str()) {
+                anyhow::bail!("can't reuse the pane this runs in");
+            }
+            workspace::update(&hc, &ops).await.map_err(anyhow::Error::msg)?;
+            if let Some(addr) = old {
+                ws_tui::kill_and_remove(&hc, &addr).await;
+            }
+            println!("{id}");
+        }
+        PaneCmd::Follow { .. } => unreachable!("handled above"),
+        PaneCmd::Close { ids, names, missing_ok } => {
+            let mut ids = ids;
+            if !names.is_empty() {
+                let ws = env(ws_app::ENV_PANE)
+                    .and_then(|p| doc.pane(&p).map(|(w, ..)| w.id.clone()))
+                    .or_else(|| env(ws_app::ENV_WS))
+                    .ok_or_else(|| anyhow::anyhow!("not inside a Hiero pane (no ${}): close by id", ws_app::ENV_PANE))?;
+                let (_, w) = doc.workspace(&ws).ok_or_else(|| anyhow::anyhow!("no workspace {ws}"))?;
+                for name in &names {
+                    match w.pane_by_name(name) {
+                        Some(p) => ids.push(p.id.clone()),
+                        None if missing_ok => {}
+                        None => anyhow::bail!("workspace \"{}\" has no pane named \"{name}\"", w.name),
+                    }
+                }
+            }
+            let own = env(ws_app::ENV_PANE);
+            let own_terminal = own.as_deref().and_then(|p| doc.pane(p)).and_then(|(_, _, p)| p.terminal.clone());
+            // The pane this runs in last: closing it ends this process too.
+            ids.sort_by_key(|id| own.as_deref() == Some(id.as_str()));
+            ids.dedup();
+            // The pane's terminal from the document, and any live one labelled
+            // with the pane (in case the document never got to record it).
+            let mut terms: Vec<String> = ids.iter().filter_map(|id| doc.pane(id).and_then(|(_, _, p)| p.terminal.clone())).collect();
+            for id in &ids {
+                let labels = hc_client::Labels::from([(ws_app::LABEL_PANE.to_string(), id.clone())]);
+                if let Ok(list) = hc.list(false, &labels).await {
+                    terms.extend(list.terminals.into_iter().map(|t| t.address));
+                }
+            }
+            terms.sort_by_key(|a| own_terminal.as_deref() == Some(a.as_str()));
+            terms.dedup();
+            if !ids.is_empty() {
+                let ops: Vec<WsOp> = ids.iter().map(|id| WsOp::ClosePane { pane: id.clone() }).collect();
+                workspace::update(&hc, &ops).await.map_err(anyhow::Error::msg)?;
+            }
+            println!("ok");
+            for addr in terms {
+                ws_tui::kill_and_remove(&hc, &addr).await;
+            }
+        }
+        PaneCmd::HideOthers { pane } => {
+            let target = pane
+                .or_else(|| env(ws_app::ENV_PANE))
+                .ok_or_else(|| anyhow::anyhow!("not inside a Hiero pane (no ${}): pass --pane ID", ws_app::ENV_PANE))?;
+            workspace::update(&hc, &[WsOp::HideOthers { pane: target }]).await.map_err(anyhow::Error::msg)?;
+            println!("ok");
+        }
+        PaneCmd::Unhide { pane, mine } => {
+            let target = pane
+                .or_else(|| env(ws_app::ENV_PANE))
+                .ok_or_else(|| anyhow::anyhow!("not inside a Hiero pane (no ${}): pass --pane ID", ws_app::ENV_PANE))?;
+            let (_, tab, _) = doc.pane(&target).ok_or_else(|| anyhow::anyhow!("no pane {target}"))?;
+            if tab.hidden.is_empty() || (mine && tab.hidden_by.as_deref() != Some(target.as_str())) {
+                println!("nothing hidden");
+            } else {
+                workspace::update(&hc, &[WsOp::Unhide { tab: tab.id.clone() }]).await.map_err(anyhow::Error::msg)?;
+                println!("ok");
+            }
+        }
+        PaneCmd::Layout { pane, restore } => {
+            let target = pane
+                .or_else(|| env(ws_app::ENV_PANE))
+                .ok_or_else(|| anyhow::anyhow!("not inside a Hiero pane (no ${}): pass --pane ID", ws_app::ENV_PANE))?;
+            match restore {
+                None => {
+                    let (_, tab, _) = doc.pane(&target).ok_or_else(|| anyhow::anyhow!("no pane {target}"))?;
+                    println!("{}", serde_json::json!({ "tab": tab.id, "layout": tab.layout }));
+                }
+                Some(json) => {
+                    #[derive(serde::Deserialize)]
+                    struct Saved {
+                        tab: String,
+                        layout: workspace::Layout,
+                    }
+                    let saved: Saved = serde_json::from_str(&json).map_err(|e| anyhow::anyhow!("not a saved layout: {e}"))?;
+                    // A hidden pane comes back only while its program still runs;
+                    // one you ended meanwhile stays gone.
+                    let mut layout = saved.layout;
+                    for p in layout.panes().into_iter().cloned().collect::<Vec<_>>() {
+                        if doc.pane(&p.id).is_some() {
+                            continue;
+                        }
+                        let live = match &p.terminal {
+                            Some(addr) => hc.get(addr).await.is_ok_and(|t| t.state == hc_client::TerminalState::Live),
+                            None => false,
+                        };
+                        if !live {
+                            layout = workspace::without_pane(&layout, &p.id);
+                        }
+                    }
+                    // Panes added to the tab since go next to the saved layout, so
+                    // it comes back and nothing is lost: across its own direction
+                    // (a split of the same direction would merge and lose its sizes).
+                    let extra: Vec<workspace::Layout> = doc
+                        .tab(&saved.tab)
+                        .map(|(_, t)| t.layout.panes().into_iter().filter(|p| layout.find(&p.id).is_none()).cloned().collect::<Vec<_>>())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(workspace::Layout::Pane)
+                        .collect();
+                    let added = extra.len();
+                    if added > 0 {
+                        let dir = match &layout {
+                            workspace::Layout::Split { dir: workspace::Dir::Horizontal, .. } => workspace::Dir::Vertical,
+                            _ => workspace::Dir::Horizontal,
+                        };
+                        let mut sizes = vec![3 * added as u16];
+                        sizes.extend(std::iter::repeat_n(1, added));
+                        let mut children = vec![layout];
+                        children.extend(extra);
+                        layout = workspace::Layout::Split { dir, children, sizes };
+                    }
+                    workspace::update(&hc, &[WsOp::SetLayout { tab: saved.tab, layout }]).await.map_err(anyhow::Error::msg)?;
+                    if added > 0 {
+                        println!("ok, {added} pane(s) added meanwhile kept beside it");
+                    } else {
+                        println!("ok");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `hiero pane follow`: poll the file, print what was added. Never returns on its own.
+fn follow(path: &std::path::Path) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    #[cfg(windows)]
+    let _ = crossterm::ansi_support::supports_ansi(); // turns on VT processing for the colours
+    let mut out = std::io::stdout().lock();
+    let (mut pos, mut pending, mut buf) = (0u64, Vec::new(), vec![0u8; 64 * 1024]);
+    loop {
+        // Opened anew each time: a short-lived handle never blocks the writer
+        // (Windows) and a replaced file is picked up.
+        match std::fs::File::open(path) {
+            Ok(mut f) => {
+                let len = f.metadata()?.len();
+                if len < pos {
+                    (pos, pending) = (0, Vec::new());
+                    out.write_all(b"\x1b[2J\x1b[H")?;
+                }
+                if len > pos {
+                    f.seek(SeekFrom::Start(pos))?;
+                    loop {
+                        let n = f.read(&mut buf)?;
+                        if n == 0 {
+                            break;
+                        }
+                        pos += n as u64;
+                        pending.extend_from_slice(&buf[..n]);
+                        write_utf8(&mut out, &mut pending)?;
+                    }
+                    out.flush()?;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow::anyhow!("{}: {e}", path.display())),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Write the UTF-8 in `pending` (bad bytes as U+FFFD, which the Windows console
+/// needs) and keep a character cut off at the end for the next read.
+fn write_utf8(out: &mut impl std::io::Write, pending: &mut Vec<u8>) -> std::io::Result<()> {
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(s) => {
+                out.write_all(s.as_bytes())?;
+                pending.clear();
+                return Ok(());
+            }
+            Err(e) => {
+                let good = e.valid_up_to();
+                out.write_all(&pending[..good])?;
+                match e.error_len() {
+                    None => {
+                        pending.drain(..good);
+                        return Ok(());
+                    }
+                    Some(bad) => {
+                        out.write_all("\u{FFFD}".as_bytes())?;
+                        pending.drain(..good + bad);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn find_ws(p: &workspace::Project, name: &str) -> Result<String> {
@@ -616,5 +954,22 @@ fn summarize(d: &hc_client::EventData) -> String {
         Foreground(None) => "fg       -".into(),
         Doc { name, version } => format!("doc      {name} v{version}"),
         Unknown { kind, .. } => format!("{kind} (unknown)"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_utf8;
+
+    #[test]
+    fn write_utf8_keeps_a_cut_character_and_replaces_bad_bytes() {
+        let (mut out, mut pending) = (Vec::new(), "a─".as_bytes()[..3].to_vec());
+        write_utf8(&mut out, &mut pending).unwrap();
+        assert_eq!((out.as_slice(), pending.len()), (&b"a"[..], 2));
+        pending.extend_from_slice(&"─".as_bytes()[2..]);
+        pending.extend_from_slice(b"\xffb");
+        write_utf8(&mut out, &mut pending).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "a─\u{FFFD}b");
+        assert!(pending.is_empty());
     }
 }

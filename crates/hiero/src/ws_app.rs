@@ -17,6 +17,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 pub const LABEL_WS: &str = "hiero.ws";
+/// How long a program may run without its pane before it is ended.
+const ORPHAN_AFTER: Duration = Duration::from_secs(5);
 pub const LABEL_PANE: &str = "hiero.pane";
 /// Set in every pane's environment, so a `hiero` started inside a pane can
 /// tell it would be nesting.
@@ -90,6 +92,10 @@ pub enum Action {
     /// `attempt` tells a late answer from one for an older attempt.
     Open { plan: Plan, attempt: u64, cols: u16, rows: u16 },
     Resize { pane: String, cols: u16, rows: u16 },
+    /// Tell the pane's program its size in-band (`CSI 48 ; rows ; cols ; 0 ; 0 t`),
+    /// for a program that turned on mode 2048: neovim then ignores SIGWINCH and
+    /// waits for this report, which the terminal (Hiero, here) has to send.
+    SizeReport { pane: String, cols: u16, rows: u16 },
     /// Kill these terminals and remove them from hc.
     Kill(Vec<String>),
     /// Start a pane's terminal in the background (no attach) and record it.
@@ -308,6 +314,9 @@ pub struct WsApp {
     recent: HashMap<String, String>,
     /// Background starts that failed; they are not retried until the pane is opened.
     failed: HashSet<String>,
+    /// Live programs labelled with a pane their workspace no longer has, and
+    /// since when (see `sweep_orphans`).
+    orphans: HashMap<String, Instant>,
     /// `[workspace] restore`: start missing terminals without being asked.
     pub auto_restore: bool,
     next_attempt: u64,
@@ -358,6 +367,7 @@ impl WsApp {
             slots: HashMap::new(),
             starting: HashSet::new(),
             recent: HashMap::new(),
+            orphans: HashMap::new(),
             failed: HashSet::new(),
             auto_restore: true,
             next_attempt: 0,
@@ -541,7 +551,27 @@ impl WsApp {
 
     /// A fresh copy of the document (first read, reload, or after our own edit).
     pub fn on_doc(&mut self, doc: WsDoc) {
+        // Panes on screen whose terminal the document dropped or swapped
+        // (`hiero pane split --reuse`): show the pane's new one, started if
+        // needed. Decided from the document alone: the old terminal may already
+        // have ended, and the pane be busy attaching to it again. Our own
+        // edits (a terminal we just started or show) don't count.
+        let mut replaced: Vec<String> = self
+            .slots
+            .iter()
+            .filter(|(id, _)| !self.starting.contains(*id))
+            .filter_map(|(id, s)| {
+                let was = self.doc.pane(id)?.2.terminal.as_ref()?;
+                let now = doc.pane(id)?.2.terminal.as_ref();
+                let ours = now.is_some_and(|n| s.view.as_ref().is_some_and(|v| &v.addr == n) || self.recent.get(id) == Some(n));
+                (now != Some(was) && !ours).then(|| id.clone())
+            })
+            .collect();
+        replaced.sort();
         self.doc = doc;
+        for pane in replaced {
+            self.restart(&pane, false, false);
+        }
         if let Some(id) = self.pending_sel.take_if(|id| self.doc.project(id).is_some()) {
             self.sel = id;
         }
@@ -664,7 +694,53 @@ impl WsApp {
     pub fn on_tick(&mut self) {
         if self.client_up && self.disconnected.is_none() {
             self.recover_lost(false);
+            self.sweep_orphans(Instant::now());
         }
+    }
+
+    /// End programs labelled with a pane that their (still existing) workspace
+    /// no longer has, on screen or hidden, once they have been like that for
+    /// `ORPHAN_AFTER`: a pane closed while the document never recorded its
+    /// terminal, for one. A workspace that is gone is left alone: deleting one
+    /// can keep its programs on purpose.
+    fn sweep_orphans(&mut self, now: Instant) {
+        if !self.synced || self.reconnected {
+            return;
+        }
+        let mut still = HashMap::new();
+        let mut kill = vec![];
+        for t in self.set.terminals.values() {
+            if t.state != hc_client::TerminalState::Live || self.self_addr.as_deref() == Some(t.address.as_str()) {
+                continue;
+            }
+            let (Some(ws), Some(pane)) = (t.labels.get(LABEL_WS), t.labels.get(LABEL_PANE)) else { continue };
+            let Some((_, w)) = self.doc.workspace(ws) else { continue };
+            if w.all_panes().iter().any(|p| &p.id == pane) {
+                continue;
+            }
+            let since = self.orphans.get(&t.address).copied().unwrap_or(now);
+            if now.duration_since(since) >= ORPHAN_AFTER {
+                kill.push(t.address.clone());
+            } else {
+                still.insert(t.address.clone(), since);
+            }
+        }
+        self.orphans = still;
+        if !kill.is_empty() {
+            tracing::info!("ending programs whose pane is gone: {kill:?}");
+            self.actions.push(Action::Kill(kill));
+        }
+    }
+
+    /// Live programs labelled `key` = one of `values`: also the ones the
+    /// document lost track of.
+    fn labelled(&self, key: &str, values: &[String]) -> Vec<String> {
+        self.set
+            .terminals
+            .values()
+            .filter(|t| t.state == hc_client::TerminalState::Live && t.labels.get(key).is_some_and(|v| values.contains(v)))
+            .map(|t| t.address.clone())
+            .collect()
     }
 
     /// A connection that can send requests is up (also again after a restart).
@@ -712,6 +788,9 @@ impl WsApp {
                 slot.size = size;
                 view.resize(size.0, size.1);
                 self.actions.push(Action::Resize { pane: id.clone(), cols: size.0, rows: size.1 });
+                if view.parser.screen().in_band_resize() {
+                    self.actions.push(Action::SizeReport { pane: id.clone(), cols: size.0, rows: size.1 });
+                }
             }
         }
         self.restore_hidden();
@@ -907,7 +986,16 @@ impl WsApp {
         use hc_client::StreamMsg;
         let Some(view) = self.slots.get_mut(pane).and_then(|s| s.view.as_mut()) else { return };
         match msg {
-            StreamMsg::Data(bytes) => view.parser.process(&bytes),
+            StreamMsg::Data(bytes) => {
+                let before = view.parser.screen().in_band_resize();
+                view.parser.process(&bytes);
+                // Turned on now, or seen in the replay of an attach (which may
+                // have resized the terminal under the program): report the size.
+                if !before && view.parser.screen().in_band_resize() {
+                    let (rows, cols) = view.parser.screen().size();
+                    self.actions.push(Action::SizeReport { pane: pane.to_string(), cols: cols.get(), rows: rows.get() });
+                }
+            }
             StreamMsg::Resize { .. } => {}
             StreamMsg::Closed(reason) => {
                 view.ended = Some(crate::widgets::describe_close(reason.as_ref()));
@@ -1607,7 +1695,12 @@ impl WsApp {
             Some(p) => p.workspaces.iter().collect(),
             None => self.doc.workspace(id).map(|(_, w)| w).into_iter().collect(),
         };
-        ws.iter().flat_map(|w| w.panes()).filter_map(|p| p.terminal.clone()).collect()
+        let mut v: Vec<String> = ws.iter().flat_map(|w| w.all_panes()).filter_map(|p| p.terminal.clone()).collect();
+        let ids: Vec<String> = ws.iter().map(|w| w.id.clone()).collect();
+        v.extend(self.labelled(LABEL_WS, &ids));
+        v.sort();
+        v.dedup();
+        v
     }
 
     fn delete_confirm(&mut self) {
@@ -1677,14 +1770,23 @@ impl WsApp {
         match kind {
             ConfirmKind::Delete(id) => self.delete(id, true),
             ConfirmKind::ClosePane(pane) => {
-                let terminals: Vec<String> = self.terminal_of(&pane).into_iter().collect();
+                let mut terminals: Vec<String> = self.terminal_of(&pane).into_iter().collect();
+                terminals.extend(self.labelled(LABEL_PANE, std::slice::from_ref(&pane)));
+                terminals.sort();
+                terminals.dedup();
                 self.close_with(terminals, WsOp::ClosePane { pane });
             }
             ConfirmKind::CloseTab(id) => {
-                let terminals = match self.doc.tab(&id) {
-                    Some((_, t)) => t.layout.panes().iter().filter_map(|p| p.terminal.clone()).collect(),
-                    None => vec![],
+                let (mut terminals, ids): (Vec<String>, Vec<String>) = match self.doc.tab(&id) {
+                    Some((_, t)) => (
+                        t.all_panes().iter().filter_map(|p| p.terminal.clone()).collect(),
+                        t.all_panes().iter().map(|p| p.id.clone()).collect(),
+                    ),
+                    None => (vec![], vec![]),
                 };
+                terminals.extend(self.labelled(LABEL_PANE, &ids));
+                terminals.sort();
+                terminals.dedup();
                 self.close_with(terminals, WsOp::CloseTab { id });
             }
         }
@@ -1853,6 +1955,37 @@ mod tests {
             "state": if live { "live" } else { "finished" },
         }))
         .unwrap()
+    }
+
+    fn labelled_terminal(addr: &str, ws: &str, pane: &str) -> Terminal {
+        serde_json::from_value(serde_json::json!({
+            "address": addr,
+            "state": "live",
+            "labels": { "hiero.ws": ws, "hiero.pane": pane },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn programs_whose_pane_is_gone_are_ended_after_a_while() {
+        let mut a = app();
+        open_attached(&mut a, "w1");
+        // Its pane is gone; a hidden pane's program; one of a deleted workspace; the open pane's own.
+        a.set.terminals.insert("t-orphan".into(), labelled_terminal("t-orphan", "w1", "n-gone"));
+        a.set.terminals.insert("t-kept".into(), labelled_terminal("t-kept", "w-deleted", "n-x"));
+        a.set.terminals.insert("t-mine".into(), labelled_terminal("t-mine", "w1", "n-w1"));
+        let mut doc = a.doc.clone();
+        apply(&mut doc, &WsOp::SplitPane { pane: "n-w1".into(), dir: Dir::Horizontal, new_id: "n-hid".into() }).unwrap();
+        apply(&mut doc, &WsOp::HideOthers { pane: "n-w1".into() }).unwrap();
+        a.on_doc(doc);
+        a.set.terminals.insert("t-hidden".into(), labelled_terminal("t-hidden", "w1", "n-hid"));
+        a.actions.clear();
+        let t0 = Instant::now();
+        a.sweep_orphans(t0);
+        assert!(!a.actions.iter().any(|x| matches!(x, Action::Kill(_))), "not at once: {:?}", a.actions);
+        a.sweep_orphans(t0 + ORPHAN_AFTER);
+        let kills: Vec<_> = a.actions.iter().filter_map(|x| if let Action::Kill(v) = x { Some(v.clone()) } else { None }).collect();
+        assert_eq!(kills, vec![vec!["t-orphan".to_string()]]);
     }
 
     fn finished(addr: &str, reason: &str, code: Option<i32>) -> Terminal {
@@ -2158,6 +2291,28 @@ mod tests {
         a.on_doc(doc);
         let again = opens(&mut a);
         assert!(matches!(&again[..], [Plan::Attach { addr, .. }] if addr == "t1"), "{again:?}");
+    }
+
+    #[test]
+    fn a_pane_whose_terminal_was_cleared_in_the_document_starts_again() {
+        let mut a = app();
+        open_attached(&mut a, "w1");
+        let mut doc = a.doc.clone();
+        apply(&mut doc, &WsOp::SetTerminal { pane: "n-w1".into(), terminal: Some("t-n-w1".into()) }).unwrap();
+        a.on_doc(doc.clone());
+        a.set.terminals.insert("t-n-w1".into(), terminal("t1", true));
+        a.actions.clear();
+        // The pane may show no terminal at all, e.g. its open failed because the old one had ended.
+        let slot = a.slots.get_mut("n-w1").unwrap();
+        (slot.view, slot.error) = (None, Some("t-n-w1 has finished".into()));
+        // From the CLI: a new command and no terminal.
+        apply(&mut doc, &WsOp::SetCommand { pane: "n-w1".into(), command: Some("make run".into()) }).unwrap();
+        apply(&mut doc, &WsOp::SetTerminal { pane: "n-w1".into(), terminal: None }).unwrap();
+        a.on_doc(doc);
+        let [Action::Detach(old), Action::Open { plan: Plan::Start { pane, params }, .. }] = &a.actions[..] else {
+            panic!("{:?}", a.actions)
+        };
+        assert_eq!((old.as_str(), pane.as_str(), params.line.as_deref()), ("n-w1", "n-w1", Some("make run")));
     }
 
     #[test]
@@ -2555,6 +2710,26 @@ mod tests {
             assert_eq!((t, p, *d), (&tab, &pane, dir));
             assert_eq!(delta.signum(), sign);
         }
+    }
+
+    #[test]
+    fn a_program_in_mode_2048_gets_its_size_in_band() {
+        let mut a = three_panes();
+        let id = a.slots.keys().min().unwrap().clone();
+        a.actions.clear();
+        // Turning the mode on (or seeing it in an attach's replay) reports the size once.
+        a.on_stream(&id, hc_client::StreamMsg::Data(b"\x1b[?2048h".to_vec()));
+        a.on_stream(&id, hc_client::StreamMsg::Data(b"\x1b[?2048h".to_vec()));
+        let (cols, rows) = a.slots[&id].size;
+        let reports: Vec<_> = a.actions.iter().filter(|x| matches!(x, Action::SizeReport { .. })).collect();
+        assert!(matches!(&reports[..], [Action::SizeReport { pane, cols: c, rows: r }] if *pane == id && (*c, *r) == (cols, rows)), "{reports:?}");
+        a.actions.clear();
+        // A resize: the stream first, then the report with the new size; panes without the mode get none.
+        a.set_screen(rect(0, 0, 80, 20));
+        let (cols, rows) = a.slots[&id].size;
+        let i = a.actions.iter().position(|x| matches!(x, Action::Resize { pane, .. } if *pane == id)).unwrap();
+        assert!(matches!(a.actions.get(i + 1), Some(Action::SizeReport { pane, cols: c, rows: r }) if *pane == id && (*c, *r) == (cols, rows)), "{:?}", a.actions);
+        assert_eq!(a.actions.iter().filter(|x| matches!(x, Action::SizeReport { .. })).count(), 1);
     }
 
     #[test]

@@ -70,9 +70,35 @@ pub fn program_name(word: &str) -> &str {
     word.rsplit(['/', '\\']).next().unwrap_or(word)
 }
 
+/// Arguments as one shell line (a pane stores its command that way): words that
+/// need it are quoted, with single quotes on Unix and double quotes on Windows.
+pub fn shell_join<S: AsRef<str>>(args: &[S]) -> String {
+    let plain = |a: &str| !a.is_empty() && a.chars().all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c) || (cfg!(windows) && c == '\\'));
+    let quote = |a: &str| {
+        if plain(a) {
+            a.to_string()
+        } else if cfg!(windows) {
+            format!("\"{}\"", a.replace('"', "\\\""))
+        } else {
+            format!("'{}'", a.replace('\'', "'\\''"))
+        }
+    };
+    args.iter().map(|a| quote(a.as_ref())).collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_join_quotes_only_what_needs_it() {
+        assert_eq!(shell_join(&["nvim", "-c", "a/b.rs"]), "nvim -c a/b.rs");
+        if cfg!(windows) {
+            assert_eq!(shell_join(&["echo", "a b", ""]), r#"echo "a b" """#);
+        } else {
+            assert_eq!(shell_join(&["echo", "a b", "", "it's", "$HOME;ls"]), r#"echo 'a b' '' 'it'\''s' '$HOME;ls'"#);
+        }
+    }
 
     #[test]
     fn verbatim_prefix_is_stripped_only_when_safe() {

@@ -345,3 +345,13 @@ fn margin_sequences_are_handled() {
     p.process(b"\x1b[?69h\x1b[1;5s\x1b[?69l\x1b[s");
     assert_eq!(p.callbacks().0, Vec::<String>::new());
 }
+
+#[test]
+fn in_band_resize_mode_follows_decset_2048() {
+    let mut p = term(5, 10);
+    assert!(!p.screen().in_band_resize());
+    p.process(b"\x1b[?2004;2048h");
+    assert!(p.screen().in_band_resize());
+    p.process(b"\x1b[?2048l");
+    assert!(!p.screen().in_band_resize());
+}
