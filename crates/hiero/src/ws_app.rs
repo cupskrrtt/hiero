@@ -326,6 +326,8 @@ pub struct WsApp {
     pub panes_area: Rect,
     /// The whole screen, to lay the panes out again when the sidebar changes.
     screen: Rect,
+    /// What the panes were last laid out for (screen, banner shown, sidebar columns).
+    laid_out: Option<(Rect, bool, u16)>,
     /// Sidebar width in columns, and whether it is hidden (prefix `b`).
     pub sidebar_w: u16,
     pub sidebar_hidden: bool,
@@ -374,6 +376,7 @@ impl WsApp {
             zoom: None,
             panes_area: ws_ui::areas(Rect::new(0, 0, 100, 30), false, ws_ui::SIDEBAR_W).panes,
             screen: Rect::new(0, 0, 100, 30),
+            laid_out: None,
             sidebar_w: ws_ui::SIDEBAR_W,
             sidebar_hidden: false,
             self_addr: None,
@@ -544,7 +547,20 @@ impl WsApp {
                     self.actions.push(Action::LoadDoc);
                 }
                 self.set.apply(e);
-                self.status_alerts()
+                // Only these can change a status or which terminals exist; the
+                // rest (title, size, foreground, keep) are frequent and can't.
+                // New kinds default to running it.
+                let relevant = !matches!(
+                    e.data,
+                    EventData::Title { .. } | EventData::Size { .. } | EventData::Foreground(_) | EventData::Keep { .. }
+                );
+                if relevant {
+                    // The loop no longer syncs every pass: a terminal that appeared or ended can change what a pane needs.
+                    self.sync();
+                    self.status_alerts()
+                } else {
+                    Vec::new()
+                }
             }
         }
     }
@@ -645,7 +661,13 @@ impl WsApp {
     }
 
     /// The screen changed size (or the banner came or went).
+    /// Cheap when none of the screen, the banner and the sidebar changed.
     pub fn set_screen(&mut self, screen: Rect) {
+        let key = (screen, self.disconnected.is_some(), self.sidebar_cols());
+        if self.laid_out == Some(key) {
+            return;
+        }
+        self.laid_out = Some(key);
         self.screen = screen;
         self.panes_area = ws_ui::areas(screen, self.disconnected.is_some(), self.sidebar_cols()).panes;
         self.sync();
@@ -666,6 +688,7 @@ impl WsApp {
     /// Lay the panes out again for the sidebar's new width; `sync` then
     /// resizes the streams and the parsers.
     fn relayout(&mut self) {
+        self.laid_out = None;
         self.set_screen(self.screen);
     }
 
@@ -692,6 +715,7 @@ impl WsApp {
     /// its terminals finished a moment before the connection drops, and that
     /// case belongs to the reconnect.
     pub fn on_tick(&mut self) {
+        self.sync();
         if self.client_up && self.disconnected.is_none() {
             self.recover_lost(false);
             self.sweep_orphans(Instant::now());

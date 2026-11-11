@@ -84,21 +84,19 @@ pub struct Ending {
 }
 
 impl Notification {
-    pub(crate) fn decode(msg: Value) -> Result<Self> {
-        let method = msg
-            .get("method")
-            .and_then(Value::as_str)
-            .ok_or_else(|| Error::Protocol(format!("no method: {msg}")))?
-            .to_string();
-        let params = msg.get("params").cloned().unwrap_or(Value::Null);
-        let seq = || params.get("seq").and_then(Value::as_u64).unwrap_or(0);
+    pub(crate) fn decode(mut msg: Value) -> Result<Self> {
+        let Some(method) = msg.get("method").and_then(Value::as_str).map(str::to_string) else {
+            return Err(Error::Protocol(format!("no method: {msg}")));
+        };
+        let mut params = msg.as_object_mut().and_then(|m| m.remove("params")).unwrap_or(Value::Null);
+        let seq = params.get("seq").and_then(Value::as_u64).unwrap_or(0);
         Ok(match method.as_str() {
-            "event" => Notification::Event(Event::decode(&params)?),
-            "heartbeat" => Notification::Heartbeat { seq: seq() },
+            "event" => Notification::Event(Event::decode(params)?),
+            "heartbeat" => Notification::Heartbeat { seq },
             "missed" => Notification::Missed {
-                seq: seq(),
+                seq,
                 terminals: serde_json::from_value(
-                    params.get("terminals").cloned().unwrap_or(Value::Array(vec![])),
+                    params.as_object_mut().and_then(|m| m.remove("terminals")).unwrap_or(Value::Array(vec![])),
                 )?,
             },
             _ => Notification::Other { method, params },
@@ -107,7 +105,7 @@ impl Notification {
 }
 
 impl Event {
-    fn decode(params: &Value) -> Result<Self> {
+    fn decode(params: Value) -> Result<Self> {
         #[derive(Deserialize)]
         struct Raw {
             seq: u64,
@@ -118,12 +116,12 @@ impl Event {
             #[serde(default)]
             data: Value,
         }
-        let raw: Raw = serde_json::from_value(params.clone())?;
-        let d = raw.data;
-        fn field<T: serde::de::DeserializeOwned + Default>(d: &Value, k: &str) -> Result<T> {
-            match d.get(k) {
+        let raw: Raw = serde_json::from_value(params)?;
+        let mut d = raw.data;
+        fn field<T: serde::de::DeserializeOwned + Default>(d: &mut Value, k: &str) -> Result<T> {
+            match d.as_object_mut().and_then(|m| m.remove(k)) {
                 None | Some(Value::Null) => Ok(T::default()),
-                Some(v) => Ok(serde_json::from_value(v.clone())?),
+                Some(v) => Ok(serde_json::from_value(v)?),
             }
         }
         let data = match raw.kind.as_str() {
@@ -133,32 +131,32 @@ impl Event {
             "finished" => EventData::Finished(serde_json::from_value(d)?),
             "removed" => EventData::Removed,
             "keep" => EventData::Keep {
-                keep: field(&d, "keep")?,
+                keep: field(&mut d, "keep")?,
             },
             "status" => EventData::Status {
-                status: field(&d, "status")?,
-                records: field(&d, "records")?,
-                reported: field(&d, "reported")?,
+                status: field(&mut d, "status")?,
+                records: field(&mut d, "records")?,
+                reported: field(&mut d, "reported")?,
             },
             "turn" => EventData::Turn {
-                turn: field(&d, "turn")?,
-                state: field(&d, "state")?,
+                turn: field(&mut d, "turn")?,
+                state: field(&mut d, "state")?,
             },
             "title" => EventData::Title {
-                title: field(&d, "title")?,
+                title: field(&mut d, "title")?,
             },
             "labels" => EventData::Labels {
-                labels: field(&d, "labels")?,
-                record: field::<Option<Terminal>>(&d, "record")?.map(Box::new),
+                labels: field(&mut d, "labels")?,
+                record: field::<Option<Terminal>>(&mut d, "record")?.map(Box::new),
             },
             "size" => EventData::Size {
-                cols: field(&d, "cols")?,
-                rows: field(&d, "rows")?,
+                cols: field(&mut d, "cols")?,
+                rows: field(&mut d, "rows")?,
             },
             "foreground" => EventData::Foreground(serde_json::from_value(d)?),
             "doc" => EventData::Doc {
-                name: field(&d, "name")?,
-                version: field(&d, "version")?,
+                name: field(&mut d, "name")?,
+                version: field(&mut d, "version")?,
             },
             _ => EventData::Unknown {
                 kind: raw.kind,

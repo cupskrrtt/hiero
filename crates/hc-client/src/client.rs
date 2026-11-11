@@ -27,6 +27,16 @@ struct Inner {
     /// `None` once the connection is gone.
     pending: Pending,
     next_id: AtomicU64,
+    /// The task reading the connection. On a Windows named pipe the read half
+    /// keeps the pipe open while it blocks in a read, so dropping the writer
+    /// is not enough to end it.
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
 }
 
 impl Client {
@@ -70,12 +80,13 @@ impl Client {
         } else {
             (None, None)
         };
-        tokio::spawn(read_loop(BufReader::new(reader), pending.clone(), ntx));
+        let reader = tokio::spawn(read_loop(BufReader::new(reader), pending.clone(), ntx));
         let client = Client {
             inner: Arc::new(Inner {
                 writer: tokio::sync::Mutex::new(Box::new(writer)),
                 pending,
                 next_id: AtomicU64::new(1),
+                reader,
             }),
         };
         (client, nrx)
@@ -257,7 +268,7 @@ async fn read_loop<R: AsyncRead + Unpin>(
         if line.trim().is_empty() {
             continue;
         }
-        let msg: Value = match serde_json::from_str(&line) {
+        let mut msg: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("hc sent bad json: {e}");
@@ -267,13 +278,13 @@ async fn read_loop<R: AsyncRead + Unpin>(
 
         // A response has an id; a notification has a method and no id.
         if let Some(id) = msg.get("id").and_then(Value::as_u64) {
-            let result = if let Some(err) = msg.get("error") {
-                match serde_json::from_value::<WireError>(err.clone()) {
+            // Take the parts out of the message instead of copying them (documents and screens can be big).
+            let result = match msg.as_object_mut().and_then(|m| m.remove("error")) {
+                Some(err) => match serde_json::from_value::<WireError>(err) {
                     Ok(w) => Err(Error::Rpc(w.into())),
                     Err(e) => Err(Error::Json(e)),
-                }
-            } else {
-                Ok(msg.get("result").cloned().unwrap_or(Value::Null))
+                },
+                None => Ok(msg.as_object_mut().and_then(|m| m.remove("result")).unwrap_or(Value::Null)),
             };
             let tx = pending.lock().unwrap().as_mut().and_then(|m| m.remove(&id));
             match tx {
@@ -356,5 +367,44 @@ mod tests {
         drop(theirs);
         assert!(matches!(call.await.unwrap(), Err(Error::Disconnected)));
         assert!(matches!(client.status().await, Err(Error::Disconnected)));
+    }
+
+    /// A reader that notices when the read task drops it.
+    struct Probe {
+        inner: tokio::io::ReadHalf<tokio::io::DuplexStream>,
+        dropped: Option<oneshot::Sender<()>>,
+    }
+    impl AsyncRead for Probe {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            if let Some(tx) = self.dropped.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_task_ends_when_the_client_is_dropped() {
+        // The peer keeps its end open the whole time: only the abort can end the task.
+        let (ours, theirs) = tokio::io::duplex(1024);
+        let (r, w) = tokio::io::split(ours);
+        let (tx, mut rx) = oneshot::channel();
+        let (client, _) = Client::from_parts(Probe { inner: r, dropped: Some(tx) }, w, false);
+        let clone = client.clone();
+        tokio::task::yield_now().await;
+        drop(client);
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err(), "a clone is still alive");
+        drop(clone);
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx).await.expect("read task ended").unwrap();
+        drop(theirs);
     }
 }

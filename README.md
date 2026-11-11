@@ -40,7 +40,7 @@ You need herdr-core installed and running (`hc server status`).
 cargo install --locked --git https://github.com/cupskrrtt/hiero hiero
 
 # a fixed release
-cargo install --locked --git https://github.com/cupskrrtt/hiero --tag v0.3.0 hiero
+cargo install --locked --git https://github.com/cupskrrtt/hiero --tag v0.3.1 hiero
 
 # from a checkout
 cargo install --locked --path crates/hiero

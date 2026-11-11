@@ -9,7 +9,7 @@ use crate::transport::{self, Reader, Writer};
 use crate::types::Terminal;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -71,6 +71,9 @@ struct Routes {
     streams: HashMap<u32, mpsc::UnboundedSender<StreamMsg>>,
     /// Frames that arrived before their stream was claimed.
     early: HashMap<u32, Vec<StreamMsg>>,
+    /// Channels whose CLOSE was delivered: later frames for them are dropped,
+    /// not kept in `early` for the life of the connection.
+    ended: HashSet<u32>,
     closed: bool,
 }
 
@@ -81,6 +84,15 @@ struct Conn {
     pending: Pending,
     routes: Arc<Mutex<Routes>>,
     next_id: AtomicU64,
+    /// The task reading the connection; ended on drop (a Windows named pipe
+    /// stays open while its read half is blocked in a read).
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
 }
 
 impl Conn {
@@ -111,14 +123,15 @@ impl Conn {
             return Err(Error::Protocol("core did not switch to framed mode".into()));
         }
 
-        let conn = Arc::new(Conn {
+        let (pending, routes): (Pending, Arc<Mutex<Routes>>) = Default::default();
+        let reader = tokio::spawn(read_loop(r, pending.clone(), routes.clone()));
+        Ok(Arc::new(Conn {
             writer: tokio::sync::Mutex::new(w),
-            pending: Arc::default(),
-            routes: Arc::default(),
+            pending,
+            routes,
             next_id: AtomicU64::new(1),
-        });
-        tokio::spawn(read_loop(r, conn.pending.clone(), conn.routes.clone()));
-        Ok(conn)
+            reader,
+        }))
     }
 
     async fn frame(&self, channel: u32, kind: u8, payload: &[u8]) -> Result<()> {
@@ -148,10 +161,14 @@ impl Conn {
     fn claim(&self, channel: u32) -> mpsc::UnboundedReceiver<StreamMsg> {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut routes = self.routes.lock().unwrap();
+        let mut ended = false;
         for msg in routes.early.remove(&channel).unwrap_or_default() {
+            ended |= matches!(msg, StreamMsg::Closed(_));
             let _ = tx.send(msg);
         }
-        if routes.closed {
+        if ended {
+            // Its CLOSE came before we claimed it; nothing more will arrive.
+        } else if routes.closed {
             let _ = tx.send(StreamMsg::Closed(None));
         } else {
             routes.streams.insert(channel, tx);
@@ -182,16 +199,17 @@ async fn read_loop(mut r: BufReader<Reader>, pending: Pending, routes: Arc<Mutex
             if kind != DATA {
                 continue;
             }
-            let Ok(msg) = serde_json::from_slice::<Value>(&payload) else {
+            let Ok(mut msg) = serde_json::from_slice::<Value>(&payload) else {
                 continue;
             };
             if let Some(id) = msg.get("id").and_then(Value::as_u64) {
-                let result = match msg.get("error") {
-                    Some(err) => match serde_json::from_value::<WireError>(err.clone()) {
+                // Take the parts out instead of copying them.
+                let result = match msg.as_object_mut().and_then(|m| m.remove("error")) {
+                    Some(err) => match serde_json::from_value::<WireError>(err) {
                         Ok(w) => Err(Error::Rpc(w.into())),
                         Err(e) => Err(Error::Json(e)),
                     },
-                    None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
+                    None => Ok(msg.as_object_mut().and_then(|m| m.remove("result")).unwrap_or(Value::Null)),
                 };
                 if let Some(tx) = pending.lock().unwrap().remove(&id) {
                     let _ = tx.send(result);
@@ -215,10 +233,12 @@ async fn read_loop(mut r: BufReader<Reader>, pending: Pending, routes: Arc<Mutex
             Some(tx) => {
                 let _ = tx.send(msg);
             }
+            None if routes.ended.contains(&channel) => {}
             None => routes.early.entry(channel).or_default().push(msg),
         }
         if closing {
             routes.streams.remove(&channel);
+            routes.ended.insert(channel);
         }
     }
 
@@ -268,19 +288,33 @@ impl AttachStream {
         })
     }
 
-    /// The next message. Output is credited back as soon as it's handed over.
-    pub async fn recv(&mut self) -> StreamMsg {
+    /// The next message, without crediting it: output stays counted against
+    /// the core's window until [`credit`](Self::credit) says it was consumed.
+    /// Cancel-safe (nothing is lost if the future is dropped while waiting).
+    pub async fn next(&mut self) -> StreamMsg {
         if self.closed {
             return StreamMsg::Closed(None);
         }
         let msg = self.rx.recv().await.unwrap_or(StreamMsg::Closed(None));
-        match &msg {
-            StreamMsg::Data(bytes) => {
-                let n = (bytes.len() as u32).to_le_bytes();
-                let _ = self.conn.frame(self.channel, CREDIT, &n).await;
-            }
-            StreamMsg::Closed(_) => self.closed = true,
-            _ => {}
+        if matches!(msg, StreamMsg::Closed(_)) {
+            self.closed = true;
+        }
+        msg
+    }
+
+    /// Give the core back `bytes` of the output window (after consuming a `Data` chunk).
+    pub async fn credit(&self, bytes: usize) {
+        let n = (bytes as u32).to_le_bytes();
+        let _ = self.conn.frame(self.channel, CREDIT, &n).await;
+    }
+
+    /// The next message, credited as soon as it's handed over. NOT cancel-safe
+    /// (a drop during the credit write loses the message): don't `select!` on
+    /// it; use [`next`](Self::next) and [`credit`](Self::credit) there.
+    pub async fn recv(&mut self) -> StreamMsg {
+        let msg = self.next().await;
+        if let StreamMsg::Data(bytes) = &msg {
+            self.credit(bytes.len()).await;
         }
         msg
     }
@@ -316,5 +350,35 @@ impl AttachStream {
             .await;
             self.closed = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(channel: u32, kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut b = channel.to_le_bytes().to_vec();
+        b.push(kind);
+        b.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        b.extend_from_slice(payload);
+        b
+    }
+
+    #[tokio::test]
+    async fn frames_after_a_close_are_not_kept() {
+        let (ours, mut theirs) = tokio::io::duplex(4096);
+        let routes: Arc<Mutex<Routes>> = Arc::default();
+        let task = tokio::spawn(read_loop(BufReader::new(Box::new(ours) as Reader), Pending::default(), routes.clone()));
+        // Output and the close arrive before anyone claims channel 5; more output after the close.
+        for f in [frame(5, DATA, b"a"), frame(5, CLOSE, b"{}"), frame(5, DATA, b"late"), frame(5, DATA, b"later")] {
+            theirs.write_all(&f).await.unwrap();
+        }
+        drop(theirs);
+        task.await.unwrap();
+        let routes = routes.lock().unwrap();
+        let early = &routes.early[&5];
+        assert_eq!(early.len(), 2, "only what came before the close is kept: {early:?}");
+        assert!(matches!(early[1], StreamMsg::Closed(_)));
     }
 }

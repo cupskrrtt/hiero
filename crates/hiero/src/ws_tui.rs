@@ -29,8 +29,6 @@ enum Msg {
     /// A background start finished (its terminal is recorded in the doc first).
     Started { pane: String, result: Result<String, String> },
     Opened { pane: String, attempt: u64, addr: String, cols: u16, rows: u16, result: Result<Box<AttachStream>, String> },
-    /// Output or the end of a pane's stream, tagged with the attempt it belongs to.
-    Stream { pane: String, attempt: u64, msg: StreamMsg },
 }
 
 /// What the event loop asks a pane's task to do with its stream.
@@ -48,22 +46,50 @@ struct Handle {
     cmd: mpsc::UnboundedSender<PaneCmd>,
 }
 
-/// One task per attached pane owns its stream (`recv` needs `&mut`) and
-/// waits on both the stream and the loop's commands. Everything it hears is
-/// forwarded to the loop tagged with the pane and attempt. It ends when the
-/// stream closes or the loop says so.
+/// Output or the end of a pane's stream, tagged with the attempt it belongs to.
+struct StreamOut {
+    pane: String,
+    attempt: u64,
+    msg: StreamMsg,
+}
+
+/// Chunks of pane output the loop has not consumed yet, over all panes. A
+/// chunk is only credited back to the core once it is in here, so a program
+/// that floods faster than we parse and draw is held back by the core's
+/// flow control instead of piling up in memory.
+const STREAM_QUEUE: usize = 64;
+
+/// One task per attached pane owns its stream (`next` needs `&mut`) and
+/// waits on both the stream and the loop's commands. Output goes to the loop
+/// through the bounded `out` channel tagged with the pane and attempt. It
+/// ends when the stream closes or the loop says so.
+///
+/// Every branch future is cancel-safe (`reserve`, `next`, `recv`); every
+/// socket write happens in a branch body and runs to completion.
 async fn pane_task(
     pane: String,
     attempt: u64,
     mut stream: AttachStream,
     mut cmds: mpsc::UnboundedReceiver<PaneCmd>,
-    tx: mpsc::UnboundedSender<Msg>,
+    out: mpsc::Sender<StreamOut>,
 ) {
+    // Room for one chunk, reserved before taking it off the stream.
+    let mut permit = None;
     loop {
         tokio::select! {
-            msg = stream.recv() => {
+            room = out.reserve(), if permit.is_none() => match room {
+                Ok(p) => permit = Some(p),
+                Err(_) => return,
+            },
+            msg = stream.next(), if permit.is_some() => {
+                let Some(p) = permit.take() else { continue };
                 let closed = matches!(msg, StreamMsg::Closed(_));
-                if tx.send(Msg::Stream { pane: pane.clone(), attempt, msg }).is_err() || closed {
+                let credit = if let StreamMsg::Data(b) = &msg { b.len() } else { 0 };
+                p.send(StreamOut { pane: pane.clone(), attempt, msg });
+                if credit > 0 {
+                    stream.credit(credit).await;
+                }
+                if closed {
                     return;
                 }
             }
@@ -72,6 +98,7 @@ async fn pane_task(
                 Some(PaneCmd::Resize(c, r)) => { let _ = stream.resize(c, r).await; }
                 Some(PaneCmd::Focus(g)) => { let _ = stream.focus(g).await; }
                 Some(PaneCmd::Close) | None => {
+                    drop(permit);
                     stream.close().await;
                     return;
                 }
@@ -128,12 +155,17 @@ async fn event_loop(
     let mut connecting = false;
     let mut next_connect = Instant::now();
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+    let (out_tx, mut out_rx) = mpsc::channel::<StreamOut>(STREAM_QUEUE);
     // The task of each attached pane, by pane id.
     let mut handles: HashMap<String, Handle> = HashMap::new();
     // The pane that last got the focus event.
     let mut last_focus: Option<String> = None;
     let mut slow = interval(Duration::from_secs(1));
     let mut last_draw = Instant::now() - FRAME;
+    // The screen size, asked of the terminal at start and on a resize event only.
+    let mut size = term.size()?;
+    // Something visible may have changed since the last draw.
+    let mut dirty = true;
 
     loop {
         if client.is_none() && !connecting && Instant::now() >= next_connect {
@@ -151,12 +183,13 @@ async fn event_loop(
             });
         }
 
-        // Every pass recomputes where the panes go, so a resize, a layout
-        // change or the banner all end up as RESIZE of the streams.
-        let size = term.size()?;
+        // Cheap unless the screen, the banner or the sidebar changed; a layout
+        // change inside the app syncs the panes itself.
         app.set_screen(Rect::new(0, 0, size.width, size.height));
 
-        for action in std::mem::take(&mut app.actions) {
+        let actions = std::mem::take(&mut app.actions);
+        dirty |= !actions.is_empty();
+        for action in actions {
             match action {
                 Action::Detach(pane) => {
                     if let Some(h) = handles.remove(&pane) {
@@ -234,14 +267,16 @@ async fn event_loop(
         // streams fast. Drawing after every chunk can't keep up when output
         // floods in (slow consoles, ConPTY on Windows): the screen then lags
         // seconds behind and shows old frames mixed with new ones.
-        if rx.is_empty() || last_draw.elapsed() >= FRAME {
+        if dirty && ((rx.is_empty() && out_rx.is_empty()) || last_draw.elapsed() >= FRAME) {
             term.draw(|f| ws_ui::draw(f, &app))?;
             last_draw = Instant::now();
+            dirty = false;
         }
 
         tokio::select! {
             ev = keys.next() => match ev {
                 Some(Ok(TermEvent::Key(k))) if keys::is_input(k.kind) => {
+                    dirty = true;
                     if let Some(out) = app.on_key(k) {
                         let bytes = match out {
                             Out::Key(k) => keys::encode(k, app.focused_app_cursor()),
@@ -253,6 +288,7 @@ async fn event_loop(
                     }
                 }
                 Some(Ok(TermEvent::Paste(text))) => {
+                    dirty = true;
                     if let Some(text) = app.on_paste(&text) {
                         let bytes = if app.focused_bracketed_paste() {
                             format!("\x1b[200~{text}\x1b[201~")
@@ -263,20 +299,26 @@ async fn event_loop(
                     }
                 }
                 Some(Ok(TermEvent::Mouse(m))) => {
+                    // A plain pointer move changes nothing we draw.
+                    dirty |= !matches!(m.kind, crossterm::event::MouseEventKind::Moved);
                     if let Some((pane, bytes)) = app.on_mouse(m)
                         && let Some(h) = handles.get(&pane)
                     {
                         let _ = h.cmd.send(PaneCmd::Input(bytes));
                     }
                 }
-                // The next pass round the loop recomputes every pane's size.
-                Some(Ok(TermEvent::Resize(_, _))) => {}
+                // The next pass lays the panes out for the new size.
+                Some(Ok(TermEvent::Resize(_, _))) => {
+                    size = term.size()?;
+                    dirty = true;
+                }
                 Some(Ok(_)) => {}
                 Some(Err(e)) => return Err(e.into()),
                 None => break,
             },
             msg = watch.recv() => {
                 let Some(msg) = msg else { break };
+                dirty = true;
                 if matches!(msg, WatchMsg::Disconnected { .. }) {
                     client = None;
                 }
@@ -284,7 +326,7 @@ async fn event_loop(
                     notify::alert(&a.what, &a.title, &a.body);
                 }
             }
-            Some(msg) = rx.recv() => match msg {
+            Some(msg) = rx.recv() => { dirty = true; match msg {
                 Msg::Connected(Ok((c, _name))) => {
                     connecting = false;
                     let (c2, tx) = (c.clone(), tx.clone());
@@ -311,7 +353,7 @@ async fn event_loop(
                         let (cmd, cmds) = mpsc::unbounded_channel();
                         // The focus event of a pane that was attached just now.
                         let _ = cmd.send(PaneCmd::Focus(app.focused_pane().as_deref() == Some(id.as_str())));
-                        tokio::spawn(pane_task(id.clone(), attempt, *stream, cmds, tx.clone()));
+                        tokio::spawn(pane_task(id.clone(), attempt, *stream, cmds, out_tx.clone()));
                         handles.insert(id, Handle { attempt, cmd });
                     }
                     // The person moved on meanwhile.
@@ -322,16 +364,23 @@ async fn event_loop(
                         app.on_opened(&id, attempt, Err(e));
                     }
                 },
-                Msg::Stream { pane: id, attempt, msg } => {
-                    if handles.get(&id).is_some_and(|h| h.attempt == attempt) {
-                        if matches!(msg, StreamMsg::Closed(_)) {
-                            handles.remove(&id);
-                        }
-                        app.on_stream(&id, msg);
+            } }
+            Some(first) = out_rx.recv() => {
+                on_stream_out(&mut app, &mut handles, first);
+                // Several chunks per pass: a full pass (actions, draw check) per chunk is wasted work under a flood.
+                for _ in 0..STREAM_BATCH {
+                    if last_draw.elapsed() >= FRAME {
+                        break;
                     }
+                    let Ok(next) = out_rx.try_recv() else { break };
+                    on_stream_out(&mut app, &mut handles, next);
                 }
-            },
-            _ = slow.tick() => app.on_tick(), // also lets a message in the bottom bar expire
+                dirty = true;
+            }
+            _ = slow.tick() => {
+                app.on_tick(); // also lets a message in the bottom bar expire
+                dirty = true;
+            }
         }
         if app.quit {
             break;
@@ -348,6 +397,20 @@ async fn event_loop(
     }
     tokio::time::sleep(Duration::from_millis(350)).await;
     Ok(())
+}
+
+/// Most chunks taken off the stream queue in one pass of the loop.
+const STREAM_BATCH: usize = 32;
+
+/// A pane's output reaches its screen (if the pane's task is still the current one).
+fn on_stream_out(app: &mut WsApp, handles: &mut HashMap<String, Handle>, o: StreamOut) {
+    let StreamOut { pane, attempt, msg } = o;
+    if handles.get(&pane).is_some_and(|h| h.attempt == attempt) {
+        if matches!(msg, StreamMsg::Closed(_)) {
+            handles.remove(&pane);
+        }
+        app.on_stream(&pane, msg);
+    }
 }
 
 /// Type into the focused pane's program.

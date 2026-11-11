@@ -66,14 +66,23 @@ pub enum Layout {
 impl Layout {
     /// Every pane, left to right, top to bottom.
     pub fn panes(&self) -> Vec<&Pane> {
+        let mut out = Vec::new();
+        self.collect_panes(&mut out);
+        out
+    }
+
+    fn collect_panes<'a>(&'a self, out: &mut Vec<&'a Pane>) {
         match self {
-            Layout::Pane(p) => vec![p],
-            Layout::Split { children, .. } => children.iter().flat_map(|c| c.panes()).collect(),
+            Layout::Pane(p) => out.push(p),
+            Layout::Split { children, .. } => children.iter().for_each(|c| c.collect_panes(out)),
         }
     }
 
     pub fn find(&self, id: &str) -> Option<&Pane> {
-        self.panes().into_iter().find(|p| p.id == id)
+        match self {
+            Layout::Pane(p) => (p.id == id).then_some(p),
+            Layout::Split { children, .. } => children.iter().find_map(|c| c.find(id)),
+        }
     }
 
     fn find_mut(&mut self, id: &str) -> Option<&mut Pane> {
@@ -151,7 +160,7 @@ impl WsDoc {
         if v.is_null() {
             return WsDoc::default();
         }
-        serde_json::from_value(v.clone()).unwrap_or_else(|e| {
+        WsDoc::deserialize(v).unwrap_or_else(|e| {
             tracing::warn!("doc {DOC_NAME} unreadable, starting empty: {e}");
             WsDoc::default()
         })
