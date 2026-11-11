@@ -272,7 +272,12 @@ enum Drag {
     Border { tab: String, border: Border, grab: i32, moved: Option<Vec<u16>> },
 }
 
-/// One pane of the active tab: its stream's screen, or why it has none.
+/// One pane: its stream's screen, or why it has none. The panes of the
+/// active tab have one, and so does every pane that was shown before and
+/// still runs: it stays attached while another tab or workspace is on
+/// screen, because a terminal nobody is attached to goes back to the core's
+/// own size (200x120), and what its program prints meanwhile is laid out for
+/// that size, not for the pane.
 pub struct Slot {
     pub attempt: u64,
     /// Present once attached.
@@ -284,7 +289,26 @@ pub struct Slot {
     pub size: (u16, u16),
     /// The attach stream closed (as opposed to a pane that was never running).
     pub lost: bool,
+    /// The pane was resized: take a fresh picture from the core at this time.
+    resync_at: Option<Instant>,
+    /// The attempt of a fresh attach under way; the view stays up meanwhile.
+    resync: Option<u64>,
+    /// The screen of that fresh attach, shown from its first output on.
+    pending: Option<PaneView>,
+    /// In the active tab at the last sync.
+    shown: bool,
 }
+
+impl Slot {
+    /// Attached to a program that still runs.
+    fn live(&self) -> bool {
+        !self.lost && self.view.as_ref().is_some_and(|v| v.ended.is_none())
+    }
+}
+
+/// How long a pane's size has to hold still before its screen is taken
+/// again from the core (a border drag resizes many times).
+const RESYNC_DELAY: Duration = Duration::from_millis(150);
 
 /// A short error in the bottom bar.
 struct Flash {
@@ -790,11 +814,28 @@ impl WsApp {
         if self.zoom.as_ref().is_some_and(|z| *z != tab) {
             self.zoom = None;
         }
-        let mut gone: Vec<String> = self.slots.keys().filter(|id| !panes.contains(id)).cloned().collect();
+        // Off screen, a pane keeps its stream while its program runs (see
+        // `Slot`); one that never attached, failed or ended starts over when
+        // it is shown again.
+        let mut gone: Vec<String> = self
+            .slots
+            .iter()
+            .filter(|(id, s)| !panes.contains(id) && !(s.live() && self.doc.has_pane(id)))
+            .map(|(id, _)| id.clone())
+            .collect();
         gone.sort();
         for id in gone {
             self.slots.remove(&id);
             self.actions.push(Action::Detach(id));
+        }
+        for (id, slot) in &mut self.slots {
+            let shown = panes.contains(id);
+            // Back on screen: take the terminal's own picture again, in
+            // case ours drifted while nobody looked.
+            if shown && !slot.shown && slot.live() {
+                slot.resync_at = Some(Instant::now() + RESYNC_DELAY);
+            }
+            slot.shown = shown;
         }
         let rects: HashMap<String, Rect> = self.pane_rects().into_iter().collect();
         for id in &panes {
@@ -811,6 +852,13 @@ impl WsApp {
             {
                 slot.size = size;
                 view.resize(size.0, size.1);
+                if let Some(next) = &mut slot.pending {
+                    next.resize(size.0, size.1);
+                }
+                // Our screen and the terminal's now differ: the terminal
+                // rewraps long lines and brings history back when it grows,
+                // ours only cuts and pads. Take the real one once this settles.
+                slot.resync_at = Some(Instant::now() + RESYNC_DELAY);
                 self.actions.push(Action::Resize { pane: id.clone(), cols: size.0, rows: size.1 });
                 if view.parser.screen().in_band_resize() {
                     self.actions.push(Action::SizeReport { pane: id.clone(), cols: size.0, rows: size.1 });
@@ -818,6 +866,29 @@ impl WsApp {
             }
         }
         self.restore_hidden();
+    }
+
+    /// When the next resized pane wants its screen taken again.
+    pub fn next_resync(&self) -> Option<Instant> {
+        self.slots.values().filter_map(|s| s.resync_at).min()
+    }
+
+    /// Attach again to the panes whose resize has settled. The pane keeps
+    /// showing its old stream until the new one is open, then swaps; the
+    /// first thing a new stream sends is the terminal's real screen.
+    pub fn resync_due(&mut self, now: Instant) {
+        let mut due: Vec<String> =
+            self.slots.iter().filter(|(_, s)| s.resync_at.is_some_and(|t| t <= now)).map(|(id, _)| id.clone()).collect();
+        due.sort();
+        for pane in due {
+            let Some(slot) = self.slots.get_mut(&pane) else { continue };
+            slot.resync_at = None;
+            let Some(addr) = slot.view.as_ref().filter(|v| v.ended.is_none()).map(|v| v.addr.clone()) else { continue };
+            self.next_attempt += 1;
+            slot.resync = Some(self.next_attempt);
+            let (cols, rows) = slot.size;
+            self.actions.push(Action::Open { plan: Plan::Attach { pane, addr }, attempt: self.next_attempt, cols, rows });
+        }
     }
 
     /// The terminal started in this run for `pane` that the terminal list
@@ -940,7 +1011,8 @@ impl WsApp {
         let (cols, rows) = self.size_of(pane);
         self.next_attempt += 1;
         let attempt = self.next_attempt;
-        let mut slot = Slot { attempt, view: None, error: None, idle: false, size: (cols, rows), lost: false };
+        let mut slot =
+            Slot { attempt, view: None, error: None, idle: false, size: (cols, rows), lost: false, resync_at: None, resync: None, pending: None, shown: true };
         match &p {
             Plan::Ended { addr, why, .. } => {
                 let mut view = PaneView::new(addr.clone(), cols, rows);
@@ -980,7 +1052,10 @@ impl WsApp {
         }
         self.slots.remove(pane);
         self.actions.push(Action::Detach(pane.to_string()));
-        self.open_slot(pane, fresh, manual);
+        // Off screen it opens when it is shown, at the size it then has.
+        if self.on_screen(pane) {
+            self.open_slot(pane, fresh, manual);
+        }
     }
 
     /// An open attempt finished. False when the pane has moved on (another tab
@@ -989,6 +1064,21 @@ impl WsApp {
         let was_start = self.starting.remove(pane);
         if was_start && let Ok((addr, ..)) = &result {
             self.recent.insert(pane.to_string(), addr.clone());
+        }
+        // A fresh attach of a resized pane: swap it in, or keep the old stream.
+        if let Some(slot) = self.slots.get_mut(pane).filter(|s| s.resync == Some(attempt)) {
+            slot.resync = None;
+            let (Ok((addr, cols, rows)), false) = (result, slot.lost) else { return false };
+            slot.attempt = attempt;
+            // Shown from its first output on, so the pane never blinks empty.
+            slot.pending = Some(PaneView::new(addr, cols, rows));
+            if let Some(view) = &mut slot.view {
+                view.resize(cols, rows);
+            }
+            slot.size = (cols, rows);
+            // The layout may have changed again while we were attaching.
+            self.sync();
+            return true;
         }
         let Some(slot) = self.slots.get_mut(pane).filter(|s| s.attempt == attempt) else { return false };
         let ok = result.is_ok();
@@ -1005,10 +1095,29 @@ impl WsApp {
         ok
     }
 
-    /// Output or the end of a pane's stream.
-    pub fn on_stream(&mut self, pane: &str, msg: hc_client::StreamMsg) {
+    /// The pane is in the active tab.
+    fn on_screen(&self, pane: &str) -> bool {
+        self.active().is_some_and(|(_, t)| t.layout.find(pane).is_some())
+    }
+
+    /// Output or the end of a pane's stream. True when the pane is on screen
+    /// (there is something new to draw).
+    pub fn on_stream(&mut self, pane: &str, msg: hc_client::StreamMsg) -> bool {
         use hc_client::StreamMsg;
-        let Some(view) = self.slots.get_mut(pane).and_then(|s| s.view.as_mut()) else { return };
+        let on_screen = self.on_screen(pane);
+        let Some(slot) = self.slots.get_mut(pane) else { return false };
+        if matches!(msg, StreamMsg::Data(_))
+            && let Some(next) = slot.pending.take()
+        {
+            slot.view = Some(next);
+        }
+        if matches!(msg, StreamMsg::Closed(_)) && !on_screen {
+            // Nobody is looking: it starts over when it is shown again.
+            self.slots.remove(pane);
+            self.actions.push(Action::Detach(pane.to_string()));
+            return false;
+        }
+        let Some(view) = slot.view.as_mut() else { return false };
         match msg {
             StreamMsg::Data(bytes) => {
                 let before = view.parser.screen().in_band_resize();
@@ -1023,11 +1132,11 @@ impl WsApp {
             StreamMsg::Resize { .. } => {}
             StreamMsg::Closed(reason) => {
                 view.ended = Some(crate::widgets::describe_close(reason.as_ref()));
-                if let Some(slot) = self.slots.get_mut(pane) {
-                    slot.lost = true;
-                }
+                slot.lost = true;
+                slot.pending = None;
             }
         }
+        on_screen
     }
 
     /// The focused pane takes keys: attached and its program still runs.
@@ -2285,15 +2394,24 @@ mod tests {
         a.on_key(code(KeyCode::Enter));
         assert!(a.actions.is_empty());
 
-        // Another workspace closes the old stream first.
+        // Another workspace: the running pane of the old one keeps its stream.
         a.sel = "w2".into();
         a.focus = Focus::Sidebar;
         a.on_key(code(KeyCode::Enter));
         assert_eq!(a.open.as_deref(), Some("w2"));
-        assert!(matches!(&a.actions[..], [Action::Detach(p), Action::Open { .. }] if p == "n-w1"));
-        assert!(a.slots.contains_key("n-w2") && !a.slots.contains_key("n-w1"));
-        // A late attach for w1 is refused (so the caller closes it).
-        assert!(!a.on_opened("n-w1", attempt, Ok(("t1".into(), 98, 26))));
+        assert!(matches!(&a.actions[..], [Action::Open { plan, .. }] if plan.pane() == "n-w2"), "{:?}", a.actions);
+        assert!(a.slots.contains_key("n-w2") && a.slots["n-w1"].view.is_some());
+
+        // Back while w2 is still opening: that one is dropped, and a late
+        // attach for it is refused (so the caller closes it).
+        let opening = a.slots["n-w2"].attempt;
+        a.actions.clear();
+        a.sel = "w1".into();
+        a.focus = Focus::Sidebar;
+        a.on_key(code(KeyCode::Enter));
+        assert!(matches!(&a.actions[..], [Action::Detach(p)] if p == "n-w2"), "{:?}", a.actions);
+        assert!(!a.slots.contains_key("n-w2"));
+        assert!(!a.on_opened("n-w2", opening, Ok(("t2".into(), 98, 26))));
     }
 
     #[test]
@@ -2811,7 +2929,7 @@ mod tests {
     }
 
     #[test]
-    fn switching_tabs_detaches_and_reattaches_the_same_terminals() {
+    fn switching_tabs_keeps_the_streams_of_running_panes() {
         let mut a = three_panes();
         let first: Vec<String> = a.active().unwrap().1.layout.panes().iter().map(|p| p.id.clone()).collect();
         // The loop records started terminals in the doc; do the same here.
@@ -2821,26 +2939,68 @@ mod tests {
             a.set.terminals.insert(format!("t-{p}"), terminal(&format!("t-{p}"), true));
         }
         a.on_doc(doc);
+        // The splits resized the panes; that resync is not the point here.
+        a.resync_due(Instant::now() + Duration::from_secs(1));
         a.actions.clear();
+        let sizes: Vec<(u16, u16)> = first.iter().map(|p| a.slots[p].size).collect();
         pk(&mut a, 't');
         commit(&mut a);
-        let mut detached: Vec<String> = a.actions.iter().filter_map(|x| if let Action::Detach(p) = x { Some(p.clone()) } else { None }).collect();
-        detached.sort();
-        let mut want = first.clone();
-        want.sort();
-        assert_eq!(detached, want, "all three old panes close their streams");
+        // A detached terminal goes back to the core's own size, and its
+        // program then prints for that size: the hidden panes stay attached.
+        assert!(!a.actions.iter().any(|x| matches!(x, Action::Detach(_) | Action::Resize { .. })), "{:?}", a.actions);
         let o = opens(&mut a);
         assert!(matches!(&o[..], [Plan::Start { .. }]), "the new tab starts a shell");
         attach_pending(&mut a);
+        // Their output still reaches their screens, and asks for no redraw.
+        assert!(!a.on_stream(&first[0], hc_client::StreamMsg::Data(b"while hidden".to_vec())));
+        assert!(a.next_resync().is_none());
 
-        // Back to tab 1: all three attach to the recorded terminals.
+        // Back to tab 1: nothing to open, the same streams and sizes; each
+        // pane takes a fresh picture from the core once.
         pk(&mut a, '1');
-        let o = opens(&mut a);
-        let mut addrs: Vec<String> = o.iter().map(|p| match p { Plan::Attach { addr, .. } => addr.clone(), other => panic!("{other:?}") }).collect();
-        addrs.sort();
-        let mut want: Vec<String> = first.iter().map(|p| format!("t-{p}")).collect();
+        assert!(opens(&mut a).is_empty());
+        assert_eq!(first.iter().map(|p| a.slots[p].size).collect::<Vec<_>>(), sizes);
+        assert!(a.slots[&first[0]].view.as_ref().unwrap().parser.screen().contents().contains("while hidden"));
+        a.actions.clear();
+        a.resync_due(a.next_resync().expect("a fresh picture is planned") + Duration::from_secs(1));
+        let mut again: Vec<String> = opens(&mut a).iter().map(|p| p.pane().to_string()).collect();
+        again.sort();
+        let mut want = first.clone();
         want.sort();
-        assert_eq!(addrs, want);
+        assert_eq!(again, want);
+    }
+
+    #[test]
+    fn a_hidden_pane_that_ends_or_leaves_the_document_lets_go_of_its_stream() {
+        let mut a = three_panes();
+        let first: Vec<String> = a.active().unwrap().1.layout.panes().iter().map(|p| p.id.clone()).collect();
+        let mut doc = a.doc.clone();
+        for p in &first {
+            apply(&mut doc, &WsOp::SetTerminal { pane: p.clone(), terminal: Some(format!("t-{p}")) }).unwrap();
+            a.set.terminals.insert(format!("t-{p}"), terminal(&format!("t-{p}"), true));
+        }
+        a.on_doc(doc);
+        pk(&mut a, 't');
+        commit(&mut a);
+        attach_pending(&mut a);
+
+        // Its program ends while nobody looks: it starts over when shown.
+        assert!(!a.on_stream(&first[0], hc_client::StreamMsg::Closed(None)));
+        assert!(!a.slots.contains_key(&first[0]));
+        assert!(matches!(&a.actions[..], [Action::Detach(p)] if *p == first[0]));
+
+        // Its pane is closed from elsewhere (the CLI): the stream goes too.
+        a.actions.clear();
+        let mut doc = a.doc.clone();
+        apply(&mut doc, &WsOp::ClosePane { pane: first[1].clone() }).unwrap();
+        a.on_doc(doc);
+        assert!(!a.slots.contains_key(&first[1]) && a.slots.contains_key(&first[2]));
+        assert!(a.actions.iter().any(|x| matches!(x, Action::Detach(p) if *p == first[1])));
+
+        // Back on the first tab the ended one opens again.
+        a.actions.clear();
+        pk(&mut a, '1');
+        assert!(opens(&mut a).iter().any(|p| p.pane() == first[0]));
     }
 
     #[test]
@@ -2856,10 +3016,10 @@ mod tests {
         a.set.terminals.insert("t1".into(), terminal("t1", false));
         // t2 is not known at all.
         a.on_doc(doc);
-        // Leave the workspace and come back.
-        a.open_workspace("w2");
-        attach_pending(&mut a);
-        a.open_workspace("w1");
+        // A fresh look at the tab, as when Hiero starts.
+        a.slots.clear();
+        a.actions.clear();
+        a.sync();
         let o = opens(&mut a);
         // The ended pane needs no stream: it shows why it ended.
         assert_eq!(o.len(), 2);
@@ -3411,6 +3571,48 @@ mod tests {
         pk(&mut a, 'b');
         pk(&mut a, 'b');
         assert!(!a.sidebar_hidden);
+    }
+
+    #[test]
+    fn a_resized_pane_takes_its_screen_again_and_keeps_showing_meanwhile() {
+        let mut a = app();
+        open_attached(&mut a, "w1");
+        a.focus = Focus::Sidebar;
+        let first = a.slots["n-w1"].attempt;
+        a.on_stream("n-w1", hc_client::StreamMsg::Data(b"old picture".to_vec()));
+        assert!(a.next_resync().is_none());
+
+        pk(&mut a, 'b'); // hides the sidebar: the pane grows
+        let size = a.slots["n-w1"].size;
+        let at = a.next_resync().expect("a resync is planned");
+        a.actions.clear();
+        a.resync_due(at - Duration::from_millis(1));
+        assert!(a.actions.is_empty(), "not before the size has held still");
+        a.resync_due(at);
+        let attempt = match a.actions.as_slice() {
+            [Action::Open { plan: Plan::Attach { pane, .. }, attempt, cols, rows }] if pane == "n-w1" && (*cols, *rows) == size => *attempt,
+            other => panic!("{other:?}"),
+        };
+        assert!(attempt != first && a.next_resync().is_none());
+        // Until the new stream is open the old one keeps the pane.
+        let text = |a: &WsApp| a.slots["n-w1"].view.as_ref().unwrap().parser.screen().contents();
+        assert_eq!((a.slots["n-w1"].attempt, text(&a).trim()), (first, "old picture"));
+
+        // The new stream is open: its screen takes over with its first output.
+        assert!(a.on_opened("n-w1", attempt, Ok(("t-n-w1".into(), size.0, size.1))));
+        assert_eq!((a.slots["n-w1"].attempt, text(&a).trim()), (attempt, "old picture"), "no empty pane in between");
+        a.on_stream("n-w1", hc_client::StreamMsg::Data(b"real".to_vec()));
+        assert_eq!(text(&a).trim(), "real");
+
+        // A resync that fails, or whose pane ended meanwhile, changes nothing.
+        pk(&mut a, 'w');
+        a.resync_due(a.next_resync().unwrap());
+        let Some(Action::Open { attempt: failed, .. }) = a.actions.last() else { panic!() };
+        let failed = *failed;
+        a.on_stream("n-w1", hc_client::StreamMsg::Data(b"kept".to_vec()));
+        assert!(!a.on_opened("n-w1", failed, Err("no".into())));
+        let slot = &a.slots["n-w1"];
+        assert!(slot.error.is_none() && slot.attempt == attempt && text(&a).contains("kept"));
     }
 
     #[test]

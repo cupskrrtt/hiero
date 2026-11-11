@@ -285,8 +285,11 @@ Projects and workspaces are named exactly; folders must exist.
 | 8 | No prebuilt binaries and no AUR entry; the PKGBUILD builds a local checkout. | Install from source. |
 
 Fixed recently: neovim's left/right-margin scrolling (the main buffer beside a dap-ui sidebar used
-to wipe the sidebar) — Hiero carries a vt100 fork that supports margins; and a pane streaming fast
-output no longer makes the screen fall behind.
+to wipe the sidebar) — Hiero carries a vt100 fork that supports margins; a pane streaming fast
+output no longer makes the screen fall behind; a resized pane takes its screen again from
+herdr-core (a pane that grew used to show its text on the wrong rows); and panes stay attached
+while another tab or workspace is shown, so their programs keep the pane's size instead of
+printing for herdr-core's 200x120.
 
 ## Development
 

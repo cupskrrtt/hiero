@@ -56,7 +56,8 @@ struct StreamOut {
 /// Chunks of pane output the loop has not consumed yet, over all panes. A
 /// chunk is only credited back to the core once it is in here, so a program
 /// that floods faster than we parse and draw is held back by the core's
-/// flow control instead of piling up in memory.
+/// flow control instead of piling up in memory. (Each pane's task may hold
+/// one more chunk while it waits for room.)
 const STREAM_QUEUE: usize = 64;
 
 /// One task per attached pane owns its stream (`next` needs `&mut`) and
@@ -65,7 +66,9 @@ const STREAM_QUEUE: usize = 64;
 /// ends when the stream closes or the loop says so.
 ///
 /// Every branch future is cancel-safe (`reserve`, `next`, `recv`); every
-/// socket write happens in a branch body and runs to completion.
+/// socket write happens in a branch body and runs to completion. A task
+/// asks for room in the queue only while it holds a chunk: panes that are
+/// attached but quiet (hidden tabs) must not use the queue up.
 async fn pane_task(
     pane: String,
     attempt: u64,
@@ -73,19 +76,16 @@ async fn pane_task(
     mut cmds: mpsc::UnboundedReceiver<PaneCmd>,
     out: mpsc::Sender<StreamOut>,
 ) {
-    // Room for one chunk, reserved before taking it off the stream.
-    let mut permit = None;
+    // A chunk taken off the stream that waits for room in the queue.
+    let mut held: Option<StreamMsg> = None;
     loop {
         tokio::select! {
-            room = out.reserve(), if permit.is_none() => match room {
-                Ok(p) => permit = Some(p),
-                Err(_) => return,
-            },
-            msg = stream.next(), if permit.is_some() => {
-                let Some(p) = permit.take() else { continue };
+            msg = stream.next(), if held.is_none() => held = Some(msg),
+            room = out.reserve(), if held.is_some() => {
+                let (Ok(room), Some(msg)) = (room, held.take()) else { return };
                 let closed = matches!(msg, StreamMsg::Closed(_));
                 let credit = if let StreamMsg::Data(b) = &msg { b.len() } else { 0 };
-                p.send(StreamOut { pane: pane.clone(), attempt, msg });
+                room.send(StreamOut { pane: pane.clone(), attempt, msg });
                 if credit > 0 {
                     stream.credit(credit).await;
                 }
@@ -98,7 +98,6 @@ async fn pane_task(
                 Some(PaneCmd::Resize(c, r)) => { let _ = stream.resize(c, r).await; }
                 Some(PaneCmd::Focus(g)) => { let _ = stream.focus(g).await; }
                 Some(PaneCmd::Close) | None => {
-                    drop(permit);
                     stream.close().await;
                     return;
                 }
@@ -273,7 +272,12 @@ async fn event_loop(
             dirty = false;
         }
 
+        let resync = app.next_resync().map(Instant::from_std);
         tokio::select! {
+            // A resized pane has held still: take its screen again.
+            _ = tokio::time::sleep_until(resync.unwrap_or_else(Instant::now)), if resync.is_some() => {
+                app.resync_due(std::time::Instant::now());
+            }
             ev = keys.next() => match ev {
                 Some(Ok(TermEvent::Key(k))) if keys::is_input(k.kind) => {
                     dirty = true;
@@ -366,16 +370,16 @@ async fn event_loop(
                 },
             } }
             Some(first) = out_rx.recv() => {
-                on_stream_out(&mut app, &mut handles, first);
+                // Output of a pane that is not on screen changes nothing we draw.
+                dirty |= on_stream_out(&mut app, &mut handles, first);
                 // Several chunks per pass: a full pass (actions, draw check) per chunk is wasted work under a flood.
                 for _ in 0..STREAM_BATCH {
                     if last_draw.elapsed() >= FRAME {
                         break;
                     }
                     let Ok(next) = out_rx.try_recv() else { break };
-                    on_stream_out(&mut app, &mut handles, next);
+                    dirty |= on_stream_out(&mut app, &mut handles, next);
                 }
-                dirty = true;
             }
             _ = slow.tick() => {
                 app.on_tick(); // also lets a message in the bottom bar expire
@@ -402,15 +406,17 @@ async fn event_loop(
 /// Most chunks taken off the stream queue in one pass of the loop.
 const STREAM_BATCH: usize = 32;
 
-/// A pane's output reaches its screen (if the pane's task is still the current one).
-fn on_stream_out(app: &mut WsApp, handles: &mut HashMap<String, Handle>, o: StreamOut) {
+/// A pane's output reaches its screen (if the pane's task is still the
+/// current one). True when that changed something on screen.
+fn on_stream_out(app: &mut WsApp, handles: &mut HashMap<String, Handle>, o: StreamOut) -> bool {
     let StreamOut { pane, attempt, msg } = o;
-    if handles.get(&pane).is_some_and(|h| h.attempt == attempt) {
-        if matches!(msg, StreamMsg::Closed(_)) {
-            handles.remove(&pane);
-        }
-        app.on_stream(&pane, msg);
+    if !handles.get(&pane).is_some_and(|h| h.attempt == attempt) {
+        return false;
     }
+    if matches!(msg, StreamMsg::Closed(_)) {
+        handles.remove(&pane);
+    }
+    app.on_stream(&pane, msg)
 }
 
 /// Type into the focused pane's program.

@@ -188,6 +188,11 @@ impl WsDoc {
         })
     }
 
+    /// Whether some workspace still has this pane, on screen or hidden.
+    pub fn has_pane(&self, id: &str) -> bool {
+        self.all_workspaces().any(|w| w.all_panes().iter().any(|p| p.id == id))
+    }
+
     fn all_workspaces(&self) -> impl Iterator<Item = &Workspace> {
         self.projects.iter().flat_map(|p| p.workspaces.iter())
     }
