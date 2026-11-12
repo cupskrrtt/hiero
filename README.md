@@ -40,7 +40,7 @@ You need herdr-core installed and running (`hc server status`).
 cargo install --locked --git https://github.com/cupskrrtt/hiero hiero
 
 # a fixed release
-cargo install --locked --git https://github.com/cupskrrtt/hiero --tag v0.3.1 hiero
+cargo install --locked --git https://github.com/cupskrrtt/hiero --tag v0.3.2 hiero
 
 # from a checkout
 cargo install --locked --path crates/hiero
@@ -182,6 +182,12 @@ when its terminal is gone from herdr-core, or finished because the system stoppe
 (`server_stop`, `host_shutdown`, `holder_lost`, `stopped_by_restart`). If its program exited or you
 killed it, the pane shows `ended: …` and `Enter` starts a fresh one. Nothing starts twice.
 `restore = false` turns the automatic start off: those panes say "not running" until `Enter`.
+
+**Pane folders.** While Hiero runs it records the folder a shell pane's shell is in at its prompt
+(a `cd` counts; a program running in front of the shell, or nvim's `:cd`, doesn't), so a pane that
+starts again after a core restart or a reboot opens where you left it. A pane started with a
+command keeps the folder it started in. If the recorded folder was deleted, the pane starts in the
+workspace folder.
 
 **Core restart while Hiero is open.** A red banner shows while herdr-core is unreachable. When it's
 back, Hiero applies the same rule to every pane and says `core restarted — restored N panes`.

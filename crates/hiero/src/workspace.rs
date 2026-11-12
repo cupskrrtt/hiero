@@ -313,6 +313,10 @@ pub enum WsOp {
     /// Name a pane; `None` or blank brings back the automatic title.
     RenamePane { pane: String, name: Option<String> },
     SetTerminal { pane: String, terminal: Option<String> },
+    /// Where the pane's program is now, so a restart opens there again; `None`
+    /// is the workspace folder. A pane that is gone is skipped, not refused:
+    /// this comes from a background sync that can lose a race with a close.
+    SetCwd { pane: String, cwd: Option<String> },
     /// Put back a tab layout saved earlier (`hiero pane layout`). Refused when
     /// the tab has a pane the layout doesn't (one you added meanwhile). The
     /// panes keep what they have now (name, command, terminal); the
@@ -645,8 +649,44 @@ pub fn apply(doc: &mut WsDoc, op: &WsOp) -> Result<(), String> {
                 p.terminal = terminal.clone();
             }
         }
+        WsOp::SetCwd { pane, cwd } => {
+            let tabs = doc.projects.iter_mut().flat_map(|p| p.workspaces.iter_mut()).flat_map(|w| w.tabs.iter_mut());
+            for t in tabs {
+                if let Some(p) = t.layout.find_mut(pane).or_else(|| t.hidden.iter_mut().find(|p| &p.id == pane)) {
+                    p.cwd = cwd.clone();
+                    break;
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// One `SetCwd` per shell pane whose shell, back at its prompt, sits somewhere
+/// other than the folder the document has for it, so a restarted core starts
+/// the pane where it was left. Only the shell itself counts (the foreground
+/// process is the terminal's own): while a program runs in front, or `:cd`s
+/// inside nvim, the folder stays where the shell was. Panes started with a
+/// command keep the folder they started in. Remote terminals (`machine/t7`)
+/// are skipped: their folders are on another machine.
+pub fn cwd_ops(doc: &WsDoc, set: &TerminalSet) -> Vec<WsOp> {
+    let mut ops = vec![];
+    for w in doc.all_workspaces() {
+        for p in w.all_panes().into_iter().filter(|p| p.command.is_none()) {
+            let Some(addr) = p.terminal.as_deref().filter(|a| !a.contains('/')) else { continue };
+            let Some(t) = set.get(addr).filter(|t| t.is_live()) else { continue };
+            let Some(fg) = t.foreground.as_ref() else { continue };
+            if t.pid.is_none() || u32::try_from(fg.pid).ok() != t.pid || fg.cwd.is_empty() {
+                continue;
+            }
+            let now = fg.cwd.as_str();
+            let cwd = (now != w.folder).then(|| now.to_string());
+            if cwd != p.cwd {
+                ops.push(WsOp::SetCwd { pane: p.id.clone(), cwd });
+            }
+        }
+    }
+    ops
 }
 
 /// A workspace never has zero tabs, so the last one can't go.
@@ -1687,6 +1727,56 @@ mod tests {
         assert!(v.to_string().contains("\"name\":\"api\""));
         let back: WsDoc = serde_json::from_value(v).unwrap();
         assert_eq!(back.pane("n").unwrap().2.name.as_deref(), Some("api"));
+    }
+
+    /// A live shell (pid 1) at its prompt in `cwd`; `None`: nothing reported yet.
+    fn live_in(addr: &str, cwd: Option<&str>) -> hc_client::Terminal {
+        let fg = cwd.map(|c| json!({ "pid": 1, "name": "zsh", "cwd": c }));
+        serde_json::from_value(json!({ "address": addr, "state": "live", "pid": 1, "cwd": "/r/f", "foreground": fg })).unwrap()
+    }
+
+    #[test]
+    fn cwd_is_the_shells_not_a_program_in_front_and_never_for_command_panes() {
+        let mut d = base();
+        ok(&mut d, split_op("w1-p", Dir::Horizontal, "b"));
+        ok(&mut d, WsOp::SetTerminal { pane: s("w1-p"), terminal: Some(s("t1")) });
+        ok(&mut d, WsOp::SetTerminal { pane: s("b"), terminal: Some(s("t2")) });
+        ok(&mut d, WsOp::SetCommand { pane: s("b"), command: Some(s("nvim .")) });
+        // nvim (pid 7) runs in front of the shell and has :cd'd elsewhere.
+        let mut in_front = live_in("t1", None);
+        in_front.foreground = Some(hc_client::Foreground { pid: 7, name: "nvim".into(), argv: vec![], cwd: "/r/f/deep".into() });
+        let mut set = TerminalSet::new();
+        set.reset(1, vec![in_front, live_in("t2", Some("/r/f/sub"))]);
+        assert!(cwd_ops(&d, &set).is_empty());
+    }
+
+    #[test]
+    fn cwd_follows_the_live_program_and_falls_back_to_the_folder() {
+        let mut d = base();
+        ok(&mut d, split_op("w1-p", Dir::Horizontal, "b"));
+        ok(&mut d, split_op("w1-p", Dir::Vertical, "c"));
+        ok(&mut d, WsOp::SetTerminal { pane: s("w1-p"), terminal: Some(s("t1")) });
+        ok(&mut d, WsOp::SetTerminal { pane: s("b"), terminal: Some(s("t2")) });
+        ok(&mut d, WsOp::SetTerminal { pane: s("c"), terminal: Some(s("m/t3")) });
+        let mut set = TerminalSet::new();
+        set.reset(1, vec![live_in("t1", Some("/r/f/src")), live_in("t2", Some("/r/f")), live_in("m/t3", Some("/far"))]);
+        // t2 sits in the folder (nothing to record), m/t3 is remote.
+        let ops = cwd_ops(&d, &set);
+        assert_eq!(ops, vec![WsOp::SetCwd { pane: s("w1-p"), cwd: Some(s("/r/f/src")) }]);
+        for op in &ops {
+            ok(&mut d, op.clone());
+        }
+        assert_eq!(d.pane("w1-p").unwrap().2.cwd.as_deref(), Some("/r/f/src"));
+        assert!(cwd_ops(&d, &set).is_empty(), "already recorded");
+        // Back in the folder: back to None. No foreground yet: left alone.
+        set.reset(2, vec![live_in("t1", Some("/r/f")), live_in("t2", None)]);
+        assert_eq!(cwd_ops(&d, &set), vec![WsOp::SetCwd { pane: s("w1-p"), cwd: None }]);
+        // A pane that is gone is skipped, not an error; hidden panes count.
+        ok(&mut d, WsOp::SetCwd { pane: s("zz"), cwd: Some(s("/x")) });
+        ok(&mut d, WsOp::HideOthers { pane: s("c") });
+        ok(&mut d, WsOp::SetCwd { pane: s("b"), cwd: Some(s("/x")) });
+        let hidden = &d.tab("w1-t").unwrap().1.hidden;
+        assert_eq!(hidden.iter().find(|p| p.id == "b").and_then(|p| p.cwd.as_deref()), Some("/x"));
     }
 
     #[test]

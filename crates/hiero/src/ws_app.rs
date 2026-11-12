@@ -149,7 +149,10 @@ pub fn plan(doc: &WsDoc, set: &TerminalSet, ws_id: &str, pane_id: &str, fresh: b
             Fate::Missing => {}
         }
     }
-    let mut params = RunParams::new().cwd(pane.cwd.clone().unwrap_or_else(|| w.folder.clone()));
+    // The folder the pane was last in, unless it has been deleted since: then
+    // the workspace folder, so the pane still starts.
+    let cwd = pane.cwd.clone().filter(|c| std::path::Path::new(c).is_dir()).unwrap_or_else(|| w.folder.clone());
+    let mut params = RunParams::new().cwd(cwd);
     if let Some(cmd) = &pane.command {
         params = params.line(cmd.clone());
     }
@@ -765,7 +768,24 @@ impl WsApp {
         if self.client_up && self.disconnected.is_none() {
             self.recover_lost(false);
             self.sweep_orphans(Instant::now());
+            self.save_cwds();
         }
+    }
+
+    /// Record where each pane's program is now (`cd` in a shell), so that
+    /// after a core restart the pane starts in that folder again.
+    fn save_cwds(&mut self) {
+        if !self.synced || self.reconnected {
+            return;
+        }
+        let ops = workspace::cwd_ops(&self.doc, &self.set);
+        if ops.is_empty() {
+            return;
+        }
+        for op in &ops {
+            let _ = workspace::apply(&mut self.doc, op);
+        }
+        self.actions.push(Action::Update(ops));
     }
 
     /// End programs labelled with a pane that their (still existing) workspace
@@ -2821,6 +2841,19 @@ mod tests {
         let Some(Plan::Start { params, .. }) = plan(&a.doc, &a.set, "w2", "n-w2", false) else { panic!() };
         assert_eq!(params.line.as_deref(), Some("nvim ."));
         assert!(plan(&a.doc, &a.set, "nope", "n-w1", false).is_none());
+    }
+
+    #[test]
+    fn a_pane_starts_in_its_last_folder_or_the_workspace_folder_if_that_is_gone() {
+        let mut a = app();
+        let here = std::env::temp_dir().to_string_lossy().into_owned();
+        let gone = std::env::temp_dir().join("hiero-no-such-dir-4f1c").to_string_lossy().into_owned();
+        apply(&mut a.doc, &WsOp::SetCwd { pane: "n-w1".into(), cwd: Some(here.clone()) }).unwrap();
+        let Some(Plan::Start { params, .. }) = plan(&a.doc, &a.set, "w1", "n-w1", false) else { panic!() };
+        assert_eq!(params.cwd.as_deref(), Some(here.as_str()));
+        apply(&mut a.doc, &WsOp::SetCwd { pane: "n-w1".into(), cwd: Some(gone) }).unwrap();
+        let Some(Plan::Start { params, .. }) = plan(&a.doc, &a.set, "w1", "n-w1", false) else { panic!() };
+        assert_eq!(params.cwd.as_deref(), Some("/tmp"));
     }
 
     #[test]
