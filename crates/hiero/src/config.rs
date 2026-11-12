@@ -33,11 +33,14 @@ pub struct WorkspaceCfg {
     /// Clicks, wheel and border drags in the workspace. Off: the terminal
     /// keeps the mouse (plain drag selects text).
     pub mouse: bool,
+    /// Lines of history each pane keeps (and asks herdr-core for when it
+    /// attaches). 0 turns scrollback off.
+    pub scrollback: usize,
 }
 
 impl Default for WorkspaceCfg {
     fn default() -> Self {
-        WorkspaceCfg { prefix: "ctrl+b".into(), restore: true, mouse: true }
+        WorkspaceCfg { prefix: "ctrl+b".into(), restore: true, mouse: true, scrollback: 5000 }
     }
 }
 
@@ -188,6 +191,7 @@ pub const DEFAULT_TOML: &str = r#"# Hiero settings. Delete a line to get its def
 prefix = "ctrl+b"        # reaches Hiero's controls; ctrl+<letter> (not c, h, i, j, m) or ctrl+space
 restore = true           # start missing terminals of a workspace when it opens
 mouse = true             # clicks, wheel and border drags; hold Shift to select text instead
+scrollback = 5000        # lines of history per pane (ctrl+b [ to scroll); 0 turns it off
 
 [notify]
 bell = true
@@ -283,5 +287,8 @@ mod tests {
         assert!(toml::from_str::<Config>(DEFAULT_TOML).unwrap().workspace.mouse);
         let c: Config = toml::from_str("[workspace]\nmouse = false").unwrap();
         assert!(!c.workspace.mouse);
+        assert_eq!(toml::from_str::<Config>(DEFAULT_TOML).unwrap().workspace.scrollback, 5000);
+        let c: Config = toml::from_str("[workspace]\nscrollback = 0").unwrap();
+        assert_eq!(c.workspace.scrollback, 0);
     }
 }

@@ -220,6 +220,17 @@ fn draw_pane(f: &mut Frame, app: &WsApp, id: &str, r: Rect, is_focused: bool, in
     } else {
         Style::new().fg(Color::DarkGray)
     };
+    let copy = app.copy_of(id);
+    if let (Some(c), Some(v)) = (copy, view) {
+        let s = v.parser.screen();
+        let up = c.lines_up(s);
+        let what = if c.anchor.is_some() { "copy · selecting" } else { "copy" };
+        title.push(Span::styled(
+            format!(" {what} · {up}/{} up ", s.scrollback_len()),
+            Style::new().bg(Color::Yellow).fg(Color::Black).bold(),
+        ));
+        title.push(Span::raw(" "));
+    }
     if let Some(why) = ended {
         title.push(Span::styled(format!("· ended: {why} "), Style::new().fg(Color::Red)));
         color = Style::new().fg(Color::Red);
@@ -244,7 +255,10 @@ fn draw_pane(f: &mut Frame, app: &WsApp, id: &str, r: Rect, is_focused: bool, in
     f.render_widget(block, r);
 
     if let Some(view) = view {
-        draw_vt(f, &view.parser, inner, is_focused && in_workspace && ended.is_none());
+        draw_vt(f, &view.parser, inner, copy.is_none() && is_focused && in_workspace && ended.is_none());
+        if let Some(c) = copy {
+            draw_copy(f, c, view.parser.screen(), inner, in_workspace);
+        }
         return;
     }
     let text = match slot.and_then(|s| s.error.as_ref()) {
@@ -255,17 +269,53 @@ fn draw_pane(f: &mut Frame, app: &WsApp, id: &str, r: Rect, is_focused: bool, in
     f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
 }
 
+/// Copy mode over a pane: the selection reversed, the cursor on its cell.
+fn draw_copy(f: &mut Frame, c: &crate::copy::Copy, s: &vt100::Screen, inner: Rect, show_cursor: bool) {
+    let buf = f.buffer_mut();
+    for r in 0..inner.height {
+        let Some((from, to)) = c.selected(s, r) else { continue };
+        for col in from..=to.min(inner.width.saturating_sub(1)) {
+            if let Some(cell) = buf.cell_mut((inner.x + col, inner.y + r)) {
+                cell.set_style(Style::new().bg(Color::Rgb(70, 90, 140)).fg(Color::White));
+            }
+        }
+    }
+    if let Some((col, r)) = c.cursor_cell(s)
+        && col < inner.width
+        && r < inner.height
+    {
+        let pos = (inner.x + col, inner.y + r);
+        if let Some(cell) = buf.cell_mut(pos) {
+            cell.set_style(Style::new().bg(Color::Yellow).fg(Color::Black));
+        }
+        if show_cursor && c.prompt.is_none() {
+            f.set_cursor_position(pos);
+        }
+    }
+}
+
 fn draw_bottom(f: &mut Frame, app: &WsApp, area: Rect) {
     let label = app.prefix.label();
     let mut spans: Vec<Span> = Vec::new();
     if app.armed {
         spans.push(Span::styled(" prefix ", Style::new().bg(Color::Yellow).fg(Color::Black).bold()));
         spans.push(Span::raw(
-            " t/T tab · v/s split (V/S ask) · hjkl move · HJKL size · 1-9 [ ] tab · r/R rename tab/pane · x/X close · z zoom · w sidebar · b hide · < > size · ? help",
+            " t/T tab · v/s split (V/S ask) · hjkl move · HJKL size · 1-9 [ ] tab · c copy · r/R rename tab/pane · x/X close · z zoom · w sidebar · b hide · < > size · ? help",
         ));
+    } else if let Some(p) = app.copy.as_ref().and_then(|c| c.prompt.as_ref()) {
+        let [label, input] = Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).areas(area);
+        f.render_widget(Paragraph::new(if p.forward { " /" } else { " ?" }).bold(), label);
+        draw_input(f, input, &p.input, true);
+        return;
     } else if let Some((msg, error)) = app.current_flash() {
         let style = if error { Style::new().fg(Color::Red) } else { Style::new().fg(Color::Green) };
         spans.push(Span::styled(format!(" {msg}"), style));
+    } else if app.copy.is_some() {
+        spans.push(Span::styled(" copy ", Style::new().bg(Color::Yellow).fg(Color::Black).bold()));
+        spans.push(Span::styled(
+            " hjkl w b move · ^u ^d g G scroll · v/V select · y copy · / ? search · n N next · q quit",
+            Style::new().dim(),
+        ));
     } else if app.focus == Focus::Sidebar {
         spans.push(Span::styled(
             format!(" j/k move · enter open · a add · A project · r rename · D delete · J/K reorder · esc back · {label}"),
@@ -273,7 +323,7 @@ fn draw_bottom(f: &mut Frame, app: &WsApp, area: Rect) {
         ));
     } else {
         spans.push(Span::styled(format!(" {label}"), Style::new().bold()));
-        spans.push(Span::styled(" then  t tab · v s split · hjkl move · z zoom · ? help · q quit", Style::new().dim()));
+        spans.push(Span::styled(" then  t tab · v s split · hjkl move · z zoom · c copy · ? help · q quit", Style::new().dim()));
     }
     let right = app.attention().map(|(p, w)| Span::styled(format!("◐ {p} › {w} needs you "), Style::new().fg(Color::Red).bold()));
     let rw = right.as_ref().map(|s| s.width() as u16).unwrap_or(0);
@@ -317,6 +367,7 @@ pub fn help_lines(prefix: &str) -> Vec<Line<'static>> {
         Line::from("  R          rename the pane (empty: show what it runs)"),
         Line::from("  x / X      close the pane / the tab (ends its programs)"),
         Line::from("  z          zoom the pane to the whole area, again to undo"),
+        Line::from("  c, PgUp    copy mode: scroll back through the pane, select and copy"),
         Line::from("  w          sidebar / back to the workspace (shows a hidden sidebar)"),
         Line::from("  b          hide or show the sidebar"),
         Line::from("  < / >      narrower / wider sidebar"),
@@ -324,6 +375,17 @@ pub fn help_lines(prefix: &str) -> Vec<Line<'static>> {
         Line::from("  ?          this help        q   quit Hiero (terminals keep running)"),
         Line::from(format!("  {prefix}   send the prefix key itself to the program")),
         Line::from("  esc        cancel"),
+        Line::from(""),
+        Line::from("Copy mode (the wheel over a shell starts it too)".bold()),
+        Line::from("  h j k l    move the cursor    w b     next / previous word"),
+        Line::from("  0 ^ $      line start / first text / end      H M L   top / middle / bottom"),
+        Line::from("  ^u ^d      half a page        ^b ^f, PgUp PgDn   a page   ^y ^e  a line"),
+        Line::from("  g / G      oldest line / back to the bottom"),
+        Line::from("  v / V      select characters / whole lines (again: stop)"),
+        Line::from("  y, enter   copy the selection (or the line) and leave"),
+        Line::from("  / ?        search down / up (smart case)   n N   next / previous"),
+        Line::from("  esc        drop the selection, then leave   q   leave"),
+        Line::from("  mouse      click places the cursor, drag selects"),
         Line::from(""),
         Line::from("Sidebar".bold()),
         Line::from("  j k, ↑ ↓   move              enter   open workspace / fold project"),

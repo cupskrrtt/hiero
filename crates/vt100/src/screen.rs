@@ -198,6 +198,46 @@ impl Screen {
         self.grid().scrollback()
     }
 
+    /// The number of lines that have ever scrolled off the top of the screen
+    /// into the scrollback, including the ones dropped since because the
+    /// scrollback is full. It only grows while output arrives (a resize that
+    /// pulls lines back, or `CSI 3 J`, lowers it), so `lines_scrolled() -
+    /// scrollback_len() + i` names line `i` of [`line_text`](Self::line_text)
+    /// for as long as the line is kept.
+    #[must_use]
+    pub fn lines_scrolled(&self) -> usize {
+        self.grid().scrolled_total()
+    }
+
+    /// The lines of history plus the rows of the screen.
+    #[must_use]
+    pub fn line_count(&self) -> usize {
+        self.scrollback_len() + usize::from(self.size().0.get())
+    }
+
+    /// The text of columns `start..end` of line `i`, counting the history
+    /// first (0: the oldest line kept) and then the screen. Trailing blanks
+    /// are left out; `None` past the last line.
+    #[must_use]
+    pub fn line_text(&self, i: usize, start: u16, end: u16) -> Option<String> {
+        let row = self.grid().line(i)?;
+        let mut out = String::new();
+        row.write_contents(&mut out, start, end.saturating_sub(start), false);
+        Some(out)
+    }
+
+    /// The cell at column `col` of line `i` (as in [`line_text`](Self::line_text)).
+    #[must_use]
+    pub fn line_cell(&self, i: usize, col: u16) -> Option<&crate::Cell> {
+        self.grid().line(i)?.get(col)
+    }
+
+    /// Line `i` (as in [`line_text`](Self::line_text)) goes on in the next one.
+    #[must_use]
+    pub fn line_wrapped(&self, i: usize) -> bool {
+        self.grid().line(i).is_some_and(crate::row::Row::wrapped)
+    }
+
     /// Returns the text contents of the terminal.
     ///
     /// This will not include any formatting information, and will be in plain

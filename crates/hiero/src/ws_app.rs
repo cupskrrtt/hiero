@@ -3,6 +3,7 @@
 //! loop (`ws_tui`) carries out the [`Action`]s this asks for, so all of it
 //! can be tested.
 
+use crate::copy::{Copy, Step};
 use crate::notify::Alert;
 use crate::paths::{self, expand_home};
 use crate::widgets::{PaneView, TextInput};
@@ -98,6 +99,8 @@ pub enum Action {
     SizeReport { pane: String, cols: u16, rows: u16 },
     /// Kill these terminals and remove them from hc.
     Kill(Vec<String>),
+    /// Put this text on the system clipboard.
+    Clipboard(String),
     /// Start a pane's terminal in the background (no attach) and record it.
     Start { pane: String, params: RunParams },
 }
@@ -267,6 +270,8 @@ enum Drag {
     /// Started on a pane whose program takes mouse reports: the drag and the
     /// release go to it, wherever the pointer is.
     Pane(String),
+    /// Selecting with the pointer in a pane in copy mode.
+    Copy(String),
     /// A border being moved. The sizes are applied here as the pointer moves
     /// and sent to the document on release.
     Border { tab: String, border: Border, grab: i32, moved: Option<Vec<u16>> },
@@ -343,9 +348,13 @@ pub struct WsApp {
     orphans: HashMap<String, Instant>,
     /// `[workspace] restore`: start missing terminals without being asked.
     pub auto_restore: bool,
+    /// Lines of history per pane.
+    pub scrollback: usize,
     next_attempt: u64,
     /// The tab (id) whose focused pane fills the area. View only, not saved.
     pub zoom: Option<String>,
+    /// Copy mode, on the focused pane.
+    pub copy: Option<Copy>,
     /// Where the panes go (below the tabs bar).
     pub panes_area: Rect,
     /// The whole screen, to lay the panes out again when the sidebar changes.
@@ -396,8 +405,10 @@ impl WsApp {
             orphans: HashMap::new(),
             failed: HashSet::new(),
             auto_restore: true,
+            scrollback: 5000,
             next_attempt: 0,
             zoom: None,
+            copy: None,
             panes_area: ws_ui::areas(Rect::new(0, 0, 100, 30), false, ws_ui::SIDEBAR_W).panes,
             screen: Rect::new(0, 0, 100, 30),
             laid_out: None,
@@ -802,6 +813,11 @@ impl WsApp {
     /// runs, else start one), and resize the ones whose rectangle changed.
     /// Safe to call at any time; it only acts on differences.
     pub fn sync(&mut self) {
+        self.sync_panes();
+        self.check_copy();
+    }
+
+    fn sync_panes(&mut self) {
         // Before the first snapshot every terminal looks missing. After a
         // reconnect the same holds until the panes have been checked.
         if !self.synced || self.reconnected {
@@ -866,6 +882,82 @@ impl WsApp {
             }
         }
         self.restore_hidden();
+    }
+
+    // ---- copy mode ------------------------------------------------------------
+
+    /// Copy mode and the screen it works on.
+    fn copy_parts(&mut self) -> Option<(&mut Copy, &mut vt100::Screen)> {
+        let c = self.copy.as_mut()?;
+        let view = self.slots.get_mut(&c.pane)?.view.as_mut()?;
+        Some((c, view.parser.screen_mut()))
+    }
+
+    /// The copy mode of `pane` and its screen, for drawing.
+    pub fn copy_of(&self, pane: &str) -> Option<&Copy> {
+        self.copy.as_ref().filter(|c| c.pane == pane)
+    }
+
+    /// Start copy mode on `pane` (unless it already is). False when the pane
+    /// has no screen.
+    fn enter_copy(&mut self, pane: &str) -> bool {
+        if self.copy_of(pane).is_some() {
+            return true;
+        }
+        self.exit_copy();
+        let Some(slot) = self.slots.get_mut(pane) else { return false };
+        let (size, attempt) = (slot.size, slot.attempt);
+        let Some(view) = slot.view.as_mut() else { return false };
+        let mut c = Copy::new(pane.to_string(), size, attempt, view.parser.screen());
+        c.apply(view.parser.screen_mut());
+        self.copy = Some(c);
+        true
+    }
+
+    /// Leave copy mode, back to the live screen.
+    pub fn exit_copy(&mut self) {
+        let Some(c) = self.copy.take() else { return };
+        if let Some(view) = self.slots.get_mut(&c.pane).and_then(|s| s.view.as_mut()) {
+            view.parser.screen_mut().set_scrollback(0);
+        }
+    }
+
+    /// Copy mode lasts while its pane has the focus and keeps its size and stream.
+    fn check_copy(&mut self) {
+        let Some(c) = &self.copy else { return };
+        let keep = self.focus == Focus::Workspace
+            && self.focused_pane().as_deref() == Some(c.pane.as_str())
+            && self.slots.get(&c.pane).is_some_and(|s| s.view.is_some() && s.size == c.size && s.attempt == c.attempt);
+        if !keep {
+            self.exit_copy();
+        }
+    }
+
+    fn do_copy(&mut self, step: Step) {
+        match step {
+            Step::Stay => {}
+            Step::Exit => self.exit_copy(),
+            Step::Note(m) => self.flash_error(&m),
+            Step::Copy(text) => {
+                self.exit_copy();
+                if text.is_empty() {
+                    self.flash_error("nothing to copy");
+                    return;
+                }
+                let n = text.lines().count().max(1);
+                self.flash_info(&format!("copied {n} line{}", if n == 1 { "" } else { "s" }));
+                self.actions.push(Action::Clipboard(text));
+            }
+        }
+    }
+
+    fn copy_key(&mut self, k: KeyEvent) {
+        let Some((c, s)) = self.copy_parts() else {
+            self.exit_copy();
+            return;
+        };
+        let step = c.key(s, k);
+        self.do_copy(step);
     }
 
     /// When the next resized pane wants its screen taken again.
@@ -1015,7 +1107,7 @@ impl WsApp {
             Slot { attempt, view: None, error: None, idle: false, size: (cols, rows), lost: false, resync_at: None, resync: None, pending: None, shown: true };
         match &p {
             Plan::Ended { addr, why, .. } => {
-                let mut view = PaneView::new(addr.clone(), cols, rows);
+                let mut view = PaneView::new(addr.clone(), cols, rows, self.scrollback);
                 view.ended = Some(why.clone());
                 slot.view = Some(view);
                 self.slots.insert(pane.to_string(), slot);
@@ -1071,7 +1163,7 @@ impl WsApp {
             let (Ok((addr, cols, rows)), false) = (result, slot.lost) else { return false };
             slot.attempt = attempt;
             // Shown from its first output on, so the pane never blinks empty.
-            slot.pending = Some(PaneView::new(addr, cols, rows));
+            slot.pending = Some(PaneView::new(addr, cols, rows, self.scrollback));
             if let Some(view) = &mut slot.view {
                 view.resize(cols, rows);
             }
@@ -1084,7 +1176,7 @@ impl WsApp {
         let ok = result.is_ok();
         match result {
             Ok((addr, cols, rows)) => {
-                slot.view = Some(PaneView::new(addr.clone(), cols, rows));
+                slot.view = Some(PaneView::new(addr.clone(), cols, rows, self.scrollback));
                 slot.size = (cols, rows);
                 slot.error = None;
             }
@@ -1122,6 +1214,10 @@ impl WsApp {
             StreamMsg::Data(bytes) => {
                 let before = view.parser.screen().in_band_resize();
                 view.parser.process(&bytes);
+                // Copy mode keeps showing the same lines while output arrives.
+                if let Some(c) = self.copy.as_mut().filter(|c| c.pane == pane) {
+                    c.apply(view.parser.screen_mut());
+                }
                 // Turned on now, or seen in the replay of an attach (which may
                 // have resized the terminal under the program): report the size.
                 if !before && view.parser.screen().in_band_resize() {
@@ -1223,7 +1319,7 @@ impl WsApp {
 
     /// Pasted text: into a dialog field, or back to the caller for the pane.
     pub fn on_paste(&mut self, text: &str) -> Option<String> {
-        let to_pane = self.focus == Focus::Workspace && !self.armed && self.pane_live();
+        let to_pane = self.focus == Focus::Workspace && !self.armed && self.copy.is_none() && self.pane_live();
         match &mut self.dialog {
             Some(Dialog::Form(f)) => {
                 f.fields[f.focus].input.insert_str(text);
@@ -1355,6 +1451,13 @@ impl WsApp {
                     self.edit(WsOp::SetFocus { pane: id.clone() });
                 }
                 let (cx, cy) = cell?;
+                if left && self.copy_of(&id).is_some() {
+                    // Copy mode: the click places the cursor, a drag selects.
+                    let (c, s) = self.copy_parts()?;
+                    c.point(s, cx, cy, false);
+                    self.drag = Some(Drag::Copy(id));
+                    return None;
+                }
                 let s = self.mouse_screen(&id)?;
                 let bytes = keys::encode_mouse(MouseAct::Press(button), mods_for(s, mods), cx, cy, s.mouse_protocol_encoding());
                 self.drag = Some(Drag::Pane(id.clone()));
@@ -1374,6 +1477,20 @@ impl WsApp {
 
     fn drag_to(&mut self, button: MouseButton, mods: KeyModifiers, x: u16, y: u16) -> Option<(String, Vec<u8>)> {
         match self.drag.as_ref()? {
+            Drag::Copy(id) => {
+                let id = id.clone();
+                let (_, r) = self.pane_rects().into_iter().find(|(p, _)| *p == id)?;
+                let (cx, cy) = self.clamp_to(&id, x, y)?;
+                let (c, s) = self.copy_parts()?;
+                // Past the top or bottom edge: scroll that way, a line a move.
+                if y <= r.y {
+                    c.scroll(s, -1);
+                } else if y + 1 >= r.y + r.height {
+                    c.scroll(s, 1);
+                }
+                c.point(s, cx, cy, true);
+                None
+            }
             Drag::Pane(id) => {
                 let id = id.clone();
                 let (cx, cy) = self.clamp_to(&id, x, y)?;
@@ -1403,6 +1520,7 @@ impl WsApp {
 
     fn release(&mut self, button: MouseButton, mods: KeyModifiers, x: u16, y: u16) -> Option<(String, Vec<u8>)> {
         match self.drag.take()? {
+            Drag::Copy(_) => None,
             Drag::Pane(id) => {
                 let (cx, cy) = self.clamp_to(&id, x, y)?;
                 let s = self.mouse_screen(&id)?;
@@ -1437,6 +1555,17 @@ impl WsApp {
                 None
             }
             Hit::Pane { id, cell: Some((cx, cy)) } => {
+                let by = match act {
+                    MouseAct::WheelUp => -(WHEEL_LINES as isize),
+                    MouseAct::WheelDown => WHEEL_LINES as isize,
+                    _ => 0,
+                };
+                if by != 0 && self.copy_of(&id).is_some() {
+                    let (c, s) = self.copy_parts()?;
+                    let step = c.scroll(s, by);
+                    self.do_copy(step);
+                    return None;
+                }
                 if let Some(s) = self.mouse_screen(&id) {
                     let bytes = keys::encode_mouse(act, mods, cx, cy, s.mouse_protocol_encoding())?;
                     return Some((id, bytes));
@@ -1444,6 +1573,20 @@ impl WsApp {
                 let v = self.slots.get(&id)?.view.as_ref().filter(|v| v.ended.is_none())?;
                 let s = v.parser.screen();
                 if !s.alternate_screen() {
+                    // A plain screen: up into its history, in copy mode.
+                    if by >= 0 || s.scrollback_len() == 0 {
+                        return None;
+                    }
+                    self.focus = Focus::Workspace;
+                    if self.focused_pane().as_deref() != Some(id.as_str()) {
+                        self.edit(WsOp::SetFocus { pane: id.clone() });
+                    }
+                    if self.enter_copy(&id) {
+                        let (c, s) = self.copy_parts()?;
+                        c.from_wheel = true;
+                        let step = c.scroll(s, by);
+                        self.do_copy(step);
+                    }
                     return None;
                 }
                 let code = match act {
@@ -1503,6 +1646,18 @@ impl WsApp {
             KeyCode::Char('x') => self.close_pane_confirm(),
             KeyCode::Char('X') => self.close_tab_confirm(),
             KeyCode::Char('z') => self.toggle_zoom(),
+            KeyCode::Char('c') | KeyCode::PageUp => {
+                let Some(id) = self.focused_pane() else {
+                    self.flash_error("open a workspace first");
+                    return None;
+                };
+                self.focus = Focus::Workspace;
+                if !self.enter_copy(&id) {
+                    self.flash_error("nothing to scroll in this pane yet");
+                } else if k.code == KeyCode::PageUp {
+                    self.copy_key(KeyEvent::from(KeyCode::PageUp));
+                }
+            }
             _ => {} // Esc and anything unknown cancel
         }
         None
@@ -1510,6 +1665,10 @@ impl WsApp {
 
     fn workspace_key(&mut self, k: KeyEvent) -> Option<Out> {
         let id = self.focused_pane()?;
+        if self.copy_of(&id).is_some() {
+            self.copy_key(k);
+            return None;
+        }
         let slot = self.slots.get(&id)?;
         let ended = slot.view.as_ref().is_some_and(|v| v.ended.is_some());
         if (ended || slot.error.is_some() || slot.idle) && k.code == KeyCode::Enter {
@@ -3573,6 +3732,66 @@ mod tests {
         assert!(!a.sidebar_hidden);
     }
 
+    /// The lines of history above a pane's screen, oldest first.
+    fn history(a: &mut WsApp, pane: &str) -> Vec<String> {
+        let screen = a.slots.get_mut(pane).unwrap().view.as_mut().unwrap().parser.screen_mut();
+        let n = screen.scrollback_len();
+        let mut out = Vec::new();
+        // Page up from the oldest line, a screen at a time.
+        let rows = screen.size().0.get() as usize;
+        let mut top = n;
+        while top > 0 {
+            screen.set_scrollback(top);
+            let take = rows.min(top);
+            out.extend(screen.contents().lines().take(take).map(|l| l.trim_end().to_string()));
+            top -= take;
+        }
+        screen.set_scrollback(0);
+        out
+    }
+
+    #[test]
+    fn panes_keep_history_and_get_it_back_from_a_fresh_attach() {
+        let mut a = app();
+        a.scrollback = 50;
+        open_attached(&mut a, "w1");
+        a.focus = Focus::Sidebar;
+        let rows = a.slots["n-w1"].size.1 as usize;
+        let lines: String = (1..=rows + 10).map(|i| format!("line{i}\r\n")).collect();
+        feed(&mut a, "n-w1", &lines);
+        let h = history(&mut a, "n-w1");
+        assert_eq!(h.first().map(String::as_str), Some("line1"));
+        assert_eq!(h.len(), 11, "the lines that scrolled off: {h:?}");
+
+        // A full-screen program draws on the alternate screen: no history from it.
+        feed(&mut a, "n-w1", "\x1b[?1049h");
+        feed(&mut a, "n-w1", &"redraw\r\n".repeat(rows * 3));
+        feed(&mut a, "n-w1", "\x1b[?1049l");
+        assert_eq!(history(&mut a, "n-w1").len(), 11);
+
+        // The cap holds.
+        feed(&mut a, "n-w1", &"more\r\n".repeat(200));
+        assert_eq!(history(&mut a, "n-w1").len(), 50);
+
+        // A resync opens a new stream; the core paints history then the screen,
+        // and the new parser keeps that history too.
+        pk(&mut a, 'b');
+        let at = a.next_resync().expect("a resync is planned");
+        a.actions.clear();
+        a.resync_due(at);
+        let attempt = match a.actions.as_slice() {
+            [Action::Open { attempt, .. }] => *attempt,
+            other => panic!("{other:?}"),
+        };
+        let (cols, rows) = a.slots["n-w1"].size;
+        assert!(a.on_opened("n-w1", attempt, Ok(("t-n-w1".into(), cols, rows))));
+        let replay: String = (1..=rows as usize + 20).map(|i| format!("old{i}\r\n")).collect();
+        feed(&mut a, "n-w1", &format!("\x1b[H\x1b[2J{replay}"));
+        let h = history(&mut a, "n-w1");
+        assert_eq!(h.first().map(String::as_str), Some("old1"));
+        assert_eq!(h.len(), 21);
+    }
+
     #[test]
     fn a_resized_pane_takes_its_screen_again_and_keeps_showing_meanwhile() {
         let mut a = app();
@@ -3945,6 +4164,102 @@ mod tests {
         assert_eq!((p.as_str(), b), ("n-w1", b"\x1b[<35;6;5M".to_vec()));
         assert_eq!(mouse(&mut a, K::Moved, 70, 6), None, "the other pane has no reporting");
         assert_eq!(mouse(&mut a, K::Moved, 26, 6), None, "the border");
+    }
+
+    fn numbered(n: usize) -> String {
+        (1..=n).map(|i| format!("line{i}\r\n")).collect()
+    }
+
+    fn clipboard(a: &mut WsApp) -> Vec<String> {
+        a.actions.iter().filter_map(|x| if let Action::Clipboard(t) = x { Some(t.clone()) } else { None }).collect()
+    }
+
+    #[test]
+    fn copy_mode_takes_the_keys_and_copies_to_the_clipboard() {
+        let mut a = side_by_side();
+        let right = focused(&a);
+        feed(&mut a, &right, &numbered(60));
+        pk(&mut a, 'c');
+        assert!(a.copy_of(&right).is_some());
+        // Keys move the cursor instead of reaching the program.
+        assert_eq!(a.on_key(key('k')), None);
+        assert_eq!(a.on_key(key('V')), None);
+        assert_eq!(a.on_key(key('k')), None);
+        assert_eq!(a.on_paste("pasted"), None, "no paste into a pane in copy mode");
+        assert_eq!(a.on_key(key('y')), None);
+        assert!(a.copy.is_none(), "y leaves");
+        assert_eq!(clipboard(&mut a), ["line59\nline60"]);
+        assert!(a.current_flash().is_some_and(|(m, e)| !e && m == "copied 2 lines"));
+        // Back to the live screen: keys reach the program again.
+        assert!(matches!(a.on_key(key('k')), Some(Out::Key(_))));
+    }
+
+    #[test]
+    fn copy_mode_ends_when_the_pane_loses_the_focus_or_its_size() {
+        let mut a = side_by_side();
+        let right = focused(&a);
+        feed(&mut a, &right, &numbered(60));
+        let screen = |a: &WsApp| a.slots[&right].view.as_ref().unwrap().parser.screen().scrollback();
+        pk(&mut a, 'c');
+        a.on_key(KeyEvent::from(KeyCode::PageUp));
+        assert!(screen(&a) > 0);
+        pk(&mut a, 'h');
+        assert!(a.copy.is_none());
+        assert_eq!(screen(&a), 0, "the pane shows its live screen again");
+
+        pk(&mut a, 'l');
+        pk(&mut a, 'c');
+        assert!(a.copy.is_some());
+        pk(&mut a, 'H');
+        commit(&mut a);
+        assert!(a.copy.is_none(), "a resize renumbers the lines");
+
+        // ctrl+b PageUp starts it a page up.
+        prefix_key(&mut a, KeyEvent::from(KeyCode::PageUp));
+        assert!(a.copy.is_some() && screen(&a) > 0);
+        a.on_key(key('q'));
+        assert!(a.copy.is_none());
+    }
+
+    #[test]
+    fn the_wheel_scrolls_a_shell_back_and_leaves_at_the_bottom() {
+        let mut a = side_by_side();
+        let right = focused(&a);
+        feed(&mut a, "n-w1", &numbered(60));
+        // Over the left pane (not focused): it takes the focus and scrolls.
+        assert_eq!(mouse(&mut a, K::ScrollUp, 30, 5), None);
+        assert_eq!(focused(&a), "n-w1");
+        assert!(a.copy_of("n-w1").is_some_and(|c| c.from_wheel));
+        let up = |a: &WsApp| a.slots["n-w1"].view.as_ref().unwrap().parser.screen().scrollback();
+        assert_eq!(up(&a), WHEEL_LINES);
+        mouse(&mut a, K::ScrollUp, 30, 5);
+        assert_eq!(up(&a), 2 * WHEEL_LINES);
+        // New output doesn't pull the view down.
+        feed(&mut a, "n-w1", "more\r\n");
+        assert_eq!(up(&a), 2 * WHEEL_LINES + 1);
+        mouse(&mut a, K::ScrollDown, 30, 5);
+        mouse(&mut a, K::ScrollDown, 30, 5);
+        mouse(&mut a, K::ScrollDown, 30, 5);
+        assert!(a.copy.is_none(), "back at the bottom");
+        assert_eq!(up(&a), 0);
+        // A shell with no history yet: nothing to do.
+        assert_eq!(mouse(&mut a, K::ScrollUp, 70, 5), None);
+        assert!(a.copy.is_none());
+        let _ = right;
+    }
+
+    #[test]
+    fn dragging_in_copy_mode_selects() {
+        let mut a = side_by_side();
+        let right = focused(&a);
+        feed(&mut a, &right, "first line\r\nsecond line\r\n");
+        pk(&mut a, 'c');
+        // The right pane starts at x=63 (inner x=64), y=1 (inner y=2) on the right.
+        assert_eq!(mouse(&mut a, K::Down(MouseButton::Left), 64 + 6, 2), None);
+        assert_eq!(mouse(&mut a, K::Drag(MouseButton::Left), 64 + 5, 3), None);
+        mouse(&mut a, K::Up(MouseButton::Left), 64 + 5, 3);
+        a.on_key(key('y'));
+        assert_eq!(clipboard(&mut a), ["line\nsecond"]);
     }
 
     #[test]

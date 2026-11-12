@@ -83,6 +83,7 @@ The bottom bar shows `prefix` until the next key.
 | `r` / `R` | rename the tab / the pane (an empty pane name brings back the automatic title) |
 | `x` / `X` | close the pane / the tab; asks first, because its programs end |
 | `z` | zoom the pane to the whole area; again to undo (not saved) |
+| `c` / `PgUp` | [copy mode](#copy-mode): scroll back through the pane, select and copy (`PgUp` starts a page up) |
 | `w` | switch between sidebar and workspace (shows a hidden sidebar) |
 | `b` | hide or show the sidebar |
 | `<` / `>` | narrower / wider sidebar (4 columns a step, 16 to 60) |
@@ -118,12 +119,46 @@ workspace instead.
 | click a pane | focus it |
 | drag the line between two panes | resize the split (saved when you let go) |
 | wheel over the sidebar | move the selection |
-| wheel over a pane | goes to a program that takes the mouse; arrow keys for a full-screen one (less, man) |
+| wheel over a pane | goes to a program that takes the mouse; arrow keys for a full-screen one (less, man); up over a shell scrolls its history in copy mode, and scrolling back to the bottom leaves it |
+| click / drag in copy mode | place the cursor / select |
 
 When the program in a pane turns on mouse reporting (nvim with `mouse=a`, htop, tmux), its clicks,
 drags and wheel go to it, at positions inside the pane. Hold **Shift** while dragging to select text
 with your terminal's own selection. `mouse = false` under `[workspace]` leaves the mouse to the
 terminal.
+
+### Copy mode
+
+`ctrl+b c` (or `ctrl+b PgUp`, or the wheel over a shell) freezes the pane and lets you move through
+its history: what scrolled off the top, up to `scrollback` lines. The pane's title shows
+`copy · N/M up`. Output that arrives meanwhile is kept but doesn't move what you're reading.
+
+| Key | Action |
+|---|---|
+| `h` `j` `k` `l`, arrows | move the cursor (the view follows) |
+| `w` / `b` | next / previous word |
+| `0` `^` `$` | start of the line / first text / end |
+| `H` `M` `L` | top / middle / bottom of the view |
+| `ctrl+u` / `ctrl+d` | half a page up / down |
+| `ctrl+b` `ctrl+f`, `PgUp` `PgDn` | a page up / down |
+| `ctrl+y` / `ctrl+e` | the view a line up / down |
+| `g` / `G` | the oldest line / back to the bottom |
+| `v` / `V` (or `Space`) | select characters / whole lines; again to stop |
+| `y`, `Enter` | copy the selection (or the cursor's line) and leave |
+| `/` / `?` | search down / up; lowercase matches either case |
+| `n` / `N` | next / previous match |
+| `Esc` | drop the selection; with none, leave |
+| `q`, `ctrl+c` | leave |
+
+Copying sends OSC 52 to your terminal (Alacritty, kitty, WezTerm, foot, iTerm2 and Windows Terminal
+accept it; tmux needs `set -g set-clipboard on`). On Windows and WSL Hiero also hands the text to
+`clip.exe`, so it lands even where a console drops OSC 52. Lines that wrapped in the pane come
+out joined.
+
+History lives in two places: Hiero keeps it per pane, and asks herdr-core for it whenever it
+attaches. So a pane has its history back after you quit and reopen Hiero, after a resize, and after
+a core restart (for a terminal that kept running). Full-screen programs (nvim, less, htop) draw on
+the alternate screen, which has no history; copy mode there works on what is shown.
 
 ## How it works
 
@@ -204,6 +239,7 @@ effect. A broken file is reported on the bottom bar and ignored.
 prefix = "ctrl+b"        # ctrl+<letter> (not c, h, i, j, m) or ctrl+space
 restore = true           # start missing terminals when a workspace opens
 mouse = true             # clicks, wheel, border drags; Shift+drag still selects text
+scrollback = 5000        # lines of history per pane, for copy mode; 0 turns it off
 
 [notify]
 bell = true
@@ -276,15 +312,14 @@ Projects and workspaces are named exactly; folders must exist.
 | # | Issue | Impact |
 |---|---|---|
 | 1 | A program shows `·` until it reports a status to herdr-core (OSC 7501), e.g. while Claude waits at its "trust this folder?" dialog. Claude Code 2.1.319+ reports by itself; other agents may not at all. | A new pane can look idle while it waits for you. |
-| 2 | Panes have no scrollback. | You can't scroll back inside a shell pane; use the program's pager or `hiero debug read`. |
-| 3 | A restored pane runs its command again from the start. | The old program's state and screen are gone (see `claude --continue` above). |
-| 4 | A second client attached to a pane's terminal (e.g. `hc attach`) takes its size: herdr-core sizes a terminal for the last active viewer. | The program reflows until Hiero's pane is used again. |
-| 5 | Hiero doesn't honour synchronized output (`CSI ?2026`). | During heavy redraws you may glimpse a half-drawn frame for a moment; it settles. |
-| 6 | Windows: tried day to day in Alacritty; not in Windows Terminal or conhost. Bracketed paste may be refused by a console. win32-input-mode (`CSI ?9001h`) isn't implemented, and herdr-core's `socket` config key isn't read. | A multi-line paste may arrive as typed lines; a program that insists on win32 key encoding may misread keys. |
-| 7 | The desktop notification on WSL (a Windows toast) has never been confirmed on screen. | It may be silent; the bell still rings. |
-| 8 | No prebuilt binaries and no AUR entry; the PKGBUILD builds a local checkout. | Install from source. |
+| 2 | A restored pane runs its command again from the start. | The old program's state and screen are gone (see `claude --continue` above). |
+| 3 | A second client attached to a pane's terminal (e.g. `hc attach`) takes its size: herdr-core sizes a terminal for the last active viewer. | The program reflows until Hiero's pane is used again. |
+| 4 | Hiero doesn't honour synchronized output (`CSI ?2026`). | During heavy redraws you may glimpse a half-drawn frame for a moment; it settles. |
+| 5 | Windows: tried day to day in Alacritty; not in Windows Terminal or conhost. Bracketed paste may be refused by a console. win32-input-mode (`CSI ?9001h`) isn't implemented, and herdr-core's `socket` config key isn't read. | A multi-line paste may arrive as typed lines; a program that insists on win32 key encoding may misread keys. |
+| 6 | The desktop notification on WSL (a Windows toast) has never been confirmed on screen. | It may be silent; the bell still rings. |
+| 7 | No prebuilt binaries and no AUR entry; the PKGBUILD builds a local checkout. | Install from source. |
 
-Fixed recently: neovim's left/right-margin scrolling (the main buffer beside a dap-ui sidebar used
+Fixed recently: panes have scrollback and a [copy mode](#copy-mode); neovim's left/right-margin scrolling (the main buffer beside a dap-ui sidebar used
 to wipe the sidebar) — Hiero carries a vt100 fork that supports margins; a pane streaming fast
 output no longer makes the screen fall behind; a resized pane takes its screen again from
 herdr-core (a pane that grew used to show its text on the wrong rows); and panes stay attached

@@ -107,10 +107,11 @@ fn nz(n: u16) -> NonZeroU16 {
 }
 
 impl PaneView {
-    pub fn new(addr: String, cols: u16, rows: u16) -> Self {
+    /// `scrollback`: lines of history kept above the screen.
+    pub fn new(addr: String, cols: u16, rows: u16, scrollback: usize) -> Self {
         PaneView {
             addr,
-            parser: vt100::Parser::new(nz(rows), nz(cols), 0),
+            parser: vt100::Parser::new(nz(rows), nz(cols), scrollback),
             ended: None,
         }
     }

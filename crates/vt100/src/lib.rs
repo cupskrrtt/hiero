@@ -74,3 +74,5 @@ pub use screen::{
 
 #[cfg(all(test, feature = "std"))]
 mod margin_tests;
+#[cfg(all(test, feature = "std"))]
+mod history_tests;

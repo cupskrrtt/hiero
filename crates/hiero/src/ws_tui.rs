@@ -140,6 +140,7 @@ async fn event_loop(
     let mut app = WsApp::new(config::get().prefix(), saved.workspace);
     app.set_sidebar(saved.sidebar_width, saved.sidebar_hidden);
     app.auto_restore = config::get().workspace.restore;
+    app.scrollback = config::get().workspace.scrollback;
     app.self_addr = std::env::var("HC_TERMINAL_ID").ok().filter(|s| !s.is_empty());
     if let Some(e) = config_error {
         tracing::warn!("{e}");
@@ -206,6 +207,7 @@ async fn event_loop(
                         let _ = h.cmd.send(PaneCmd::Input(format!("\x1b[48;{rows};{cols};0;0t").into_bytes()));
                     }
                 }
+                Action::Clipboard(text) => crate::copy::to_clipboard(&text),
                 Action::LoadDoc => {
                     if let Some(c) = &client {
                         let (c, tx) = (c.clone(), tx.clone());
@@ -485,7 +487,9 @@ async fn open_pane(c: Client, path: PathBuf, plan: Plan, attempt: u64, size: (u1
             }
         },
     };
-    let params = AttachParams::new(addr.clone(), size.0, size.1);
+    let mut params = AttachParams::new(addr.clone(), size.0, size.1);
+    // The history lands above the screen, so a reattached pane scrolls back too.
+    params.history = config::get().workspace.scrollback;
     let result = AttachStream::open_at(&path, &params).await.map(Box::new).map_err(|e| e.to_string());
     let _ = tx.send(Msg::Opened { pane: pane.clone(), attempt, addr, cols: size.0, rows: size.1, result });
 }

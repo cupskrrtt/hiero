@@ -1,4 +1,5 @@
 mod config;
+mod copy;
 mod keys;
 mod notify;
 mod paths;

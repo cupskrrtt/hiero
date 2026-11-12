@@ -329,6 +329,22 @@ impl Grid {
         self.scrollback.as_ref().map_or(0, |s| s.rows.len())
     }
 
+    /// Lines that have scrolled off the top into the scrollback, counting
+    /// the ones the capacity has since dropped.
+    pub fn scrolled_total(&self) -> usize {
+        self.scrollback.as_ref().map_or(0, |s| s.unbounded_len)
+    }
+
+    /// Line `i` of the history followed by the screen (0: the oldest line kept).
+    pub fn line(&self, i: usize) -> Option<&crate::row::Row> {
+        let back = self.scrollback.as_ref().map_or(0, |s| s.rows.len());
+        if i < back {
+            self.scrollback.as_ref().and_then(|s| s.rows.get(i))
+        } else {
+            self.rows.get(i - back)
+        }
+    }
+
     pub fn scrollback(&self) -> usize {
         self.scrollback.as_ref().map_or(0, |s| s.offset)
     }
