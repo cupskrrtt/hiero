@@ -1,6 +1,6 @@
 //! Drawing the workspace screen: sidebar, pane area, bottom bar, dialogs.
 
-use crate::widgets::{draw_input, draw_vt, popup};
+use crate::widgets::{draw_input, draw_multiline, draw_vt, popup};
 use crate::workspace::{Workspace, WsStatus};
 use crate::ws_app::{Dialog, Focus, Form, Row, WsApp};
 use ratatui::Frame;
@@ -96,8 +96,10 @@ pub fn draw(f: &mut Frame, app: &WsApp) {
         Some(Dialog::Help(top)) => draw_help(f, f.area(), &app.prefix.label(), *top),
         Some(Dialog::Form(form)) => draw_form(f, form, f.area()),
         Some(Dialog::Confirm { message, .. }) => {
-            let w = (message.chars().count() as u16 + 4).min(f.area().width.saturating_sub(4)).max(30);
-            let h = 2 + (message.chars().count() as u16 / w.saturating_sub(2).max(1));
+            let longest = message.lines().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+            let w = (longest + 4).min(f.area().width.saturating_sub(4)).max(30);
+            let rows: usize = message.lines().map(|l| 1 + l.chars().count() / w.saturating_sub(2).max(1) as usize).sum();
+            let h = 1 + rows as u16;
             let inner = popup(f, f.area(), w, h + 1, "confirm");
             f.render_widget(Paragraph::new(message.clone()).wrap(Wrap { trim: false }).yellow(), inner);
         }
@@ -300,7 +302,7 @@ fn draw_bottom(f: &mut Frame, app: &WsApp, area: Rect) {
     if app.armed {
         spans.push(Span::styled(" prefix ", Style::new().bg(Color::Yellow).fg(Color::Black).bold()));
         spans.push(Span::raw(
-            " t/T tab · v/s split (V/S ask) · hjkl move · HJKL size · 1-9 [ ] tab · c copy · r/R rename tab/pane · x/X close · z zoom · w sidebar · b hide · < > size · ? help",
+            " t/T tab · v/s split (V/S ask) · hjkl move · HJKL size · 1-9 [ ] tab · c copy · r/R rename tab/pane · e env · x/X close · z zoom · w sidebar · b hide · < > size · ? help",
         ));
     } else if let Some(p) = app.copy.as_ref().and_then(|c| c.prompt.as_ref()) {
         let [label, input] = Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).areas(area);
@@ -318,7 +320,7 @@ fn draw_bottom(f: &mut Frame, app: &WsApp, area: Rect) {
         ));
     } else if app.focus == Focus::Sidebar {
         spans.push(Span::styled(
-            format!(" j/k move · enter open · a add · A project · r rename · D delete · J/K reorder · esc back · {label}"),
+            format!(" j/k move · enter open · a add · A project · r rename · e env · D delete · J/K reorder · esc back · {label}"),
             Style::new().dim(),
         ));
     } else {
@@ -335,9 +337,12 @@ fn draw_bottom(f: &mut Frame, app: &WsApp, area: Rect) {
 }
 
 fn draw_form(f: &mut Frame, form: &Form, area: Rect) {
-    let h = form.fields.len() as u16 * 2 + 3;
+    // A field of several lines gets a block of rows.
+    let height = |f: &crate::ws_app::Field| if f.input.multiline { 10u16.min(area.height.saturating_sub(9)).max(3) } else { 1 };
+    let h: u16 = form.fields.iter().map(|f| height(f) + 1).sum::<u16>() + 3;
     let inner = popup(f, area, 64, h + 2, &form.title);
-    let mut constraints: Vec<Constraint> = form.fields.iter().flat_map(|_| [Constraint::Length(1), Constraint::Length(1)]).collect();
+    let mut constraints: Vec<Constraint> =
+        form.fields.iter().flat_map(|fl| [Constraint::Length(height(fl)), Constraint::Length(1)]).collect();
     constraints.extend([Constraint::Length(1), Constraint::Min(1)]);
     let rows = Layout::vertical(constraints).split(inner);
     for (i, field) in form.fields.iter().enumerate() {
@@ -345,13 +350,22 @@ fn draw_form(f: &mut Frame, form: &Form, area: Rect) {
         let focused = i == form.focus;
         let style = if focused { Style::new().bold() } else { Style::new().dim() };
         f.render_widget(Paragraph::new(field.label).style(style), label);
-        draw_input(f, input, &field.input, focused);
+        if field.input.multiline {
+            draw_multiline(f, input, &field.input, focused);
+        } else {
+            draw_input(f, input, &field.input, focused);
+        }
     }
     let n = form.fields.len() * 2;
     if let Some(e) = &form.error {
         f.render_widget(Paragraph::new(e.clone()).red().wrap(Wrap { trim: false }), rows[n]);
     }
-    f.render_widget(Paragraph::new("tab next · enter ok · esc cancel").dim(), rows[n + 1]);
+    let hint = if form.fields.iter().any(|f| f.input.multiline) {
+        "KEY=VALUE per line · # comment · enter new line · ctrl+s save · esc cancel"
+    } else {
+        "tab next · enter ok · esc cancel"
+    };
+    f.render_widget(Paragraph::new(hint).dim(), rows[n + 1]);
 }
 
 /// The help text. It is taller than a small screen, so it scrolls.
@@ -365,6 +379,7 @@ pub fn help_lines(prefix: &str) -> Vec<Line<'static>> {
         Line::from("  1 .. 9     go to tab N        [ ]   previous / next tab"),
         Line::from("  r          rename the tab"),
         Line::from("  R          rename the pane (empty: show what it runs)"),
+        Line::from("  e          edit this project's env vars (offers to restart its terminals)"),
         Line::from("  x / X      close the pane / the tab (ends its programs)"),
         Line::from("  z          zoom the pane to the whole area, again to undo"),
         Line::from("  c, PgUp    copy mode: scroll back through the pane, select and copy"),
@@ -391,6 +406,7 @@ pub fn help_lines(prefix: &str) -> Vec<Line<'static>> {
         Line::from("  j k, ↑ ↓   move              enter   open workspace / fold project"),
         Line::from("  a          add workspace     A       add project"),
         Line::from("  r          rename            D       delete (asks about its terminals)"),
+        Line::from("  e          edit the project's env vars (ctrl+s saves)"),
         Line::from("  J K        move down / up    z       fold project"),
         Line::from("  esc, l, tab  back to the workspace          q   quit"),
         Line::from(""),

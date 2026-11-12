@@ -14,13 +14,50 @@ pub struct TextInput {
     pub text: String,
     /// Cursor position in chars.
     cursor: usize,
+    /// Several lines: Enter adds one, up / down move between them.
+    pub multiline: bool,
 }
 
 impl TextInput {
     pub fn new(text: impl Into<String>) -> Self {
         let text = text.into();
         let cursor = text.chars().count();
-        TextInput { text, cursor }
+        TextInput { text, cursor, multiline: false }
+    }
+
+    /// An input of several lines.
+    pub fn multiline(text: impl Into<String>) -> Self {
+        TextInput { multiline: true, ..TextInput::new(text) }
+    }
+
+    /// Where the cursor's line starts and ends, in chars.
+    fn line_bounds(&self) -> (usize, usize) {
+        let chars: Vec<char> = self.text.chars().collect();
+        let start = chars[..self.cursor].iter().rposition(|&c| c == '\n').map_or(0, |i| i + 1);
+        let end = chars[self.cursor..].iter().position(|&c| c == '\n').map_or(chars.len(), |i| self.cursor + i);
+        (start, end)
+    }
+
+    /// The cursor's line and column, counting from 0.
+    pub fn line_col(&self) -> (usize, usize) {
+        let (start, _) = self.line_bounds();
+        (self.text.chars().take(start).filter(|&c| c == '\n').count(), self.cursor - start)
+    }
+
+    /// Move up (`-1`) or down (`1`) a line, keeping the column when it fits.
+    fn move_line(&mut self, by: i32) {
+        let (start, end) = self.line_bounds();
+        let col = self.cursor - start;
+        let chars: Vec<char> = self.text.chars().collect();
+        if by < 0 && start > 0 {
+            let prev_end = start - 1;
+            let prev_start = chars[..prev_end].iter().rposition(|&c| c == '\n').map_or(0, |i| i + 1);
+            self.cursor = prev_start + col.min(prev_end - prev_start);
+        } else if by > 0 && end < chars.len() {
+            let next_start = end + 1;
+            let next_end = chars[next_start..].iter().position(|&c| c == '\n').map_or(chars.len(), |i| next_start + i);
+            self.cursor = next_start + col.min(next_end - next_start);
+        }
     }
 
     pub fn value(&self) -> &str {
@@ -35,9 +72,14 @@ impl TextInput {
         self.text.char_indices().nth(char_idx).map(|(i, _)| i).unwrap_or(self.text.len())
     }
 
-    /// Insert pasted text at the cursor (newlines become spaces).
+    /// Insert pasted text at the cursor (newlines become spaces, unless the
+    /// input has several lines).
     pub fn insert_str(&mut self, text: &str) {
-        let clean: String = text.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
+        let clean: String = if self.multiline {
+            text.replace("\r\n", "\n").replace('\r', "\n")
+        } else {
+            text.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect()
+        };
         let b = self.byte_at(self.cursor);
         self.text.insert_str(b, &clean);
         self.cursor += clean.chars().count();
@@ -47,11 +89,12 @@ impl TextInput {
     pub fn handle(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let len = self.text.chars().count();
+        let (line_start, line_end) = self.line_bounds();
         match key.code {
             KeyCode::Char('u') if ctrl => {
-                let b = self.byte_at(self.cursor);
-                self.text.replace_range(..b, "");
-                self.cursor = 0;
+                let (a, b) = (self.byte_at(line_start), self.byte_at(self.cursor));
+                self.text.replace_range(a..b, "");
+                self.cursor = line_start;
             }
             KeyCode::Char('w') if ctrl => {
                 let chars: Vec<char> = self.text.chars().collect();
@@ -66,8 +109,15 @@ impl TextInput {
                 self.text.replace_range(a..b, "");
                 self.cursor = start;
             }
-            KeyCode::Char('a') if ctrl => self.cursor = 0,
-            KeyCode::Char('e') if ctrl => self.cursor = len,
+            KeyCode::Char('a') if ctrl => self.cursor = line_start,
+            KeyCode::Char('e') if ctrl => self.cursor = line_end,
+            KeyCode::Enter if self.multiline => {
+                let b = self.byte_at(self.cursor);
+                self.text.insert(b, '\n');
+                self.cursor += 1;
+            }
+            KeyCode::Up if self.multiline => self.move_line(-1),
+            KeyCode::Down if self.multiline => self.move_line(1),
             KeyCode::Char(_) if ctrl => return false,
             KeyCode::Char(c) => {
                 let b = self.byte_at(self.cursor);
@@ -85,8 +135,8 @@ impl TextInput {
             }
             KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
             KeyCode::Right => self.cursor = (self.cursor + 1).min(len),
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = len,
+            KeyCode::Home => self.cursor = line_start,
+            KeyCode::End => self.cursor = line_end,
             KeyCode::Backspace | KeyCode::Delete => {}
             _ => return false,
         }
@@ -149,6 +199,20 @@ pub fn draw_input(f: &mut Frame, area: Rect, input: &TextInput, focused: bool) {
     f.render_widget(Paragraph::new(text).style(style).scroll((0, skip)), area);
     if focused {
         f.set_cursor_position((area.x + before_w - skip, area.y));
+    }
+}
+
+/// A text field of several lines; scrolls to keep the cursor in view.
+pub fn draw_multiline(f: &mut Frame, area: Rect, input: &TextInput, focused: bool) {
+    let style = if focused { Style::new().bg(Color::Rgb(40, 44, 52)) } else { Style::new().dim() };
+    let (line, col) = input.line_col();
+    let before: String = input.value().lines().nth(line).unwrap_or("").chars().take(col).collect();
+    let before_w = Span::raw(before.as_str()).width() as u16;
+    let skip_x = before_w.saturating_sub(area.width.saturating_sub(1));
+    let skip_y = (line as u16).saturating_sub(area.height.saturating_sub(1));
+    f.render_widget(Paragraph::new(input.value()).style(style).scroll((skip_y, skip_x)), area);
+    if focused {
+        f.set_cursor_position((area.x + before_w - skip_x, area.y + line as u16 - skip_y));
     }
 }
 
@@ -231,6 +295,24 @@ mod tests {
 
     fn key(c: KeyCode) -> KeyEvent {
         KeyEvent::from(c)
+    }
+
+    #[test]
+    fn multiline_input_adds_lines_and_moves_between_them() {
+        let mut t = TextInput::multiline("ab\ncdef");
+        assert_eq!(t.line_col(), (1, 4));
+        t.handle(key(KeyCode::Up));
+        assert_eq!(t.line_col(), (0, 2), "the column is kept as far as the line goes");
+        t.handle(key(KeyCode::Enter));
+        t.handle(key(KeyCode::Char('x')));
+        assert_eq!(t.value(), "ab\nx\ncdef");
+        t.handle(key(KeyCode::Home));
+        assert_eq!(t.line_col(), (1, 0));
+        t.handle(key(KeyCode::End));
+        assert_eq!(t.line_col(), (1, 1));
+        // A single-line input ignores Enter and up / down.
+        let mut one = TextInput::new("a");
+        assert!(!one.handle(key(KeyCode::Enter)) && !one.handle(key(KeyCode::Up)));
     }
 
     #[test]

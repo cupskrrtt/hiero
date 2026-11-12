@@ -81,6 +81,7 @@ The bottom bar shows `prefix` until the next key.
 | `H` `J` `K` `L` | narrower / taller / shorter / wider (5% a press) |
 | `1` … `9`, `[` / `]` | go to tab N, previous / next tab |
 | `r` / `R` | rename the tab / the pane (an empty pane name brings back the automatic title) |
+| `e` | edit this project's environment variables: one `KEY=VALUE` per line (`#` comments), `Ctrl+S` saves; every terminal started in the project gets them, and Hiero offers to restart the ones already running |
 | `x` / `X` | close the pane / the tab; asks first, because its programs end |
 | `z` | zoom the pane to the whole area; again to undo (not saved) |
 | `c` / `PgUp` | [copy mode](#copy-mode): scroll back through the pane, select and copy (`PgUp` starts a page up) |
@@ -104,6 +105,7 @@ workspace instead.
 | `Enter` | open a workspace; on a project, fold or unfold it |
 | `a` / `A` | add a workspace to this project / add a project |
 | `r` | rename |
+| `e` | edit the project's environment variables (as above) |
 | `D` | delete; asks: `y` end its terminals · `k` keep them running · `n` cancel |
 | `J` / `K` | move down / up |
 | `z` | fold or unfold the project |

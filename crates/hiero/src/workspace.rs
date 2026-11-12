@@ -9,6 +9,7 @@ use hc_client::{AgentState, Client, ErrorKind, TerminalSet};
 use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 pub const DOC_NAME: &str = "hiero-ws";
@@ -143,6 +144,9 @@ pub struct Project {
     pub collapsed: bool,
     #[serde(default)]
     pub workspaces: Vec<Workspace>,
+    /// Variables every terminal started in this project gets.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 /// The whole document. Unknown keys are kept as they are.
@@ -208,6 +212,35 @@ impl WsDoc {
     }
 }
 
+/// The text a person edits: one `KEY=VALUE` per line, sorted by key.
+pub fn env_text(env: &BTreeMap<String, String>) -> String {
+    env.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("\n")
+}
+
+/// Read that text back. Blank lines and `#` lines are skipped; the value is
+/// everything after the first `=`; a key given twice keeps its last value.
+pub fn parse_env(text: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut env = BTreeMap::new();
+    for (i, line) in text.lines().enumerate() {
+        let n = i + 1;
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!("line {n}: expected KEY=VALUE"));
+        };
+        let key = key.trim();
+        let mut chars = key.chars();
+        let ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !ok {
+            return Err(format!("line {n}: bad name \"{key}\" (letters, digits and _, not starting with a digit)"));
+        }
+        env.insert(key.to_string(), value.to_string());
+    }
+    Ok(env)
+}
+
 impl Project {
     pub fn workspace_by_name(&self, name: &str) -> Option<&Workspace> {
         self.workspaces.iter().find(|w| w.name == name)
@@ -243,6 +276,8 @@ pub enum Move {
 pub enum WsOp {
     AddProject { id: String, name: String, root: String },
     RenameProject { id: String, name: String },
+    /// Replaces the project's environment variables wholesale.
+    SetProjectEnv { id: String, env: BTreeMap<String, String> },
     DeleteProject { id: String },
     MoveProject { id: String, dir: Move },
     SetCollapsed { id: String, collapsed: bool },
@@ -381,6 +416,7 @@ pub fn apply(doc: &mut WsDoc, op: &WsOp) -> Result<(), String> {
                 root: root.clone(),
                 collapsed: false,
                 workspaces: vec![],
+                env: BTreeMap::new(),
             });
         }
         WsOp::RenameProject { id, name } => {
@@ -390,6 +426,10 @@ pub fn apply(doc: &mut WsDoc, op: &WsOp) -> Result<(), String> {
                 return Err(format!("a project named \"{name}\" already exists"));
             }
             doc.projects[i].name = name;
+        }
+        WsOp::SetProjectEnv { id, env } => {
+            let i = project_ix(doc, id)?;
+            doc.projects[i].env = env.clone();
         }
         WsOp::DeleteProject { id } => {
             let i = project_ix(doc, id)?;
@@ -1155,6 +1195,46 @@ mod tests {
 
     fn s(x: &str) -> String {
         x.to_string()
+    }
+
+    #[test]
+    fn parse_env_reads_lines() {
+        let m = |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| (s(k), s(v))).collect::<BTreeMap<_, _>>();
+        assert_eq!(parse_env("A=1\nB_2=two words\n"), Ok(m(&[("A", "1"), ("B_2", "two words")])));
+        // Blank lines and comments are skipped.
+        assert_eq!(parse_env("\n  # note\nA=1\n\n#B=2"), Ok(m(&[("A", "1")])));
+        // The value is everything after the first `=`, and may be empty.
+        assert_eq!(parse_env("URL=http://x?a=b\nEMPTY="), Ok(m(&[("URL", "http://x?a=b"), ("EMPTY", "")])));
+        // The last of a repeated key wins.
+        assert_eq!(parse_env("A=1\nA=2"), Ok(m(&[("A", "2")])));
+        assert_eq!(parse_env(""), Ok(m(&[])));
+        // Mistakes name their line.
+        assert!(parse_env("A=1\n1A=2").unwrap_err().starts_with("line 2: bad name"));
+        assert!(parse_env("=x").unwrap_err().starts_with("line 1: bad name"));
+        assert!(parse_env("A B=x").unwrap_err().starts_with("line 1: bad name"));
+        assert_eq!(parse_env("\nJUSTAKEY").unwrap_err(), "line 2: expected KEY=VALUE");
+        // What is shown reads back the same.
+        let env = m(&[("B", "x=y"), ("A", "")]);
+        assert_eq!(env_text(&env), "A=\nB=x=y");
+        assert_eq!(parse_env(&env_text(&env)), Ok(env));
+    }
+
+    #[test]
+    fn project_env_defaults_empty_is_replaced_and_skipped_when_empty() {
+        let old = json!({"projects": [{"id": "p", "name": "p"}]});
+        let mut d = WsDoc::from_value(&old);
+        assert!(d.projects[0].env.is_empty());
+        assert!(serde_json::to_value(&d).unwrap()["projects"][0].get("env").is_none());
+
+        let env = |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| (s(k), s(v))).collect::<BTreeMap<_, _>>();
+        ok(&mut d, WsOp::SetProjectEnv { id: s("p"), env: env(&[("A", "1"), ("B", "2")]) });
+        assert_eq!(d.projects[0].env, env(&[("A", "1"), ("B", "2")]));
+        assert_eq!(serde_json::to_value(&d).unwrap()["projects"][0]["env"]["A"], "1");
+        ok(&mut d, WsOp::SetProjectEnv { id: s("p"), env: env(&[("C", "3")]) });
+        assert_eq!(d.projects[0].env, env(&[("C", "3")]));
+        assert!(err(&mut d, WsOp::SetProjectEnv { id: s("zz"), env: env(&[]) }).contains("no project"));
+        ok(&mut d, WsOp::SetProjectEnv { id: s("p"), env: env(&[]) });
+        assert!(serde_json::to_value(&d).unwrap()["projects"][0].get("env").is_none());
     }
 
     fn add_project(doc: &mut WsDoc, id: &str, name: &str) {

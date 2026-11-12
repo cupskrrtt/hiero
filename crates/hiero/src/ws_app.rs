@@ -14,7 +14,7 @@ use crate::ws_ui;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use hc_client::{EventData, RunParams, Terminal, TerminalSet, WatchMsg};
 use ratatui::layout::Rect;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 pub const LABEL_WS: &str = "hiero.ws";
@@ -156,6 +156,8 @@ pub fn plan(doc: &WsDoc, set: &TerminalSet, ws_id: &str, pane_id: &str, fresh: b
     params.labels.insert(LABEL_WS.into(), w.id.clone());
     params.labels.insert(LABEL_PANE.into(), pane.id.clone());
     params.labels.insert(LABEL_PROJECT.into(), project.name.clone());
+    // Project variables first, so Hiero's own always win.
+    params.env.extend(project.env.clone());
     params.env.insert(ENV_PANE.into(), pane.id.clone());
     params.env.insert(ENV_WS.into(), w.id.clone());
     Some(Plan::Start { pane: pane.id.clone(), params })
@@ -212,6 +214,8 @@ pub enum FormKind {
     NewTab { workspace: String },
     /// A split of `pane`, asking what the new pane runs first.
     NewSplit { pane: String, dir: Dir },
+    /// The environment variables of a project, one `KEY=VALUE` per line.
+    Env { project: String },
 }
 
 /// What a yes/no question is about.
@@ -220,6 +224,8 @@ pub enum ConfirmKind {
     Delete(String),
     ClosePane(String),
     CloseTab(String),
+    /// Restart these panes (their ids) so they get the project's new environment.
+    RestartEnv(Vec<String>),
 }
 
 pub struct Field {
@@ -386,6 +392,9 @@ pub struct WsApp {
     /// Select / open these as soon as the document that holds them arrives.
     pending_sel: Option<String>,
     pending_open: Option<String>,
+    /// A project's new environment was sent: once the document shows it, offer
+    /// to restart the terminals that run with the old one.
+    pending_env: Option<(String, BTreeMap<String, String>)>,
 }
 
 impl WsApp {
@@ -430,6 +439,7 @@ impl WsApp {
             restore,
             pending_sel: None,
             pending_open: None,
+            pending_env: None,
         }
     }
 
@@ -643,6 +653,7 @@ impl WsApp {
             self.focus = Focus::Workspace;
             self.open_workspace(&id);
         }
+        self.offer_restart();
         // The open workspace was deleted (here or from the CLI).
         if let Some(id) = &self.open
             && self.doc.workspace(id).is_none()
@@ -1624,6 +1635,7 @@ impl WsApp {
             KeyCode::Char('?') => self.dialog = Some(Dialog::Help(0)),
             KeyCode::Char('n') => self.add_workspace_form(),
             KeyCode::Char('N') => self.add_project_form(),
+            KeyCode::Char('e') => self.env_form(),
             KeyCode::Char('t') => self.new_tab(None),
             KeyCode::Char('T') => self.command_form(),
             KeyCode::Char('v') => self.split(Dir::Horizontal, None),
@@ -1901,6 +1913,7 @@ impl WsApp {
             KeyCode::Char('a') => self.add_workspace_form(),
             KeyCode::Char('A') => self.add_project_form(),
             KeyCode::Char('r') => self.rename_form(),
+            KeyCode::Char('e') => self.env_form(),
             KeyCode::Char('D') => self.delete_confirm(),
             KeyCode::Char('J') => self.reorder(Move::Down),
             KeyCode::Char('K') => self.reorder(Move::Up),
@@ -1981,6 +1994,21 @@ impl WsApp {
         }));
     }
 
+    /// Edit the environment of the cursor's project.
+    fn env_form(&mut self) {
+        let Some(p) = self.current_project().and_then(|id| self.doc.project(&id)) else {
+            self.flash_error("add a project first");
+            return;
+        };
+        self.dialog = Some(Dialog::Form(Form {
+            kind: FormKind::Env { project: p.id.clone() },
+            title: format!("env of {} (every new terminal gets it)", p.name),
+            fields: vec![Field { label: "env", input: TextInput::multiline(workspace::env_text(&p.env)) }],
+            focus: 0,
+            error: None,
+        }));
+    }
+
     /// The terminals of every pane of a workspace or project.
     fn terminals_of(&self, id: &str) -> Vec<String> {
         let ws: Vec<&Workspace> = match self.doc.project(id) {
@@ -2043,6 +2071,13 @@ impl WsApp {
             },
             Some(Dialog::Form(f)) => match k.code {
                 KeyCode::Esc => self.dialog = None,
+                // The way to save a form whose Enter adds a line.
+                KeyCode::Char('s') if k.modifiers.contains(KeyModifiers::CONTROL) => self.submit_form(),
+                _ if f.fields[f.focus].input.multiline && !matches!(k.code, KeyCode::Tab | KeyCode::BackTab) => {
+                    if f.fields[f.focus].input.handle(k) {
+                        f.error = None;
+                    }
+                }
                 KeyCode::Tab | KeyCode::Down => f.focus = (f.focus + 1) % f.fields.len(),
                 KeyCode::BackTab | KeyCode::Up => f.focus = (f.focus + f.fields.len() - 1) % f.fields.len(),
                 KeyCode::Enter if f.focus + 1 < f.fields.len() => f.focus += 1,
@@ -2081,6 +2116,61 @@ impl WsApp {
                 terminals.dedup();
                 self.close_with(terminals, WsOp::CloseTab { id });
             }
+            ConfirmKind::RestartEnv(panes) => self.restart_panes(&panes),
+        }
+    }
+
+    /// The document now holds the environment we sent: offer to restart the
+    /// project's running terminals so they pick it up.
+    fn offer_restart(&mut self) {
+        if self.dialog.is_some() {
+            return;
+        }
+        let Some((project, _)) = self.pending_env.take_if(|(id, env)| self.doc.project(id).is_some_and(|p| p.env == *env)) else {
+            return;
+        };
+        let Some(p) = self.doc.project(&project) else { return };
+        let panes = running_panes(&self.doc, &self.set, &project, self.self_addr.as_deref());
+        if panes.is_empty() {
+            return;
+        }
+        let list: Vec<String> = panes.iter().map(|(_, what)| format!("  {what}")).collect();
+        let message = format!(
+            "Restart {} terminal{} in {} to apply the new env?  y / n\n{}",
+            panes.len(),
+            if panes.len() == 1 { "" } else { "s" },
+            p.name,
+            list.join("\n")
+        );
+        let ids = panes.into_iter().map(|(id, _)| id).collect();
+        self.dialog = Some(Dialog::Confirm { kind: ConfirmKind::RestartEnv(ids), message });
+    }
+
+    /// End these panes' programs and start a fresh one in each. Panes that are
+    /// not on screen get theirs in the background.
+    fn restart_panes(&mut self, panes: &[String]) {
+        for pane in panes {
+            if self.starting.contains(pane) {
+                continue;
+            }
+            let Some((w, _, _)) = self.doc.pane(pane) else { continue };
+            let ws = w.id.clone();
+            let mut old: Vec<String> = self.terminal_of(pane).into_iter().collect();
+            old.extend(self.labelled(LABEL_PANE, std::slice::from_ref(pane)));
+            old.sort();
+            old.dedup();
+            let on_screen = self.open.as_deref() == Some(ws.as_str()) && self.on_screen(pane);
+            self.slots.remove(pane);
+            self.actions.push(Action::Detach(pane.clone()));
+            if on_screen {
+                self.open_slot(pane, true, true);
+            } else if let Some(Plan::Start { pane, params }) = plan(&self.doc, &self.set, &ws, pane, true) {
+                self.starting.insert(pane.clone());
+                self.actions.push(Action::Start { pane, params });
+            }
+            if !old.is_empty() {
+                self.actions.push(Action::Kill(old));
+            }
         }
     }
 
@@ -2116,6 +2206,11 @@ impl WsApp {
                 if let Err(e) = self.check(&ops) {
                     return self.form_error(form, e);
                 }
+                if let (FormKind::Env { project }, [WsOp::SetProjectEnv { env, .. }]) = (&form.kind, &ops[..])
+                    && self.doc.project(project).is_some_and(|p| p.env != *env)
+                {
+                    self.pending_env = Some((project.clone(), env.clone()));
+                }
                 self.pending_sel = pending_sel;
                 self.pending_open = pending_open;
                 self.zoom = None;
@@ -2133,6 +2228,10 @@ impl WsApp {
     /// The op, and the project / workspace to select or open once it lands.
     #[allow(clippy::type_complexity)]
     fn build_op(&self, form: &Form) -> Result<(Vec<WsOp>, Option<String>, Option<String>), String> {
+        if let FormKind::Env { project } = &form.kind {
+            let env = workspace::parse_env(form.fields[0].input.value())?;
+            return Ok((vec![WsOp::SetProjectEnv { id: project.clone(), env }], None, None));
+        }
         let name = form.fields[0].input.value().trim().to_string();
         let folder = || existing_dir(form.fields[1].input.value());
         Ok(match &form.kind {
@@ -2170,8 +2269,29 @@ impl WsApp {
                 (ops.ok_or("the workspace is gone")?, None, None)
             }
             FormKind::NewSplit { pane, dir } => (self.split_ops(pane, *dir, command(&form.fields[0].input)), None, None),
+            FormKind::Env { .. } => unreachable!("handled above"),
         })
     }
+}
+
+/// The panes of a project whose terminal is running now, with where they are
+/// (workspace › tab › name or command). Never the terminal Hiero itself runs in.
+pub fn running_panes(doc: &WsDoc, set: &TerminalSet, project: &str, self_addr: Option<&str>) -> Vec<(String, String)> {
+    let Some(p) = doc.project(project) else { return vec![] };
+    let mut out = vec![];
+    for w in &p.workspaces {
+        for t in &w.tabs {
+            for pane in t.all_panes() {
+                let Some(addr) = &pane.terminal else { continue };
+                if self_addr == Some(addr.as_str()) || fate(set.get(addr)) != Fate::Running {
+                    continue;
+                }
+                let what = pane.name.as_deref().or(pane.command.as_deref()).unwrap_or("shell");
+                out.push((pane.id.clone(), format!("{} › {} › {what}", w.name, t.name)));
+            }
+        }
+    }
+    out
 }
 
 fn command(input: &TextInput) -> Option<String> {
@@ -2462,6 +2582,205 @@ mod tests {
         a.focus = Focus::Sidebar;
         a.on_key(code(KeyCode::Esc));
         assert_eq!(a.focus, Focus::Workspace);
+    }
+
+    fn type_text(a: &mut WsApp, text: &str) {
+        for c in text.chars() {
+            a.on_key(if c == '\n' { code(KeyCode::Enter) } else { key(c) });
+        }
+    }
+
+    fn ctrl_s() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
+    }
+
+    fn env_of(kv: &[(&str, &str)]) -> BTreeMap<String, String> {
+        kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// n-w1 (p1) and n-w2 (p1) each with a terminal, in the set as live.
+    fn with_running_panes(a: &mut WsApp) {
+        let mut doc = a.doc.clone();
+        for (pane, t) in [("n-w1", "t1"), ("n-w2", "t2"), ("n-w3", "t3")] {
+            apply(&mut doc, &WsOp::SetTerminal { pane: pane.into(), terminal: Some(t.into()) }).unwrap();
+            a.set.terminals.insert(t.into(), terminal(t, true));
+        }
+        a.on_doc(doc);
+        a.actions.clear();
+    }
+
+    #[test]
+    fn the_env_form_saves_lines_and_names_a_bad_one() {
+        let mut a = app();
+        let mut doc = a.doc.clone();
+        apply(&mut doc, &WsOp::SetProjectEnv { id: "p1".into(), env: env_of(&[("OLD", "1")]) }).unwrap();
+        a.on_doc(doc);
+
+        // From a workspace row: its project's env, prefilled.
+        a.sel = "w1".into();
+        a.on_key(key('e'));
+        let Some(Dialog::Form(f)) = &a.dialog else { panic!() };
+        assert_eq!(f.fields[0].input.value(), "OLD=1");
+        // Enter adds a line instead of saving.
+        type_text(&mut a, "\nA=1\n# note\nB=x=y");
+        assert!(a.dialog.is_some() && a.actions.is_empty());
+        a.on_key(ctrl_s());
+        assert!(a.dialog.is_none());
+        assert_eq!(
+            only_update(&mut a),
+            [WsOp::SetProjectEnv { id: "p1".into(), env: env_of(&[("OLD", "1"), ("A", "1"), ("B", "x=y")]) }]
+        );
+
+        // A bad line keeps the form open and says which.
+        a.sel = "p2".into();
+        a.on_key(key('e'));
+        type_text(&mut a, "A=1\noops");
+        a.on_key(ctrl_s());
+        let Some(Dialog::Form(f)) = &a.dialog else { panic!("closed") };
+        assert!(f.error.as_deref().unwrap().starts_with("line 2:"));
+        assert!(a.actions.is_empty());
+        a.on_key(code(KeyCode::Esc));
+        assert!(a.dialog.is_none());
+
+        // The prefix key reaches it too.
+        a.sel = "p2".into();
+        a.on_key(ctrl_space());
+        a.on_key(key('e'));
+        let Some(Dialog::Form(f)) = &a.dialog else { panic!() };
+        assert!(f.title.contains("solo"));
+    }
+
+    #[test]
+    fn running_panes_picks_only_running_terminals_of_the_project() {
+        let mut a = app();
+        let mut doc = a.doc.clone();
+        // A hidden pane (live), and one whose terminal the core doesn't know.
+        apply(&mut doc, &WsOp::SplitPane { pane: "n-w1".into(), dir: Dir::Horizontal, new_id: "n-w1b".into() }).unwrap();
+        apply(&mut doc, &WsOp::RenamePane { pane: "n-w1b".into(), name: Some("logs".into()) }).unwrap();
+        for (pane, t) in [("n-w1", "t1"), ("n-w1b", "t5")] {
+            apply(&mut doc, &WsOp::SetTerminal { pane: pane.into(), terminal: Some(t.into()) }).unwrap();
+        }
+        apply(&mut doc, &WsOp::HideOthers { pane: "n-w1".into() }).unwrap();
+        apply(&mut doc, &WsOp::SplitPane { pane: "n-w1".into(), dir: Dir::Horizontal, new_id: "n-w1c".into() }).unwrap();
+        for (pane, t) in [("n-w1c", "gone"), ("n-w2", "t2"), ("n-w3", "t3")] {
+            apply(&mut doc, &WsOp::SetTerminal { pane: pane.into(), terminal: Some(t.into()) }).unwrap();
+        }
+        a.set.terminals.insert("t1".into(), terminal("t1", true));
+        a.set.terminals.insert("t5".into(), terminal("t5", true));
+        a.set.terminals.insert("t2".into(), finished("t2", "exited", Some(0)));
+        a.set.terminals.insert("t3".into(), terminal("t3", true));
+
+        let got = running_panes(&doc, &a.set, "p1", None);
+        let ids: Vec<&str> = got.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["n-w1", "n-w1b"], "ended, missing and other projects are left out");
+        assert_eq!(got[1].1, "frontend › shell › logs");
+        // Hiero's own terminal is never restarted.
+        assert_eq!(running_panes(&doc, &a.set, "p1", Some("t1")).len(), 1);
+        // Panes of several workspaces count.
+        a.set.terminals.insert("t2".into(), terminal("t2", true));
+        assert_eq!(running_panes(&doc, &a.set, "p1", None).len(), 3);
+        assert_eq!(running_panes(&doc, &a.set, "nope", None), vec![]);
+    }
+
+    #[test]
+    fn a_changed_env_offers_a_restart_and_yes_restarts_each_pane() {
+        let mut a = app();
+        with_running_panes(&mut a);
+        a.sel = "p1".into();
+        a.on_key(key('e'));
+        type_text(&mut a, "A=1");
+        a.on_key(ctrl_s());
+        let ops = only_update(&mut a);
+        // Nothing is asked until the document shows the new env.
+        assert!(a.dialog.is_none());
+        let mut doc = a.doc.clone();
+        for op in &ops {
+            apply(&mut doc, op).unwrap();
+        }
+        a.on_doc(doc);
+        let Some(Dialog::Confirm { kind, message }) = &a.dialog else { panic!("no prompt") };
+        assert_eq!(*kind, ConfirmKind::RestartEnv(vec!["n-w1".into(), "n-w2".into()]));
+        assert!(message.starts_with("Restart 2 terminals in shosha to apply the new env?"), "{message}");
+        assert!(message.contains("frontend › shell › shell") && message.contains("backend › shell › shell"), "{message}");
+
+        // No: nothing happens.
+        a.on_key(key('n'));
+        assert!(a.dialog.is_none() && a.actions.is_empty());
+
+        // Yes (asked again by hand): each pane is detached, started with the env, and its old terminal killed.
+        a.dialog = Some(Dialog::Confirm { kind: ConfirmKind::RestartEnv(vec!["n-w1".into(), "n-w2".into()]), message: String::new() });
+        a.on_key(key('y'));
+        let starts: Vec<(&str, &str)> = a
+            .actions
+            .iter()
+            .filter_map(|x| match x {
+                Action::Start { pane, params } => Some((pane.as_str(), params.env["A"].as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts, [("n-w1", "1"), ("n-w2", "1")], "{:?}", a.actions);
+        let kills: Vec<&Vec<String>> = a.actions.iter().filter_map(|x| if let Action::Kill(v) = x { Some(v) } else { None }).collect();
+        assert_eq!(kills, [&vec!["t1".to_string()], &vec!["t2".to_string()]]);
+        assert_eq!(a.actions.iter().filter(|x| matches!(x, Action::Detach(_))).count(), 2);
+    }
+
+    #[test]
+    fn restarting_a_pane_on_screen_opens_a_fresh_terminal_there() {
+        let mut a = app();
+        with_running_panes(&mut a);
+        open_attached(&mut a, "w1");
+        let mut doc = a.doc.clone();
+        apply(&mut doc, &WsOp::SetProjectEnv { id: "p1".into(), env: env_of(&[("A", "1")]) }).unwrap();
+        a.on_doc(doc);
+        a.dialog = None;
+        a.restart_panes(&["n-w1".to_string()]);
+        let Some(Action::Open { plan: Plan::Start { pane, params }, .. }) =
+            a.actions.iter().find(|x| matches!(x, Action::Open { .. }))
+        else {
+            panic!("{:?}", a.actions)
+        };
+        assert_eq!((pane.as_str(), params.env["A"].as_str()), ("n-w1", "1"));
+        assert!(a.actions.iter().any(|x| matches!(x, Action::Kill(v) if v == &["t1".to_string()])));
+    }
+
+    #[test]
+    fn no_restart_is_offered_without_a_change_or_a_running_terminal() {
+        let mut a = app();
+        // Changed, but nothing runs.
+        a.sel = "p1".into();
+        a.on_key(key('e'));
+        type_text(&mut a, "A=1");
+        a.on_key(ctrl_s());
+        let mut doc = a.doc.clone();
+        for op in only_update(&mut a) {
+            apply(&mut doc, &op).unwrap();
+        }
+        a.on_doc(doc);
+        assert!(a.dialog.is_none());
+
+        // Running, but saved as it was.
+        with_running_panes(&mut a);
+        a.on_key(key('e'));
+        a.on_key(ctrl_s());
+        a.actions.clear();
+        let doc = a.doc.clone();
+        a.on_doc(doc);
+        assert!(a.dialog.is_none());
+    }
+
+    #[test]
+    fn plan_passes_project_env_but_hiero_vars_win() {
+        let mut a = app();
+        let pid = a.doc.workspace("w1").unwrap().0.id.clone();
+        let env = [("FOO", "bar"), (ENV_PANE, "evil"), (ENV_WS, "evil")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        apply(&mut a.doc, &WsOp::SetProjectEnv { id: pid, env }).unwrap();
+        let Some(Plan::Start { params, .. }) = plan(&a.doc, &a.set, "w1", "n-w1", false) else { panic!() };
+        assert_eq!(params.env["FOO"], "bar");
+        assert_eq!(params.env[ENV_PANE], "n-w1");
+        assert_eq!(params.env[ENV_WS], "w1");
     }
 
     #[test]
